@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - 融合进化版
-# 支持 Gemini API 和 Vertex AI (自动计费检测 + 自定义数量 + 屏幕展示)
-# 版本: 3.1.0
+# 支持 Gemini API (自动计费检测 + 稳定提取 + 屏幕展示)
+# 版本: 3.2.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.1.0"
+VERSION="3.2.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-gemini-key}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 TEMP_DIR=""
@@ -42,7 +42,7 @@ log() {
 handle_error() {
     local exit_code=$?
     case $exit_code in 141|130) return 0 ;; esac
-    if [ $exit_code -gt 1 ]; then log "ERROR" "发生严重错误，请检查日志"; return $exit_code; else log "WARN" "发生非严重错误，继续执行"; return 0; fi
+    if [ $exit_code -gt 1 ]; then return $exit_code; else return 0; fi
 }
 trap 'handle_error' ERR
 
@@ -59,7 +59,6 @@ retry() {
         if "$@"; then return 0; fi
         if [ $attempt -ge $max ]; then return 1; fi
         delay=$(( attempt * 3 + RANDOM % 3 ))
-        log "WARN" "重试 ${attempt}/${max} (等待 ${delay}s)..."
         sleep $delay
         attempt=$((attempt + 1))
     done
@@ -95,7 +94,7 @@ unlink_projects_from_billing_account() {
     local billing_id="$1"
     local linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null)
     if [ -z "$linked_projects" ]; then return 0; fi
-    log "WARN" "发现旧项目占用结算账户，喵酱开始清理释放配额..."
+    log "INFO" "正在清理旧项目释放账单配额喵..."
     while IFS= read -r project_id; do
         [ -n "$project_id" ] && retry gcloud billing projects unlink "$project_id" --quiet &>/dev/null
     done <<< "$linked_projects"
@@ -142,35 +141,70 @@ gemini_create_projects() {
         local project_id=$(new_project_id "gemini-api")
         log "INFO" "[${i}/${num_projects}] 正在处理项目: ${project_id}"
         
-        retry gcloud projects create "$project_id" --quiet || { failed=$((failed+1)); i=$((i+1)); continue; }
-        retry gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet || true
+        # 1. 创建项目
+        if ! retry gcloud projects create "$project_id" --quiet >/dev/null 2>&1; then
+            log "ERROR" "项目创建失败喵！"
+            failed=$((failed+1)); i=$((i+1)); continue
+        fi
         
+        # 2. 绑定账单
+        if ! gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet >/dev/null 2>&1; then
+            log "WARN" "绑定账单失败，喵酱正在重试清理配额..."
+            unlink_projects_from_billing_account "$GEMINI_BILLING_ACCOUNT"
+            sleep 2
+            if ! gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet >/dev/null 2>&1; then
+                log "WARN" "配额不足绑定失败！喵酱已把废弃项目删掉啦..."
+                gcloud projects delete "$project_id" --quiet >/dev/null 2>&1 || true
+                skipped=$((skipped+1)); i=$((i+1)); continue
+            fi
+        fi
+        
+        # 3. 双重检测账单是否真实存在
         local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
         if [ -z "$billing_info" ]; then
-            log "WARN" "项目 ${project_id} 未绑定结算账户，跳过密钥提取喵！"
+            log "WARN" "项目依然无账单！跳过它喵！"
+            gcloud projects delete "$project_id" --quiet >/dev/null 2>&1 || true
             skipped=$((skipped+1)); i=$((i+1)); continue
         fi
         
-        retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet || { failed=$((failed+1)); i=$((i+1)); continue; }
+        # 4. 启用API
+        if ! retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1; then
+            log "ERROR" "启用 API 失败喵！"
+            failed=$((failed+1)); i=$((i+1)); continue
+        fi
         
-        local key_output
-        if key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet); then
-            local api_key=$(parse_json "$key_output" ".keyString")
-            if [ -n "$api_key" ]; then
-                echo "$api_key" >> "$key_file"
-                log "SUCCESS" "成功提取密钥！"
-                success=$((success+1))
+        # 5. 生成密钥 (先静默创建)
+        log "INFO" "正在生成 API Key..."
+        if retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --quiet >/dev/null 2>&1; then
+            
+            # 6. 使用绝对可靠的方案精准提取 (和选项2一致)
+            local keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+            if [ -n "$keys_list" ]; then
+                local key_name=$(echo "$keys_list" | head -n 1)
+                local key_details=$(gcloud services api-keys get-key-string "$key_name" --format=json 2>/dev/null)
+                local api_key=$(parse_json "$key_details" ".keyString")
+                if [ -n "$api_key" ]; then
+                    echo "$api_key" >> "$key_file"
+                    log "SUCCESS" "成功提取密钥！"
+                    success=$((success+1))
+                else
+                    log "ERROR" "无法解析密钥文本喵！"
+                    failed=$((failed+1))
+                fi
             else
+                log "ERROR" "找不回刚刚创建的密钥喵！"
                 failed=$((failed+1))
             fi
         else
+            log "ERROR" "生成 API Key 失败喵！"
             failed=$((failed+1))
         fi
+        
         i=$((i+1))
     done
     
     echo -e "\n${CYAN}====== 任务汇报 ======${NC}"
-    echo "计划创建: $num_projects | 成功提取: $success | 失败: $failed | 无账单跳过: $skipped"
+    echo "计划创建: $num_projects | 成功提取: $success | 失败: $failed | 绑账单失败跳过: $skipped"
     if [ "$success" -gt 0 ] && [ -s "$key_file" ]; then
         echo -e "🔑 密钥已保存至: ${GREEN}${key_file}${NC}"
         echo -e "\n${YELLOW}喵酱为你奉上新鲜的密钥喵：${NC}"
@@ -200,7 +234,7 @@ gemini_get_keys_from_existing() {
         fi
         
         log "INFO" "正在提取项目: ${project_id}"
-        retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet || continue
+        retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || continue
         
         local keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
         local key_found=false
@@ -217,14 +251,20 @@ gemini_get_keys_from_existing() {
             fi
         fi
         
-        # 如果没有现有密钥则创建
+        # 如果没有现有密钥则静默创建后再提取
         if [ "$key_found" = false ]; then
-            local key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet)
-            local new_key=$(parse_json "$key_output" ".keyString")
-            if [ -n "$new_key" ]; then
-                echo "$new_key" >> "$key_file"
-                success=$((success+1))
-                log "SUCCESS" "创建了新密钥！"
+            if retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --quiet >/dev/null 2>&1; then
+                local new_keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+                if [ -n "$new_keys_list" ]; then
+                    local new_key_name=$(echo "$new_keys_list" | head -n 1)
+                    local new_key_details=$(gcloud services api-keys get-key-string "$new_key_name" --format=json 2>/dev/null)
+                    local new_key=$(parse_json "$new_key_details" ".keyString")
+                    if [ -n "$new_key" ]; then
+                        echo "$new_key" >> "$key_file"
+                        success=$((success+1))
+                        log "SUCCESS" "创建了新密钥！"
+                    fi
+                fi
             fi
         fi
     done <<< "$projects"
@@ -246,7 +286,7 @@ gemini_delete_projects() {
     local projects=$(gcloud projects list --format="value(projectId)" --filter="projectId:$prefix*" 2>/dev/null)
     for p in $projects; do
         log "INFO" "正在删除 $p ..."
-        gcloud projects delete "$p" --quiet
+        gcloud projects delete "$p" --quiet >/dev/null 2>&1
     done
 }
 
