@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - 融合进化版
-# 支持 Gemini API 和 Vertex AI (自动计费检测 + 自定义数量)
-# 版本: 3.0.0
+# 支持 Gemini API 和 Vertex AI (自动计费检测 + 自定义数量 + 屏幕展示)
+# 版本: 3.1.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.0.0"
+VERSION="3.1.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-gemini-key}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 TEMP_DIR=""
@@ -106,7 +106,6 @@ unlink_projects_from_billing_account() {
 gemini_create_projects() {
     log "INFO" "====== 自动创建并提取 Gemini 项目 ======"
     
-    # 需求1：自定义数量或随机范围
     local num_input
     read -r -p "主人想创建几个项目呢？(支持数字如 3，或范围如 3-5) [默认: 3]: " num_input
     num_input=${num_input:-3}
@@ -146,7 +145,6 @@ gemini_create_projects() {
         retry gcloud projects create "$project_id" --quiet || { failed=$((failed+1)); i=$((i+1)); continue; }
         retry gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet || true
         
-        # 需求2：检测结算账户绑定状态，没绑上直接跳过提取
         local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
         if [ -z "$billing_info" ]; then
             log "WARN" "项目 ${project_id} 未绑定结算账户，跳过密钥提取喵！"
@@ -173,7 +171,12 @@ gemini_create_projects() {
     
     echo -e "\n${CYAN}====== 任务汇报 ======${NC}"
     echo "计划创建: $num_projects | 成功提取: $success | 失败: $failed | 无账单跳过: $skipped"
-    if [ "$success" -gt 0 ]; then echo -e "🔑 密钥已保存至: ${GREEN}${key_file}${NC}"; fi
+    if [ "$success" -gt 0 ] && [ -s "$key_file" ]; then
+        echo -e "🔑 密钥已保存至: ${GREEN}${key_file}${NC}"
+        echo -e "\n${YELLOW}喵酱为你奉上新鲜的密钥喵：${NC}"
+        cat "$key_file"
+        echo
+    fi
 }
 
 gemini_get_keys_from_existing() {
@@ -200,6 +203,8 @@ gemini_get_keys_from_existing() {
         retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet || continue
         
         local keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+        local key_found=false
+
         if [ -n "$keys_list" ]; then
             local key_name=$(echo "$keys_list" | head -n 1)
             local key_details=$(gcloud services api-keys get-key-string "$key_name" --format=json 2>/dev/null)
@@ -208,23 +213,30 @@ gemini_get_keys_from_existing() {
                 echo "$api_key" >> "$key_file"
                 success=$((success+1))
                 log "SUCCESS" "找到已有密钥！"
-                continue
+                key_found=true
             fi
         fi
         
         # 如果没有现有密钥则创建
-        local key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet)
-        local new_key=$(parse_json "$key_output" ".keyString")
-        if [ -n "$new_key" ]; then
-            echo "$new_key" >> "$key_file"
-            success=$((success+1))
-            log "SUCCESS" "创建了新密钥！"
+        if [ "$key_found" = false ]; then
+            local key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet)
+            local new_key=$(parse_json "$key_output" ".keyString")
+            if [ -n "$new_key" ]; then
+                echo "$new_key" >> "$key_file"
+                success=$((success+1))
+                log "SUCCESS" "创建了新密钥！"
+            fi
         fi
     done <<< "$projects"
     
     echo -e "\n${CYAN}====== 提取完成 ======${NC}"
     echo "成功提取: $success | 无账单跳过: $skipped"
-    if [ "$success" -gt 0 ]; then echo -e "🔑 密钥已保存至: ${GREEN}${key_file}${NC}"; fi
+    if [ "$success" -gt 0 ] && [ -s "$key_file" ]; then
+        echo -e "🔑 密钥已保存至: ${GREEN}${key_file}${NC}"
+        echo -e "\n${YELLOW}这是喵酱辛苦找出来的密钥哦：${NC}"
+        cat "$key_file"
+        echo
+    fi
 }
 
 gemini_delete_projects() {
