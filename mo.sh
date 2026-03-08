@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持自定义项目数量并在终端直接提取/显示 JSON Key
-# 版本: 2.1.0
+# 支持自定义项目数量、终端打印 JSON Key 以及一键配置现有项目
+# 版本: 2.2.0
 
 # 仅启用 errtrace (-E) 与 nounset (-u)
 set -Euo
@@ -17,7 +17,7 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="2.1.0"
+VERSION="2.2.0"
 LAST_UPDATED="2025-05-23"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
@@ -305,7 +305,6 @@ vertex_create_projects() {
     existing_projects=$(gcloud projects list --filter="billingAccountName:billingAccounts/${BILLING_ACCOUNT}" --format='value(projectId)' 2>/dev/null | wc -l)
     log "INFO" "当前结算账户已有 ${existing_projects} 个项目"
     
-    # 取消数量限制，允许用户自定义输入
     local num_projects
     read -r -p "请输入要创建的项目数量 (例如 3, 5, 8 等): " num_projects
     
@@ -339,7 +338,6 @@ vertex_create_projects() {
         
         log "INFO" "[${i}/${num_projects}] 创建项目: ${project_id}"
         
-        # 核心创建项目代码（保持与原逻辑一致）
         if ! retry gcloud projects create "$project_id" --quiet; then
             log "ERROR" "创建项目失败: ${project_id}"
             failed=$((failed + 1)) || true
@@ -453,20 +451,35 @@ vertex_configure_existing() {
     fi
     
     local selected_projects=()
-    read -r -p "请输入项目编号（多个用空格分隔，输入 'all' 选择全部显示项目）: " -a numbers
     
-    if [ "${numbers[0]}" = "all" ]; then
-        selected_projects=("${project_array[@]}")
-    else
-        for num in "${numbers[@]}"; do
-            if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
-                selected_projects+=("${project_array[$((num-1))]}")
+    # 新增：询问是否一键配置
+    echo ""
+    if ask_yes_no "是否一键在现有项目中配置 Vertex项目 (自动选中所有已关联当前结算账户的项目)？" "N"; then
+        log "INFO" "正在筛选已关联当前结算账户的项目..."
+        for proj in "${project_array[@]}"; do
+            local b_info
+            b_info=$(gcloud billing projects describe "$proj" --format='value(billingAccountName)' 2>/dev/null || echo "")
+            if [ -n "$b_info" ] && [[ "$b_info" == *"${BILLING_ACCOUNT}"* ]]; then
+                selected_projects+=("$proj")
             fi
         done
+        log "INFO" "自动选中了 ${#selected_projects[@]} 个已关联结算的项目。"
+    else
+        read -r -p "请输入项目编号（多个用空格分隔，输入 'all' 选择全部显示项目）: " -a numbers
+        
+        if [ "${#numbers[@]}" -gt 0 ] && [ "${numbers[0]}" = "all" ]; then
+            selected_projects=("${project_array[@]}")
+        else
+            for num in "${numbers[@]}"; do
+                if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
+                    selected_projects+=("${project_array[$((num-1))]}")
+                fi
+            done
+        fi
     fi
     
     if [ ${#selected_projects[@]} -eq 0 ]; then
-        log "ERROR" "未选择任何项目"
+        log "ERROR" "未选择任何项目，操作已取消。"
         return 1
     fi
     
