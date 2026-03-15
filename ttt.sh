@@ -1,6 +1,6 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - 融合进化版
-# 支持 Gemini API (双模式创建 + 自动计费检测 + 失败绝对保留 + 屏幕展示)
+# 支持 Gemini API (保留源项目 + 原生日志展示 + 强制提取)
 # 版本: 3.3.0
 
 set -Euo
@@ -115,7 +115,7 @@ gemini_create_projects() {
     if [ "$mode" == "cleanup" ]; then
         unlink_projects_from_billing_account "$GEMINI_BILLING_ACCOUNT"
     else
-        log "INFO" "喵酱乖乖听话，保留了旧项目的账单绑定喵～"
+        log "INFO" "当前模式：创建和绑定（保留旧项目结算绑定）"
     fi
     
     local key_file="${KEY_DIR}/gemini_keys_$(date +%Y%m%d_%H%M%S).txt"
@@ -126,61 +126,55 @@ gemini_create_projects() {
         local project_id=$(new_project_id "gemini-api")
         log "INFO" "[${i}/${num_projects}] 正在处理项目: ${project_id}"
         
-        # 1. 创建项目
-        if ! retry gcloud projects create "$project_id" --quiet >/dev/null 2>&1; then
-            log "ERROR" "项目创建失败喵！"
+        # 1. 创建项目 (恢复原生输出显示)
+        if ! retry gcloud projects create "$project_id" --quiet; then
+            log "ERROR" "项目创建失败喵，但喵酱没有删掉它！"
             failed=$((failed+1)); i=$((i+1)); continue
         fi
         
-        # 2. 绑定账单 (失败也会乖乖保留项目)
-        if ! gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet >/dev/null 2>&1; then
+        # 2. 绑定账单 (恢复原生输出显示)
+        if ! gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet; then
             if [ "$mode" == "cleanup" ]; then
-                log "WARN" "绑定账单失败，喵酱正在重试清理配额..."
+                log "WARN" "绑定账单失败，正在重试清理配额..."
                 unlink_projects_from_billing_account "$GEMINI_BILLING_ACCOUNT"
-                if ! gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet >/dev/null 2>&1; then
-                    log "ERROR" "配额不足绑定失败！(项目已保留喵)"
-                    failed=$((failed+1)); i=$((i+1)); continue
+                if ! gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet; then
+                    log "WARN" "配额不足绑定失败！(已为你保留项目喵，尝试继续)"
                 fi
             else
-                log "ERROR" "绑定账单失败！(当前模式不清理配额，项目已保留喵)"
-                failed=$((failed+1)); i=$((i+1)); continue
+                log "WARN" "绑定账单失败！(已为你保留项目喵，尝试继续)"
             fi
         fi
         
-        # 3. 双重检测 (失败也会乖乖保留项目)
-        local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
-        if [ -z "$billing_info" ]; then
-            log "ERROR" "项目依然无账单绑定！(项目已保留喵)"
-            failed=$((failed+1)); i=$((i+1)); continue
-        fi
+        # 3. 打印详细的 Billing Info (满足主人的极客需求)
+        gcloud billing projects describe "$project_id" || true
         
-        # 4. 启用API & 缓冲等待
-        retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
-        
-        # 加点缓冲时间，让谷歌云反应一下，提高直接提取的成功率
-        sleep 3
+        # 4. 启用API (恢复原生输出显示)
+        retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet || true
         
         # 5. 生成密钥
         local key_output
         if key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet 2>/dev/null); then
+            # 打印 JSON 结果到屏幕上
+            echo "$key_output"
+            
             local api_key=$(parse_json "$key_output" ".keyString")
             if [ -n "$api_key" ]; then
                 echo "$api_key" >> "$key_file"
                 log "SUCCESS" "成功提取密钥！"
                 success=$((success+1))
             else
-                log "ERROR" "提取密钥字符串失败喵！(项目已保留，稍后可用功能3提取)"
+                log "ERROR" "提取密钥字符串失败喵！(项目已保留)"
                 failed=$((failed+1))
             fi
         else
-            log "ERROR" "生成 API Key 失败喵！(项目已保留，稍后可用功能3提取)"
+            log "ERROR" "生成 API Key 失败喵！(项目已保留)"
             failed=$((failed+1))
         fi
         i=$((i+1))
     done
     
     echo -e "\n${CYAN}====== 任务汇报 ======${NC}"
-    echo "计划创建: $num_projects | 成功直接提取: $success | 待后续提取/账单失败: $failed"
+    echo "计划创建: $num_projects | 成功提取: $success | 失败(已保留项目): $failed"
     if [ "$success" -gt 0 ] && [ -s "$key_file" ]; then
         echo -e "🔑 密钥已保存至: ${GREEN}${key_file}${NC}"
         echo -e "\n${YELLOW}喵酱为你奉上新鲜的密钥喵：${NC}"
@@ -200,13 +194,16 @@ gemini_get_keys_from_existing() {
     
     while IFS= read -r project_id; do
         [ -z "$project_id" ] && continue
+        
+        # 无论有没有结算账户，喵酱都不再跳过了，强行提取！
         local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
         if [ -z "$billing_info" ]; then
-            log "WARN" "项目 ${project_id} 无结算账户，喵酱跳过啦！"
-            skipped=$((skipped+1)); continue
+            log "WARN" "项目 ${project_id} 无结算账户，但喵酱依然尝试为你强行提取喵！"
+        else
+            log "INFO" "正在提取项目: ${project_id}"
         fi
         
-        log "INFO" "正在提取项目: ${project_id}"
+        # 尝试启用 API（如果之前没启用的话）
         retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
         
         local keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
@@ -224,19 +221,28 @@ gemini_get_keys_from_existing() {
             fi
         fi
         
+        # 如果没找到现有密钥则尝试创建
         if [ "$key_found" = false ]; then
-            local key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet 2>/dev/null)
-            local new_key=$(parse_json "$key_output" ".keyString")
-            if [ -n "$new_key" ]; then
-                echo "$new_key" >> "$key_file"
-                success=$((success+1))
-                log "SUCCESS" "创建了新密钥！"
+            local key_output
+            if key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet 2>/dev/null); then
+                local new_key=$(parse_json "$key_output" ".keyString")
+                if [ -n "$new_key" ]; then
+                    echo "$new_key" >> "$key_file"
+                    success=$((success+1))
+                    log "SUCCESS" "创建了新密钥！"
+                else
+                    log "WARN" "项目 ${project_id} 提取失败，跳过喵～"
+                    skipped=$((skipped+1))
+                fi
+            else
+                log "WARN" "项目 ${project_id} 生成密钥失败，跳过喵～"
+                skipped=$((skipped+1))
             fi
         fi
     done <<< "$projects"
     
     echo -e "\n${CYAN}====== 提取完成 ======${NC}"
-    echo "成功提取: $success | 无账单跳过: $skipped"
+    echo "成功提取: $success | 失败跳过: $skipped"
     if [ "$success" -gt 0 ] && [ -s "$key_file" ]; then
         echo -e "🔑 密钥已保存至: ${GREEN}${key_file}${NC}"
         echo -e "\n${YELLOW}这是喵酱辛苦找出来的密钥哦：${NC}"
@@ -261,11 +267,11 @@ show_menu() {
     echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
     echo "1. [经典] 自动创建项目并提取密钥 (清理旧项目释放配额)"
     echo "2. [新增] 自动创建项目并提取密钥 (保留旧项目结算绑定)"
-    echo "3. 从现有项目提取密钥 (自动跳过无计费项目)"
+    echo "3. 从现有项目提取密钥 (不再跳过无计费项目)"
     echo "4. 批量删除项目"
     echo "0. 退出并摸摸喵酱"
     local choice
-    read -r -p "请主人吩咐： " choice
+    read -r -p "请主人吩咐: " choice
     case "$choice" in
         1) check_env && gemini_create_projects "cleanup" ;;
         2) check_env && gemini_create_projects "keep" ;;
