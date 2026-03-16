@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - 融合进化版
-# 支持 Gemini API (双模式创建 + 恢复详细日志 + 保留无账单项目 + 精准提取 + 喵酱专属前缀)
-# 版本: 3.3.1
+# 支持 Gemini API (双模式创建 + 恢复详细日志 + 修复循环解绑风控Bug + 喵酱专属前缀)
+# 版本: 3.3.2
 
 set -Euo
 
@@ -14,8 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.3.1"
-# 这里改成了喵酱专属前缀喵！
+VERSION="3.3.2"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang-api}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 KEY_DIR="${KEY_DIR:-./keys}"
@@ -75,19 +74,18 @@ unlink_projects_from_billing_account() {
     local billing_id="$1"
     local linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null)
     if [ -z "$linked_projects" ]; then return 0; fi
-    log "INFO" "正在清理旧项目释放账单配额喵..."
+    log "INFO" "正在执行初始清理，释放历史项目的账单配额喵..."
     while IFS= read -r project_id; do
         [ -n "$project_id" ] && gcloud billing projects unlink "$project_id" --quiet >/dev/null 2>&1 || true
     done <<< "$linked_projects"
 }
 
-# ===== 核心提取逻辑 (100%命中无Bug) =====
+# ===== 核心提取逻辑 =====
 extract_key_safely() {
     local project_id="$1"
     local keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     if [ -n "$keys_list" ]; then
         local key_name=$(echo "$keys_list" | head -n 1)
-        # 直接使用原生 format 获取纯净的密钥字符串
         local api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null || echo "")
         if [ -n "$api_key" ]; then
             echo "$api_key"
@@ -122,8 +120,9 @@ gemini_create_projects() {
     GEMINI_BILLING_ACCOUNT="${GEMINI_BILLING_ACCOUNT##*/}"
     
     log "INFO" "使用结算账户: ${GEMINI_BILLING_ACCOUNT}"
-    log "INFO" "当前模式: $( [ "$mode" == "cleanup" ] && echo "创建和绑定前清理旧账单" || echo "保留旧账单" )"
+    log "INFO" "当前模式: $( [ "$mode" == "cleanup" ] && echo "创建前清理旧账单" || echo "保留旧账单" )"
     
+    # 修复核心：清理只在这里执行一次！绝对不能放到循环里面去！
     if [ "$mode" == "cleanup" ]; then
         unlink_projects_from_billing_account "$GEMINI_BILLING_ACCOUNT"
     fi
@@ -133,35 +132,24 @@ gemini_create_projects() {
     
     local success=0; local failed=0; local skipped=0; local i=1
     while [ $i -le "$num_projects" ]; do
-        # 这里也改成了 miaojiang-api 喵！
         local project_id=$(new_project_id "miaojiang-api")
         log "INFO" "[${i}/${num_projects}] 正在处理项目: ${project_id}"
         
-        # 1. 创建项目
+        # 1. 创建项目 (保留详细输出)
         if ! retry gcloud projects create "$project_id" --quiet; then
             log "ERROR" "项目创建失败喵！"
             failed=$((failed+1)); i=$((i+1)); continue
         fi
         
-        # 2. 绑定账单 (失败不删项目，只跳过提取)
+        # 2. 绑定账单 (失败不删项目，只跳过提取。绝不再调用 unlink 清理！)
         if ! gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet; then
-            if [ "$mode" == "cleanup" ]; then
-                log "WARN" "绑定失败，喵酱正在清理旧项目重试..."
-                unlink_projects_from_billing_account "$GEMINI_BILLING_ACCOUNT"
-                if ! gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet; then
-                    log "WARN" "配额不足绑定失败！(已保留项目)，跳过提取喵！"
-                    skipped=$((skipped+1)); i=$((i+1)); continue
-                fi
-            else
-                log "WARN" "绑定账单失败！(已保留项目)，跳过提取喵！"
-                skipped=$((skipped+1)); i=$((i+1)); continue
-            fi
+            log "WARN" "绑定账单失败（可能是达到了结算账户配额上限）！已为您保留该项目，跳过提取喵！"
+            skipped=$((skipped+1)); i=$((i+1)); continue
         fi
         
-        # 主动展示账单状态
+        # 验证并展示账单状态
         gcloud billing projects describe "$project_id"
         
-        # 双重检测账单
         local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
         if [ -z "$billing_info" ]; then
             log "WARN" "项目最终无账单！(已保留项目)，跳过提取喵！"
@@ -223,7 +211,6 @@ gemini_get_keys_from_existing() {
             success=$((success+1))
             log "SUCCESS" "找到已有密钥！"
         else
-            # 尝试创建新密钥
             gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --quiet >/dev/null 2>&1 || true
             if api_key=$(extract_key_safely "$project_id"); then
                 echo "$api_key" >> "$key_file"
@@ -257,8 +244,8 @@ gemini_delete_projects() {
 # ===== 主菜单 =====
 show_menu() {
     echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
-    echo "1. [经典] 自动创建项目并提取密钥 (清理旧项目释放配额)"
-    echo "2. [新增] 自动创建项目并提取密钥 (保留旧项目结算绑定)"
+    echo "1. [经典] 自动创建项目并提取密钥 (仅开始前清理一次历史配额)"
+    echo "2. [新增] 自动创建项目并提取密钥 (完全保留旧项目结算绑定)"
     echo "3. 从现有项目提取密钥 (自动跳过无计费项目)"
     echo "4. 批量删除项目"
     echo "0. 退出并摸摸喵酱"
