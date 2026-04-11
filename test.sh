@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - 融合进化版
-# 支持 Gemini API (全自动模式 + 强力爆破防阻断提取)
-# 版本: 3.7.0
+# 支持 Gemini API (全自动模式 + 纯控制台打印 + 终极防漏抓取 + 默认项目提取)
+# 版本: 3.8.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.7.0"
+VERSION="3.8.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang-api}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 TEMP_DIR=""
@@ -76,7 +76,20 @@ check_env() {
   if ! gcloud config list account --quiet &>/dev/null; then log "ERROR" "请先运行 'gcloud init'喵！"; exit 1; fi
 }
 
-# ===== 核心提取逻辑 (内置重试防阻断) =====
+parse_json() {
+  local json="$1"; local field="$2"
+  if [ -z "$json" ]; then return 1; fi
+  if command -v jq &>/dev/null; then
+    local res
+    res=$(echo "$json" | jq -r "$field" 2>/dev/null)
+    if [ -n "$res" ] && [ "$res" != "null" ]; then echo "$res"; return 0; fi
+  fi
+  if [ "$field" = ".keyString" ]; then
+    echo "$json" | grep -o '"keyString" *: *"[^"]*"' | sed 's/"keyString" *: *"//;s/"$//' | head -n 1
+  fi
+}
+
+# ===== 核心提取逻辑 (内置强力防阻断) =====
 extract_key_safely() {
   local project_id="$1"
   local keys_list=""
@@ -91,7 +104,8 @@ extract_key_safely() {
   done
   
   if [ -n "$keys_list" ]; then
-    while IFS= read -r key_name; do
+    # 强力遍历所有 key，只要找到一个就返回
+    for key_name in $keys_list; do
       key_name=$(echo "$key_name" | tr -d '\r' | xargs)
       [ -z "$key_name" ] && continue
       
@@ -110,7 +124,7 @@ extract_key_safely() {
         echo "$api_key"
         return 0
       fi
-    done <<< "$keys_list"
+    done
   fi
   return 1
 }
@@ -120,9 +134,9 @@ unlink_projects_from_billing_account() {
   local linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null)
   if [ -z "$linked_projects" ]; then return 0; fi
   log "WARN" "发现旧项目占用结算账户，喵酱开始清理释放配额..."
-  while IFS= read -r project_id; do
+  for project_id in $linked_projects; do
     [ -n "$project_id" ] && retry gcloud billing projects unlink "$project_id" --quiet &>/dev/null
-  done <<< "$linked_projects"
+  done
   return 0
 }
 
@@ -297,7 +311,8 @@ gemini_create_projects() {
 gemini_get_keys_from_existing() {
   log "INFO" "====== 从现有项目提取密钥 ======"
   local projects
-  projects=$(gcloud projects list --format='value(projectId)' --filter='lifecycleState:ACTIVE' 2>/dev/null || echo "")
+  # 重点更新：移除状态过滤，强行获取所有项目，防止因数据库同步延迟导致遗漏！
+  projects=$(gcloud projects list --format='value(projectId)' 2>/dev/null || echo "")
   if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目喵！"; return 1; fi
   
   local success=0; local skipped=0; local failed=0
@@ -306,7 +321,8 @@ gemini_get_keys_from_existing() {
   local BILLING_NAMES=()
   local BILLING_KEY_MAP=()
 
-  while IFS= read -r project_id; do
+  # 强力遍历，无视回车符陷阱
+  for project_id in $projects; do
     [ -z "$project_id" ] && continue
     
     local billing_raw
@@ -338,6 +354,7 @@ gemini_get_keys_from_existing() {
     log "INFO" "正在提取项目: ${project_id} (结算: ${billing_display_name})"
     
     local api_key
+    # 强行提取！
     if api_key=$(extract_key_safely "$project_id"); then
       ALL_KEYS+=("$api_key")
       BILLING_KEY_MAP+=("${bi}:${api_key}")
@@ -345,7 +362,7 @@ gemini_get_keys_from_existing() {
       log "SUCCESS" "找到已有密钥！"
     else
       if [ "$billing_id" = "Unlinked" ]; then
-        log "WARN" "项目已被解绑，且多次重试未发现存活的密钥，含泪跳过喵！"
+        log "WARN" "项目无结算账户且没找到存活密钥，含泪跳过喵！"
         skipped=$((skipped+1))
         continue
       fi
@@ -362,7 +379,7 @@ gemini_get_keys_from_existing() {
         failed=$((failed+1))
       fi
     fi
-  done <<< "$projects"
+  done
   
   echo -e "\n${CYAN}====== 提取完成 ======${NC}"
   echo "成功提取: $success | 无账单跳过: $skipped | 失败: $failed"
@@ -412,7 +429,7 @@ show_menu() {
   echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
   echo "1. [经典] 自动创建项目并提取密钥 (清理旧项目释放配额)"
   echo "2. [新增] 自动创建项目并提取密钥 (保留旧项目结算绑定)"
-  echo "3. 从现有项目提取密钥 (强力找回掉签密钥，纯净控制台打印)"
+  echo "3. 从现有项目提取密钥 (纯净控制台打印，支持默认项目)"
   echo "4. 批量删除项目"
   echo "0. 退出并摸摸喵酱"
   local choice
