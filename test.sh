@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - 融合进化版
-# 支持 Gemini API (全自动模式 + 纯控制台分组展示 + 强力找回掉签密钥)
-# 版本: 3.6.0
+# 支持 Gemini API (全自动模式 + 强力爆破防阻断提取)
+# 版本: 3.7.0
 
 set -Euo
 
@@ -14,9 +14,14 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.6.0"
+VERSION="3.7.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang-api}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
+TEMP_DIR=""
+
+# 初始化
+TEMP_DIR=$(mktemp -d -t gcp_script_XXXXXX) || { echo "错误：无法创建临时目录"; exit 1; }
+SECONDS=0
 
 # ===== 日志与错误处理 =====
 log() { 
@@ -37,6 +42,12 @@ handle_error() {
   if [ $exit_code -gt 1 ]; then log "ERROR" "发生严重错误，请检查日志"; return $exit_code; else return 0; fi
 }
 trap 'handle_error' ERR
+
+cleanup_resources() {
+  if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then rm -rf "$TEMP_DIR" 2>/dev/null || true; fi
+  echo -e "\n${CYAN}喵酱期待下次为主人服务喵～${NC}"
+}
+trap cleanup_resources EXIT
 
 # ===== 工具函数 =====
 retry() {
@@ -65,27 +76,36 @@ check_env() {
   if ! gcloud config list account --quiet &>/dev/null; then log "ERROR" "请先运行 'gcloud init'喵！"; exit 1; fi
 }
 
-parse_json() {
-  local json="$1"; local field="$2"
-  if [ -z "$json" ]; then return 1; fi
-  if command -v jq &>/dev/null; then
-    local res
-    res=$(echo "$json" | jq -r "$field" 2>/dev/null)
-    if [ -n "$res" ] && [ "$res" != "null" ]; then echo "$res"; return 0; fi
-  fi
-  if [ "$field" = ".keyString" ]; then
-    echo "$json" | grep -o '"keyString" *: *"[^"]*"' | sed 's/"keyString" *: *"//;s/"$//' | head -n 1
-  fi
-}
-
-# ===== 核心提取逻辑 (不管有没有账单都能强行抓取) =====
+# ===== 核心提取逻辑 (内置重试防阻断) =====
 extract_key_safely() {
   local project_id="$1"
-  local keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+  local keys_list=""
+  
+  local attempt=1
+  while [ $attempt -le $MAX_RETRY_ATTEMPTS ]; do
+    if keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null); then
+      break
+    fi
+    sleep 2
+    attempt=$((attempt+1))
+  done
+  
   if [ -n "$keys_list" ]; then
     while IFS= read -r key_name; do
+      key_name=$(echo "$key_name" | tr -d '\r' | xargs)
       [ -z "$key_name" ] && continue
-      local api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null || echo "")
+      
+      local api_key=""
+      local k_attempt=1
+      while [ $k_attempt -le $MAX_RETRY_ATTEMPTS ]; do
+        if api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null); then
+          break
+        fi
+        sleep 2
+        k_attempt=$((k_attempt+1))
+      done
+      
+      api_key=$(echo "$api_key" | tr -d '\r' | xargs)
       if [ -n "$api_key" ]; then
         echo "$api_key"
         return 0
@@ -295,7 +315,6 @@ gemini_get_keys_from_existing() {
     local billing_id="${billing_account_path##*/}"
     local billing_display_name
 
-    # 【重要修复】如果被Google解绑，不会直接跳过，而是强行进去捞Key！
     if [ -z "$billing_id" ] || [ "$billing_id" = "" ]; then
       billing_id="Unlinked"
       billing_display_name="未绑定结算账户 (被强行解绑)"
@@ -319,21 +338,18 @@ gemini_get_keys_from_existing() {
     log "INFO" "正在提取项目: ${project_id} (结算: ${billing_display_name})"
     
     local api_key
-    # 强行抓取！有Key就直接偷走！
     if api_key=$(extract_key_safely "$project_id"); then
       ALL_KEYS+=("$api_key")
       BILLING_KEY_MAP+=("${bi}:${api_key}")
       success=$((success+1))
       log "SUCCESS" "找到已有密钥！"
     else
-      # 没有Key，而且账单还被解绑了，那就真的没办法创建了，只能跳过
       if [ "$billing_id" = "Unlinked" ]; then
-        log "WARN" "无结算账户无法创建新密钥，含泪跳过喵！"
+        log "WARN" "项目已被解绑，且多次重试未发现存活的密钥，含泪跳过喵！"
         skipped=$((skipped+1))
         continue
       fi
 
-      # 有账单但没Key，帮它开通并创建！
       retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
       gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --quiet >/dev/null 2>&1 || true
       
