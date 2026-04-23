@@ -1,7 +1,7 @@
 #!/bin/bash
-# 优化的 GCP API 密钥管理工具 - 经典回归版
-# 支持 Gemini API (完美还原原始创建/启用/生成流程 + 纯控制台打印 + 幽灵记忆库)
-# 版本: 4.2.0
+# 优化的 GCP API 密钥管理工具 - 经典护航版
+# 支持 Gemini API (全量提取 + 动态救助掉签项目重绑账单 + 幽灵记忆库)
+# 版本: 4.3.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.2.0"
+VERSION="4.3.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang-api}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -118,6 +118,57 @@ unlink_projects_from_billing_account() {
   return 0
 }
 
+# ===== 核心提取逻辑 =====
+extract_key_safely() {
+  local project_id="$1"
+  
+  # 尝试唤醒服务
+  retry gcloud services enable apikeys.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
+
+  local keys_list=""
+  local attempt=1
+  while [ $attempt -le $MAX_RETRY_ATTEMPTS ]; do
+    if keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null); then
+      break
+    fi
+    sleep 2
+    attempt=$((attempt+1))
+  done
+  
+  if [ -n "$keys_list" ]; then
+    for key_name in $keys_list; do
+      key_name=$(echo "$key_name" | tr -d '\r' | xargs)
+      [ -z "$key_name" ] && continue
+      
+      local api_key=""
+      local k_attempt=1
+      while [ $k_attempt -le $MAX_RETRY_ATTEMPTS ]; do
+        if api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null); then
+          break
+        fi
+        sleep 2
+        k_attempt=$((k_attempt+1))
+      done
+      
+      api_key=$(echo "$api_key" | tr -d '\r' | xargs)
+      if [ -n "$api_key" ]; then
+        save_key_to_cache "$project_id" "$api_key"
+        echo "$api_key"
+        return 0
+      fi
+    done
+  fi
+
+  local cached_key
+  cached_key=$(get_key_from_cache "$project_id")
+  if [ -n "$cached_key" ]; then
+    echo "$cached_key"
+    return 0
+  fi
+  
+  return 1
+}
+
 # ===== 结算账户选择 =====
 select_billing_accounts() {
   local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
@@ -163,7 +214,7 @@ select_billing_accounts() {
   fi
 }
 
-# ===== Gemini 核心逻辑：创建项目 (完全还原经典代码) =====
+# ===== Gemini 核心逻辑：经典创建跑马灯流程 =====
 gemini_create_projects() {
   local keep_billing="${1:-false}"
   local auto_mode="${2:-false}"
@@ -223,13 +274,8 @@ gemini_create_projects() {
       local project_id=$(new_project_id)
       log "INFO" "[${global_idx}/${total_projects}] 正在处理项目: ${project_id} (结算: ${billing_name})"
       
-      # 1. 还原原汁原味的创建项目（不加 quiet）
       gcloud projects create "$project_id" || { failed=$((failed+1)); i=$((i+1)); continue; }
-      
-      # 2. 还原原汁原味的绑定账单
       gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" || true
-      
-      # 3. 还原打印账单信息（展示 billingEnabled: true）
       gcloud billing projects describe "$project_id" || true
       
       local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
@@ -238,22 +284,23 @@ gemini_create_projects() {
         skipped=$((skipped+1)); i=$((i+1)); continue
       fi
       
-      # 4. 彻底还原启用 Gemini API！(主人最在意的核心步骤)
-      log "INFO" "正在启用 Generative Language API..."
-      gcloud services enable generativelanguage.googleapis.com --project="$project_id" || { log "ERROR" "API启用失败喵！"; failed=$((failed+1)); i=$((i+1)); continue; }
+      gcloud services enable generativelanguage.googleapis.com --project="$project_id" || { failed=$((failed+1)); i=$((i+1)); continue; }
       
-      # 5. 生成密钥并打印出原生的 JSON 数据框
-      log "INFO" "正在创建 API Key..."
       local key_output=""
       key_output=$(gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json) || true
+      if [ -n "$key_output" ]; then echo "$key_output"; fi
       
       local api_key=""
       api_key=$(parse_json "$key_output" ".keyString") || true
-      
+
+      if [ -z "$api_key" ]; then
+        api_key=$(extract_key_safely "$project_id") || true
+      fi
+
       if [ -n "$api_key" ]; then
+        save_key_to_cache "$project_id" "$api_key"
         ALL_KEYS+=("$api_key")
         BILLING_KEY_MAP+=("${billing_idx}:${api_key}")
-        save_key_to_cache "$project_id" "$api_key"
         log "SUCCESS" "成功提取密钥！"
         success=$((success+1))
       else
@@ -301,59 +348,26 @@ gemini_create_projects() {
   fi
 }
 
-# ===== 核心提取逻辑 (针对现有项目，内置强力防阻断) =====
-extract_key_safely() {
-  local project_id="$1"
-  
-  # 哪怕没账单，也强行试着唤醒 API 服务
-  retry gcloud services enable apikeys.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
-
-  local keys_list=""
-  local attempt=1
-  while [ $attempt -le $MAX_RETRY_ATTEMPTS ]; do
-    if keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null); then
-      break
-    fi
-    sleep 2
-    attempt=$((attempt+1))
-  done
-  
-  if [ -n "$keys_list" ]; then
-    for key_name in $keys_list; do
-      key_name=$(echo "$key_name" | tr -d '\r' | xargs)
-      [ -z "$key_name" ] && continue
-      
-      local api_key=""
-      local k_attempt=1
-      while [ $k_attempt -le $MAX_RETRY_ATTEMPTS ]; do
-        if api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null); then
-          break
-        fi
-        sleep 2
-        k_attempt=$((k_attempt+1))
-      done
-      
-      api_key=$(echo "$api_key" | tr -d '\r' | xargs)
-      if [ -n "$api_key" ]; then
-        save_key_to_cache "$project_id" "$api_key"
-        echo "$api_key"
-        return 0
-      fi
-    done
-  fi
-
-  local cached_key
-  cached_key=$(get_key_from_cache "$project_id")
-  if [ -n "$cached_key" ]; then
-    echo "$cached_key"
-    return 0
-  fi
-  
-  return 1
-}
-
 gemini_get_keys_from_existing() {
-  log "INFO" "====== 从现有项目提取密钥 ======"
+  log "INFO" "====== 从现有项目强力提取密钥 ======"
+  
+  # 1. 先摸底查清目前有多少个结算账户，以及每个账户占用了多少配额
+  local open_billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
+  if [ -z "$open_billing_accounts" ]; then log "ERROR" "未找到可用的结算账户喵！"; return 1; fi
+  
+  local ALL_AVAILABLE_BIDS=()
+  local BID_PROJECT_COUNTS=()
+  local BID_DISPLAY_NAMES=()
+  
+  log "INFO" "喵酱正在分析结算账户配额..."
+  while IFS=',' read -r bid bname; do
+    bid="${bid##*/}"
+    ALL_AVAILABLE_BIDS+=("$bid")
+    BID_DISPLAY_NAMES+=("$bname")
+    local p_count=$(gcloud billing projects list --billing-account="$bid" --format='value(projectId)' 2>/dev/null | wc -l)
+    BID_PROJECT_COUNTS+=("$p_count")
+  done <<< "$open_billing_accounts"
+
   local projects
   projects=$(gcloud projects list --format='value(projectId)' 2>/dev/null || echo "")
   if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目喵！"; return 1; fi
@@ -373,19 +387,39 @@ gemini_get_keys_from_existing() {
     local billing_id="${billing_account_path##*/}"
     local billing_display_name
 
+    # 【核心救助逻辑】如果项目未绑定账单，自动寻找空闲账单复活它！
     if [ -z "$billing_id" ] || [ "$billing_id" = "" ]; then
-      billing_id="Unlinked"
-      billing_display_name="未绑定结算账户 (被强行解绑)"
+      log "WARN" "发现掉签项目 ${project_id}！喵酱尝试寻找空闲账单重新绑定..."
+      local rebind_success=false
+      for idx in "${!ALL_AVAILABLE_BIDS[@]}"; do
+        local candidate_bid="${ALL_AVAILABLE_BIDS[$idx]}"
+        local current_count="${BID_PROJECT_COUNTS[$idx]}"
+        # 目标是每个账单挂3个，如果没满3个就绑过去
+        if [ "$current_count" -lt 3 ]; then
+          if retry gcloud billing projects link "$project_id" --billing-account="$candidate_bid" --quiet >/dev/null 2>&1; then
+            log "SUCCESS" "重新绑定成功！(绑定至 ${BID_DISPLAY_NAMES[$idx]})"
+            billing_id="$candidate_bid"
+            billing_display_name="${BID_DISPLAY_NAMES[$idx]}"
+            BID_PROJECT_COUNTS[$idx]=$((current_count + 1))
+            rebind_success=true
+            break
+          fi
+        fi
+      done
+
+      if [ "$rebind_success" = false ]; then
+        billing_id="Unlinked"
+        billing_display_name="未绑定结算账户 (配额全满，重绑失败)"
+      fi
     else
       billing_display_name=$(gcloud billing accounts describe "$billing_id" --format='value(displayName)' 2>/dev/null || echo "$billing_id")
       [ -z "$billing_display_name" ] && billing_display_name="$billing_id"
     fi
 
+    # 记录到展示数组
     local bi=-1
     for idx in "${!BILLING_IDS[@]}"; do
-      if [ "${BILLING_IDS[$idx]}" = "$billing_id" ]; then
-        bi="$idx"; break
-      fi
+      if [ "${BILLING_IDS[$idx]}" = "$billing_id" ]; then bi="$idx"; break; fi
     done
     if [ "$bi" -eq -1 ]; then
       BILLING_IDS+=("$billing_id")
@@ -396,7 +430,6 @@ gemini_get_keys_from_existing() {
     log "INFO" "正在提取项目: ${project_id} (结算: ${billing_display_name})"
     
     local api_key
-    # 强行提取，无论有没有账单！
     if api_key=$(extract_key_safely "$project_id"); then
       ALL_KEYS+=("$api_key")
       BILLING_KEY_MAP+=("${bi}:${api_key}")
@@ -404,7 +437,7 @@ gemini_get_keys_from_existing() {
       log "SUCCESS" "找到已有密钥！"
     else
       if [ "$billing_id" = "Unlinked" ]; then
-        log "WARN" "项目已锁死且记忆库中无存档，含泪跳过喵！"
+        log "WARN" "项目彻底断网且记忆库无存档，含泪跳过喵！"
         skipped=$((skipped+1))
         continue
       fi
@@ -471,7 +504,7 @@ show_menu() {
   echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
   echo "1. [经典] 自动创建项目并提取密钥 (清理旧项目释放配额)"
   echo "2. [新增] 自动创建项目并提取密钥 (保留旧项目结算绑定)"
-  echo "3. 从现有项目提取密钥 (防丢失记忆库，全量提取纯控制台打印)"
+  echo "3. 从现有项目提取密钥 (智能流浪收容救助项目，纯净打印)"
   echo "4. 批量删除项目"
   echo "0. 退出并摸摸喵酱"
   local choice
