@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持自定义项目数量、终端打印 JSON Key 以及一键配置现有项目
-# 版本: 2.2.0
+# 支持 API Key 与 JSON 双重共存提取、终端分离打印、全自动配置现有项目
+# 版本: 2.3.0
 
 # 仅启用 errtrace (-E) 与 nounset (-u)
 set -Euo
@@ -17,8 +17,8 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="2.2.0"
-LAST_UPDATED="2025-05-23"
+VERSION="2.3.0"
+LAST_UPDATED="2026-05-24"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 TEMP_DIR=""
@@ -29,8 +29,10 @@ SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
 KEY_DIR="${KEY_DIR:-./keys}"
 ENABLE_EXTRA_ROLES=("roles/iam.serviceAccountUser" "roles/aiplatform.user")
 
-# 全局数组，用于收集本次生成的密钥文件路径
+# 全局数组，用于收集本次生成的双重密钥
+CONFIGURED_PROJECT_IDS=()
 GENERATED_JSON_KEYS=()
+GENERATED_API_KEYS=()
 
 # ===== 初始化 =====
 TEMP_DIR=$(mktemp -d -t gcp_vertex_XXXXXX) || {
@@ -85,7 +87,7 @@ cleanup_resources() {
         rm -rf "$TEMP_DIR" 2>/dev/null || true
     fi
     if [ $exit_code -eq 0 ]; then
-        echo -e "\n${CYAN}感谢使用 Vertex AI 密钥管理工具${NC}"
+        echo -e "\n${CYAN}感谢使用 Vertex AI 密钥管理工具喵～${NC}"
     fi
 }
 trap cleanup_resources EXIT
@@ -105,8 +107,7 @@ retry() {
             log "ERROR" "命令在 ${max_attempts} 次尝试后失败: $*"
             return $error_code
         fi
-        delay=$(( attempt * 10 + RANDOM % 5 ))
-        log "WARN" "重试 ${attempt}/${max_attempts}: $* (等待 ${delay}s)"
+        delay=$(( attempt * 5 + RANDOM % 3 ))
         sleep $delay
         attempt=$((attempt + 1)) || true
     done
@@ -157,7 +158,6 @@ is_service_enabled() {
 }
 
 check_env() {
-    log "INFO" "检查环境配置..."
     require_cmd gcloud
     if ! gcloud config list account --quiet &>/dev/null; then
         log "ERROR" "请先运行 'gcloud init' 初始化"
@@ -169,7 +169,6 @@ check_env() {
         log "ERROR" "请先运行 'gcloud auth login' 登录"
         exit 1
     fi
-    log "SUCCESS" "环境检查通过 (账号: ${active_account})"
 }
 
 enable_services() {
@@ -182,25 +181,19 @@ enable_services() {
             "iam.googleapis.com"
             "iamcredentials.googleapis.com"
             "cloudresourcemanager.googleapis.com"
+            "apikeys.googleapis.com" # 新增 API Keys 服务支持
         )
     fi
-    log "INFO" "为项目 ${proj} 启用必要的API服务..."
     local failed=0
     for svc in "${services[@]}"; do
-        if is_service_enabled "$proj" "$svc"; then
-            log "INFO" "服务 ${svc} 已启用"
-            continue
-        fi
-        log "INFO" "启用服务: ${svc}"
-        if retry gcloud services enable "$svc" --project="$proj" --quiet; then
-            log "SUCCESS" "成功启用服务: ${svc}"
-        else
-            log "ERROR" "无法启用服务: ${svc}"
-            failed=$((failed + 1)) || true
+        if ! is_service_enabled "$proj" "$svc"; then
+            if ! retry gcloud services enable "$svc" --project="$proj" --quiet; then
+                log "ERROR" "无法启用服务: ${svc}"
+                failed=$((failed + 1)) || true
+            fi
         fi
     done
     if [ $failed -gt 0 ]; then
-        log "WARN" "有 ${failed} 个服务启用失败"
         return 1
     fi
     return 0
@@ -223,40 +216,47 @@ show_progress() {
     if [ "$completed" -eq "$total" ]; then echo; fi
 }
 
-display_generated_keys() {
-    if [ ${#GENERATED_JSON_KEYS[@]} -eq 0 ]; then
-        return 0
+# ===== 核心提取函数 =====
+
+get_or_create_api_key() {
+    local project_id="$1"
+    
+    # 尝试查找已有的 API Key
+    local keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+    if [ -n "$keys_list" ]; then
+        local key_name=$(echo "$keys_list" | head -n 1)
+        local api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null || echo "")
+        if [ -n "$api_key" ]; then
+            echo "$api_key"
+            return 0
+        fi
     fi
     
-    echo -e "\n${CYAN}${BOLD}====== 本次提取的 Vertex AI 密钥 (JSON) ======${NC}"
-    echo -e "${YELLOW}提示: Vertex AI 必须使用完整的 JSON 作为密钥认证。${NC}\n"
-    
-    for key_path in "${GENERATED_JSON_KEYS[@]}"; do
-        if [ -f "$key_path" ]; then
-            echo -e "${GREEN}▶ 来源文件: ${key_path}${NC}"
-            echo -e "--------------------------------------------------"
-            cat "$key_path"
-            echo -e "\n--------------------------------------------------\n"
+    # 如果没有，则创建新 API Key
+    gcloud services api-keys create --project="$project_id" --display-name="Vertex API Key" --quiet >/dev/null 2>&1 || true
+    keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+    if [ -n "$keys_list" ]; then
+        local key_name=$(echo "$keys_list" | head -n 1)
+        local api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null || echo "")
+        if [ -n "$api_key" ]; then
+            echo "$api_key"
+            return 0
         fi
-    done
+    fi
+    return 1
 }
-
-# ===== Vertex AI 核心功能 =====
 
 vertex_setup_service_account() {
     local project_id="$1"
     local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
     
     if ! gcloud iam service-accounts describe "$sa_email" --project="$project_id" &>/dev/null; then
-        log "INFO" "创建服务账号..."
         if ! retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" \
             --display-name="Vertex AI Service Account" \
-            --project="$project_id" --quiet; then
+            --project="$project_id" --quiet >/dev/null 2>&1; then
             log "ERROR" "创建服务账号失败"
             return 1
         fi
-    else
-        log "INFO" "服务账号已存在"
     fi
     
     local roles=(
@@ -266,40 +266,66 @@ vertex_setup_service_account() {
         "roles/aiplatform.user"
     )
     
-    log "INFO" "分配IAM角色..."
     for role in "${roles[@]}"; do
-        if retry gcloud projects add-iam-policy-binding "$project_id" \
+        retry gcloud projects add-iam-policy-binding "$project_id" \
             --member="serviceAccount:${sa_email}" \
             --role="$role" \
-            --quiet &>/dev/null; then
-            log "SUCCESS" "授予角色: ${role}"
-        else
-            log "WARN" "授予角色失败: ${role}"
-        fi
+            --quiet >/dev/null 2>&1 || true
     done
     
-    log "INFO" "生成服务账号密钥..."
     local key_file="${KEY_DIR}/${project_id}-${SERVICE_ACCOUNT_NAME}-$(date +%Y%m%d-%H%M%S).json"
     
     if retry gcloud iam service-accounts keys create "$key_file" \
         --iam-account="$sa_email" \
         --project="$project_id" \
-        --quiet; then
+        --quiet >/dev/null 2>&1; then
         chmod 600 "$key_file"
-        log "SUCCESS" "密钥已保存: ${key_file}"
-        
-        # 将生成的密钥路径加入全局数组，以便后续打印
         GENERATED_JSON_KEYS+=("$key_file")
         return 0
     else
-        log "ERROR" "生成密钥失败"
+        log "ERROR" "生成 JSON 密钥失败"
+        GENERATED_JSON_KEYS+=("获取失败")
         return 1
     fi
 }
 
+display_generated_credentials() {
+    if [ ${#CONFIGURED_PROJECT_IDS[@]} -eq 0 ]; then
+        return 0
+    fi
+    
+    echo -e "\n${CYAN}${BOLD}====== 🔑 喵酱的提取结果汇报 ======${NC}"
+    
+    echo -e "\n${YELLOW}${BOLD}[1/2] API 密钥 (Key) 列表：${NC}"
+    echo -e "${YELLOW}提示: 可用于轻量级的 REST API 请求 (如 Gemini on Vertex)${NC}"
+    echo -e "──────────────────────────────────────────────────"
+    for i in "${!CONFIGURED_PROJECT_IDS[@]}"; do
+        echo -e "${GREEN}项目:${NC} ${CONFIGURED_PROJECT_IDS[i]}"
+        echo -e "${CYAN}Key:${NC}  ${GENERATED_API_KEYS[i]}"
+        echo -e "──────────────────────────────────────────────────"
+    done
+    
+    echo -e "\n${YELLOW}${BOLD}[2/2] 服务账号凭证 (JSON) 列表：${NC}"
+    echo -e "${YELLOW}提示: Vertex AI SDK 与后端 ADC 鉴权必须使用此 JSON 凭证。${NC}"
+    for i in "${!CONFIGURED_PROJECT_IDS[@]}"; do
+        local j_file="${GENERATED_JSON_KEYS[i]}"
+        if [ "$j_file" != "获取失败" ] && [ -f "$j_file" ]; then
+            echo -e "──────────────────────────────────────────────────"
+            echo -e "${GREEN}▶ 项目: ${CONFIGURED_PROJECT_IDS[i]} | 来源文件: ${j_file}${NC}"
+            echo -e "──────────────────────────────────────────────────"
+            cat "$j_file"
+            echo ""
+        fi
+    done
+}
+
+# ===== Vertex AI 主流程 =====
+
 vertex_create_projects() {
-    log "INFO" "====== 创建新项目并生成密钥 ======"
+    log "INFO" "====== 创建新项目并生成双重密钥 ======"
+    CONFIGURED_PROJECT_IDS=()
     GENERATED_JSON_KEYS=()
+    GENERATED_API_KEYS=()
     
     local existing_projects
     existing_projects=$(gcloud projects list --filter="billingAccountName:billingAccounts/${BILLING_ACCOUNT}" --format='value(projectId)' 2>/dev/null | wc -l)
@@ -336,45 +362,45 @@ vertex_create_projects() {
         local project_id
         project_id=$(new_project_id "$project_prefix")
         
-        log "INFO" "[${i}/${num_projects}] 创建项目: ${project_id}"
+        log "INFO" "[${i}/${num_projects}] 创建并配置项目: ${project_id}"
         
-        if ! retry gcloud projects create "$project_id" --quiet; then
+        if ! retry gcloud projects create "$project_id" --quiet >/dev/null 2>&1; then
             log "ERROR" "创建项目失败: ${project_id}"
             failed=$((failed + 1)) || true
-            show_progress "$i" "$num_projects"
-            i=$((i + 1)) || true
-            continue
+            i=$((i + 1)); continue
         fi
         
-        log "INFO" "关联结算账户..."
-        if ! retry gcloud billing projects link "$project_id" --billing-account="$BILLING_ACCOUNT" --quiet; then
+        if ! retry gcloud billing projects link "$project_id" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1; then
             log "ERROR" "关联结算账户失败: ${project_id}"
-            gcloud projects delete "$project_id" --quiet 2>/dev/null
+            gcloud projects delete "$project_id" --quiet >/dev/null 2>&1 || true
             failed=$((failed + 1)) || true
-            show_progress "$i" "$num_projects"
-            i=$((i + 1)) || true
-            continue
+            i=$((i + 1)); continue
         fi
         
-        log "INFO" "启用必要的API..."
         if ! enable_services "$project_id"; then
-            log "ERROR" "启用API失败: ${project_id}"
             failed=$((failed + 1)) || true
-            show_progress "$i" "$num_projects"
-            i=$((i + 1)) || true
-            continue
+            i=$((i + 1)); continue
         fi
         
-        log "INFO" "配置服务账号..."
-        if vertex_setup_service_account "$project_id"; then
-            log "SUCCESS" "成功配置项目: ${project_id}"
-            success=$((success + 1)) || true
+        # 并发生成双重凭证
+        local j_success=false
+        if vertex_setup_service_account "$project_id"; then j_success=true; fi
+        
+        local api_key
+        if api_key=$(get_or_create_api_key "$project_id"); then
+            GENERATED_API_KEYS+=("$api_key")
         else
-            log "ERROR" "配置服务账号失败: ${project_id}"
+            GENERATED_API_KEYS+=("获取失败")
+        fi
+        
+        if [ "$j_success" = true ]; then
+            CONFIGURED_PROJECT_IDS+=("$project_id")
+            success=$((success + 1)) || true
+            log "SUCCESS" "成功提取项目 ${project_id} 的 API Key & JSON！"
+        else
             failed=$((failed + 1)) || true
         fi
         
-        show_progress "$i" "$num_projects"
         sleep 2
         i=$((i + 1)) || true
     done
@@ -382,13 +408,15 @@ vertex_create_projects() {
     echo -e "\n${GREEN}创建操作完成！${NC}"
     echo "成功: ${success}, 失败: ${failed}"
     
-    # 打印本次生成的所有 JSON 密钥
-    display_generated_keys
+    # 分离打印结果
+    display_generated_credentials
 }
 
 vertex_configure_existing() {
     log "INFO" "====== 在现有项目上配置 Vertex AI ======"
+    CONFIGURED_PROJECT_IDS=()
     GENERATED_JSON_KEYS=()
+    GENERATED_API_KEYS=()
     
     log "INFO" "获取项目列表..."
     local all_projects
@@ -415,76 +443,49 @@ vertex_configure_existing() {
     local total=${#project_array[@]}
     
     if [ "$total" -eq 0 ]; then
-        log "WARN" "未找到与当前结算账户关联的项目"
-        echo -e "\n${YELLOW}请选择操作:${NC}"
-        echo "1. 显示所有活跃项目 (尝试强行关联账单)"
-        echo "2. 返回主菜单"
-        local list_choice
-        read -r -p "请选择 [1-2]: " list_choice
-        if [ "$list_choice" = "1" ]; then
-            while IFS= read -r line; do
-                if [ -n "$line" ]; then project_array+=("$line"); fi
-            done <<< "$all_projects"
-            total=${#project_array[@]}
-        else
-            return 0
-        fi
+        log "WARN" "未找到与当前结算账户关联的项目喵！"
+        return 1
     fi
     
-    echo -e "\n项目列表:"
-    for ((i=0; i<total && i<20; i++)); do
-        local billing_info
-        billing_info=$(gcloud billing projects describe "${project_array[i]}" --format='value(billingAccountName)' 2>/dev/null || echo "")
-        local status=""
-        if [ -n "$billing_info" ] && [[ "$billing_info" == *"${BILLING_ACCOUNT}"* ]]; then
-            status="(已关联当前结算账户)"
-        elif [ -n "$billing_info" ]; then
-            status="(关联了其他结算账户)"
-        else
-            status="(未关联结算)"
-        fi
-        echo "$((i+1)). ${project_array[i]} ${status}"
-    done
+    echo -e "\n${CYAN}主人，请选择如何配置现有项目喵：${NC}"
+    echo "1. 手动选择项目 (输入编号)"
+    echo "2. 全自动配置 (自动处理所有已关联当前结算账户的项目)"
+    echo "0. 返回主菜单"
     
-    if [ "$total" -gt 20 ]; then
-        echo "... 还有 $((total-20)) 个项目"
-    fi
+    local conf_choice
+    read -r -p "请选择 [0-2]: " conf_choice
     
     local selected_projects=()
-    
-    # 新增：询问是否一键配置
-    echo ""
-    if ask_yes_no "是否一键在现有项目中配置 Vertex项目 (自动选中所有已关联当前结算账户的项目)？" "N"; then
-        log "INFO" "正在筛选已关联当前结算账户的项目..."
-        for proj in "${project_array[@]}"; do
-            local b_info
-            b_info=$(gcloud billing projects describe "$proj" --format='value(billingAccountName)' 2>/dev/null || echo "")
-            if [ -n "$b_info" ] && [[ "$b_info" == *"${BILLING_ACCOUNT}"* ]]; then
-                selected_projects+=("$proj")
-            fi
-        done
-        log "INFO" "自动选中了 ${#selected_projects[@]} 个已关联结算的项目。"
-    else
-        read -r -p "请输入项目编号（多个用空格分隔，输入 'all' 选择全部显示项目）: " -a numbers
-        
-        if [ "${#numbers[@]}" -gt 0 ] && [ "${numbers[0]}" = "all" ]; then
-            selected_projects=("${project_array[@]}")
-        else
-            for num in "${numbers[@]}"; do
-                if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
-                    selected_projects+=("${project_array[$((num-1))]}")
-                fi
+    case "$conf_choice" in
+        1)
+            echo -e "\n项目列表:"
+            for ((i=0; i<total; i++)); do
+                echo "$((i+1)). ${project_array[i]}"
             done
-        fi
-    fi
+            read -r -p "请输入项目编号（多个用空格分隔，输入 'all' 选择全部）: " -a numbers
+            if [ "${#numbers[@]}" -gt 0 ] && [ "${numbers[0]}" = "all" ]; then
+                selected_projects=("${project_array[@]}")
+            else
+                for num in "${numbers[@]}"; do
+                    if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
+                        selected_projects+=("${project_array[$((num-1))]}")
+                    fi
+                done
+            fi
+            ;;
+        2)
+            log "INFO" "喵酱开启全自动模式！正在选中所有已关联当前结算账户的项目..."
+            selected_projects=("${project_array[@]}")
+            log "INFO" "自动选中了 ${#selected_projects[@]} 个项目。"
+            ;;
+        0) return 0 ;;
+        *) log "ERROR" "无效选项"; return 1 ;;
+    esac
     
     if [ ${#selected_projects[@]} -eq 0 ]; then
         log "ERROR" "未选择任何项目，操作已取消。"
         return 1
     fi
-    
-    echo -e "\n${YELLOW}将为 ${#selected_projects[@]} 个项目配置 Vertex AI${NC}"
-    if ! ask_yes_no "确认继续？" "N"; then return 1; fi
     
     local success=0
     local failed=0
@@ -494,46 +495,40 @@ vertex_configure_existing() {
         current=$((current + 1)) || true
         log "INFO" "[${current}/${#selected_projects[@]}] 处理项目: ${project_id}"
         
-        local billing_info
-        billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
-        
-        if [ -z "$billing_info" ]; then
-            log "WARN" "项目未关联结算账户，尝试关联..."
-            if ! retry gcloud billing projects link "$project_id" --billing-account="$BILLING_ACCOUNT" --quiet; then
-                log "ERROR" "关联结算账户失败: ${project_id}"
-                failed=$((failed + 1)) || true
-                show_progress "$current" "${#selected_projects[@]}"
-                continue
-            fi
-        fi
-        
-        log "INFO" "启用必要的API..."
         if ! enable_services "$project_id"; then
             failed=$((failed + 1)) || true
-            show_progress "$current" "${#selected_projects[@]}"
             continue
         fi
         
-        log "INFO" "配置服务账号..."
-        if vertex_setup_service_account "$project_id"; then
+        local j_success=false
+        if vertex_setup_service_account "$project_id"; then j_success=true; fi
+        
+        local api_key
+        if api_key=$(get_or_create_api_key "$project_id"); then
+            GENERATED_API_KEYS+=("$api_key")
+        else
+            GENERATED_API_KEYS+=("获取失败")
+        fi
+        
+        if [ "$j_success" = true ]; then
+            CONFIGURED_PROJECT_IDS+=("$project_id")
             success=$((success + 1)) || true
+            log "SUCCESS" "成功提取项目 ${project_id} 的 API Key & JSON！"
         else
             failed=$((failed + 1)) || true
         fi
-        show_progress "$current" "${#selected_projects[@]}"
     done
     
     echo -e "\n${GREEN}配置操作完成！${NC}"
     echo "成功: ${success}, 失败: ${failed}"
     
-    # 打印本次生成的所有 JSON 密钥
-    display_generated_keys
+    display_generated_credentials
 }
 
 vertex_manage_keys() {
     log "INFO" "====== 管理服务账号密钥 ======"
     echo "请选择操作:"
-    echo "1. 列出本地保存的所有服务账号密钥"
+    echo "1. 列出本地保存的所有服务账号 JSON 密钥"
     echo "0. 返回"
     echo
     local choice
@@ -560,8 +555,8 @@ vertex_manage_keys() {
 main() {
     echo -e "${CYAN}${BOLD}"
     echo "╔═══════════════════════════════════════════════════════╗"
-    echo "║       Vertex AI 独立密钥管理工具 v${VERSION}               ║"
-    echo "║       (支持终端打印 JSON Key / 自定义项目数量)          ║"
+    echo "║       Vertex AI 双擎独立密钥管理工具 v${VERSION}        ║"
+    echo "║       (支持终端纯净分离打印 API Key 和 JSON)          ║"
     echo "╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
@@ -604,12 +599,12 @@ main() {
     
     while true; do
         echo -e "\n=============================================="
-        echo -e "           Vertex 操作菜单"
+        echo -e "            Vertex 操作菜单"
         echo -e "=============================================="
         echo "请选择操作:"
-        echo "1. 创建新项目并生成密钥"
-        echo "2. 在现有项目上配置 Vertex AI"
-        echo "3. 管理服务账号密钥"
+        echo "1. 创建新项目并生成双重密钥 (API Key + JSON)"
+        echo "2. 在现有项目上提取/配置 Vertex AI 双重密钥"
+        echo "3. 管理本地服务账号 JSON 密钥"
         echo "0. 退出工具"
         echo
         
