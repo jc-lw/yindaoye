@@ -1,23 +1,20 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持自定义数量、双密钥(JSON + Agent Platform 专属 AQ.格式)共存分离展示、全自动配置
-# 版本: 2.4.0
+# 支持全自动配置、纯 AQ. 格式专属密钥提取、全量 API 权限开通
+# 版本: 2.5.0
 
-# 仅启用 errtrace (-E) 与 nounset (-u)
 set -Euo
 
 # ===== 颜色定义 =====
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m' 
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="2.4.0"
+VERSION="2.5.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 TEMP_DIR=""
@@ -25,16 +22,9 @@ TEMP_DIR=""
 # Vertex模式配置
 BILLING_ACCOUNT="${BILLING_ACCOUNT:-}"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
-KEY_DIR="${KEY_DIR:-./keys}"
-
-# 全局数组，用于分别收集 JSON 路径和文本 Key
-GENERATED_JSON_KEYS=()
-GENERATED_API_KEYS=()
 
 # ===== 初始化 =====
 TEMP_DIR=$(mktemp -d -t gcp_vertex_XXXXXX) || { echo "错误：无法创建临时目录"; exit 1; }
-mkdir -p "$KEY_DIR" 2>/dev/null || true
-chmod 700 "$KEY_DIR" 2>/dev/null || true
 SECONDS=0
 
 # ===== 日志与错误处理 =====
@@ -110,69 +100,42 @@ check_env() {
     log "SUCCESS" "环境检查通过"
 }
 
-enable_services() {
+enable_all_services() {
     local proj="$1"
+    # 霸气拉满！开通全部核心 API 权限
     local services=(
         "aiplatform.googleapis.com"
+        "generativelanguage.googleapis.com"
+        "discoveryengine.googleapis.com"
         "iam.googleapis.com"
         "iamcredentials.googleapis.com"
         "cloudresourcemanager.googleapis.com"
         "apikeys.googleapis.com"
+        "compute.googleapis.com"
     )
-    log "INFO" "为项目 ${proj} 启用必要的API服务..."
-    local failed=0
+    log "INFO" "正在为项目 ${proj} 强力开通全部核心 API 权限..."
     for svc in "${services[@]}"; do
-        retry gcloud services enable "$svc" --project="$proj" --quiet >/dev/null 2>&1 || failed=$((failed + 1))
+        retry gcloud services enable "$svc" --project="$proj" --quiet >/dev/null 2>&1 || true
     done
-    if [ $failed -gt 0 ]; then return 1; fi
-    return 0
 }
 
-show_progress() {
-    local completed="${1:-0}"; local total="${2:-1}"
-    if [ "$total" -le 0 ]; then return; fi
-    if [ "$completed" -gt "$total" ]; then completed=$total; fi
-    local percent=$((completed * 100 / total))
-    local bar_length=50
-    local filled=$((percent * bar_length / 100))
-    local bar=""; local i=0
-    while [ $i -lt $filled ]; do bar+="█"; i=$((i + 1)); done
-    i=$filled
-    while [ $i -lt $bar_length ]; do bar+="░"; i=$((i + 1)); done
-    printf "\r[%s] %3d%% (%d/%d)" "$bar" "$percent" "$completed" "$total"
-    if [ "$completed" -eq "$total" ]; then echo; fi
-}
-
-# ===== 密钥提取与展示 =====
-
-vertex_setup_service_account() {
+# ===== 核心：仅提取 AQ. 格式专属密钥 =====
+setup_and_extract_aq_key() {
     local project_id="$1"
     local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
     
+    # 1. 确保服务账号存在（AQ 密钥必须绑定服务账号）
     if ! gcloud iam service-accounts describe "$sa_email" --project="$project_id" &>/dev/null; then
-        retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex AI Service Account" --project="$project_id" --quiet >/dev/null 2>&1 || return 1
+        retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Agent SA" --project="$project_id" --quiet >/dev/null 2>&1 || true
     fi
     
-    local roles=("roles/aiplatform.admin" "roles/iam.serviceAccountUser" "roles/iam.serviceAccountTokenCreator" "roles/aiplatform.user")
+    # 2. 赋予最高权限
+    local roles=("roles/editor" "roles/aiplatform.admin" "roles/iam.serviceAccountUser")
     for role in "${roles[@]}"; do
         retry gcloud projects add-iam-policy-binding "$project_id" --member="serviceAccount:${sa_email}" --role="$role" --quiet >/dev/null 2>&1 || true
     done
-    
-    local key_file="${KEY_DIR}/${project_id}-${SERVICE_ACCOUNT_NAME}-$(date +%Y%m%d-%H%M%S).json"
-    if retry gcloud iam service-accounts keys create "$key_file" --iam-account="$sa_email" --project="$project_id" --quiet >/dev/null 2>&1; then
-        chmod 600 "$key_file"
-        GENERATED_JSON_KEYS+=("$key_file")
-        return 0
-    else
-        return 1
-    fi
-}
 
-extract_api_key() {
-    local project_id="$1"
-    local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
-    
-    # 1. 先尝试寻找已有的 AQ. 开头密钥 (绑定了服务账号的密钥)
+    # 3. 寻找或创建 AQ. 格式密钥
     local keys_list
     keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     if [ -n "$keys_list" ]; then
@@ -188,10 +151,9 @@ extract_api_key() {
         done
     fi
 
-    # 2. 如果没有 AQ. 密钥，使用 gcloud beta 指令，将 API Key 强制绑定到服务账号，生成 Agent Platform 专属密钥
-    retry gcloud beta services api-keys create --project="$project_id" --display-name="Vertex Agent Platform Key" --service-account="$sa_email" --quiet >/dev/null 2>&1 || true
+    # 如果没有找到，强制生成绑定服务账号的 AQ 密钥
+    retry gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet >/dev/null 2>&1 || true
     
-    # 3. 再次拉取并获取 AQ. 密钥
     keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     if [ -n "$keys_list" ]; then
         for key_name in $keys_list; do
@@ -204,7 +166,8 @@ extract_api_key() {
                 return 0
             fi
         done
-        # 如果由于某种原因没生成 AQ.，兜底返回最新生成的
+        
+        # 极端情况兜底
         local fallback_name
         fallback_name=$(echo "$keys_list" | head -n 1 | tr -d '\r' | xargs)
         local fallback_key
@@ -214,34 +177,14 @@ extract_api_key() {
             return 0
         fi
     fi
+
     return 1
 }
 
-display_generated_keys() {
-    if [ ${#GENERATED_API_KEYS[@]} -gt 0 ]; then
-        echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Agent Platform API 密钥 (AQ. 格式) ======${NC}"
-        for k in "${GENERATED_API_KEYS[@]}"; do echo "$k"; done
-        echo
-    fi
-
-    if [ ${#GENERATED_JSON_KEYS[@]} -gt 0 ]; then
-        echo -e "\n${CYAN}${BOLD}====== 本次生成的 Vertex AI 凭证 (JSON) ======${NC}"
-        for key_path in "${GENERATED_JSON_KEYS[@]}"; do
-            if [ -f "$key_path" ]; then
-                echo -e "${GREEN}▶ 来源文件: ${key_path}${NC}"
-                echo -e "--------------------------------------------------"
-                cat "$key_path"
-                echo -e "\n--------------------------------------------------\n"
-            fi
-        done
-    fi
-}
-
-# ===== 核心功能 =====
+# ===== 功能 1：创建新项目 =====
 vertex_create_projects() {
-    log "INFO" "====== 创建新项目并生成双密钥 ======"
-    GENERATED_JSON_KEYS=()
-    GENERATED_API_KEYS=()
+    log "INFO" "====== 创建新项目并生成 Agent Platform 专属密钥 ======"
+    local GENERATED_API_KEYS=()
     
     local existing_projects
     existing_projects=$(gcloud projects list --filter="billingAccountName:billingAccounts/${BILLING_ACCOUNT}" --format='value(projectId)' 2>/dev/null | wc -l)
@@ -266,18 +209,10 @@ vertex_create_projects() {
         gcloud projects create "$project_id" --quiet >/dev/null 2>&1 || { failed=$((failed+1)); i=$((i+1)); continue; }
         gcloud billing projects link "$project_id" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
         
-        if ! enable_services "$project_id"; then failed=$((failed+1)); i=$((i+1)); continue; fi
+        enable_all_services "$project_id"
         
-        # 1. 提取服务账号 JSON
-        if vertex_setup_service_account "$project_id"; then
-            log "SUCCESS" "JSON 密钥生成成功！"
-        else
-            log "WARN" "JSON 密钥生成失败！"
-        fi
-
-        # 2. 提取文本 API Key (必定绑定为 AQ. 格式)
         local api_key
-        if api_key=$(extract_api_key "$project_id"); then
+        if api_key=$(setup_and_extract_aq_key "$project_id"); then
             GENERATED_API_KEYS+=("$api_key")
             log "SUCCESS" "AQ. 格式 API 密钥提取成功！"
             success=$((success+1))
@@ -285,19 +220,22 @@ vertex_create_projects() {
             log "WARN" "API 密钥提取失败！"
             failed=$((failed+1))
         fi
-        
         i=$((i+1))
     done
     
     echo -e "\n${GREEN}====== 创建操作完成 ======${NC}"
     echo "总计成功: ${success}, 失败: ${failed}"
-    display_generated_keys
+    if [ ${#GENERATED_API_KEYS[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Agent Platform API 密钥 (AQ. 格式) ======${NC}"
+        for k in "${GENERATED_API_KEYS[@]}"; do echo "$k"; done
+        echo
+    fi
 }
 
+# ===== 功能 2：一键配置现有项目 =====
 vertex_configure_existing() {
-    log "INFO" "====== 在现有项目上配置 Vertex AI ======"
-    GENERATED_JSON_KEYS=()
-    GENERATED_API_KEYS=()
+    log "INFO" "====== 在现有项目上配置 Vertex AI 并提取密钥 ======"
+    local GENERATED_API_KEYS=()
     
     local all_projects
     all_projects=$(gcloud projects list --format='value(projectId)' --filter="lifecycleState=ACTIVE" 2>/dev/null || echo "")
@@ -306,7 +244,6 @@ vertex_configure_existing() {
     local project_array=()
     while IFS= read -r line; do [ -n "$line" ] && project_array+=("$line"); done <<< "$all_projects"
     local total=${#project_array[@]}
-    
     local selected_projects=()
     
     echo -e "\n${CYAN}主人想怎么配置现有项目呢？${NC}"
@@ -362,16 +299,10 @@ vertex_configure_existing() {
             retry gcloud billing projects link "$project_id" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
         fi
         
-        if ! enable_services "$project_id"; then failed=$((failed+1)); continue; fi
+        enable_all_services "$project_id"
         
-        if vertex_setup_service_account "$project_id"; then
-            log "SUCCESS" "JSON 生成成功！"
-        else
-            log "WARN" "JSON 生成失败！"
-        fi
-
         local api_key
-        if api_key=$(extract_api_key "$project_id"); then
+        if api_key=$(setup_and_extract_aq_key "$project_id"); then
             GENERATED_API_KEYS+=("$api_key")
             log "SUCCESS" "AQ. 格式 API 密钥提取成功！"
             success=$((success+1))
@@ -383,18 +314,10 @@ vertex_configure_existing() {
     
     echo -e "\n${GREEN}====== 配置操作完成 ======${NC}"
     echo "总计成功: ${success}, 失败: ${failed}"
-    display_generated_keys
-}
-
-vertex_manage_keys() {
-    log "INFO" "====== 本地服务账号密钥管理 ======"
-    local key_files=()
-    while IFS= read -r -d '' file; do key_files+=("$file"); done < <(find "$KEY_DIR" -name "*.json" -type f -print0 2>/dev/null)
-    if [ ${#key_files[@]} -eq 0 ]; then
-        log "INFO" "喵酱没找到任何保存在本地的密钥文件喵"
-    else
-        echo -e "\n本地存放着 ${#key_files[@]} 个 JSON 密钥文件:"
-        for ((i=0; i<${#key_files[@]}; i++)); do echo "$((i+1)). ${key_files[i]}"; done
+    if [ ${#GENERATED_API_KEYS[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Agent Platform API 密钥 (AQ. 格式) ======${NC}"
+        for k in "${GENERATED_API_KEYS[@]}"; do echo "$k"; done
+        echo
     fi
 }
 
@@ -403,7 +326,7 @@ main() {
     echo -e "${CYAN}${BOLD}"
     echo "╔═══════════════════════════════════════════════════════╗"
     echo "║        Vertex AI 独立密钥管理工具 v${VERSION}               ║"
-    echo "║        (支持 AQ. 专属密钥提取 / 全自动项目配置)         ║"
+    echo "║        (纯 AQ. 专属密钥提取 / 全量 API 权限开通)        ║"
     echo "╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
@@ -443,18 +366,16 @@ main() {
         echo -e "           Vertex 操作菜单"
         echo -e "=============================================="
         echo "请选择操作:"
-        echo "1. 创建新项目并生成双密钥 (JSON + Agent Platform 专属 AQ Key)"
-        echo "2. 在现有项目上配置 Vertex AI (支持一键全自动提取)"
-        echo "3. 管理本地服务账号密钥 (JSON)"
+        echo "1. 创建新项目并提取 Vertex 专属密钥 (AQ. 格式)"
+        echo "2. 在现有项目上开通权限并提取密钥 (支持一键全自动)"
         echo "0. 退出工具并摸摸喵酱"
         echo
         
         local choice
-        read -r -p "请选择 [0-3]: " choice
+        read -r -p "请选择 [0-2]: " choice
         case "$choice" in
             1) vertex_create_projects ;;
             2) vertex_configure_existing ;;
-            3) vertex_manage_keys ;;
             0) exit 0 ;;
             *) log "ERROR" "无效选项喵" ;;
         esac
