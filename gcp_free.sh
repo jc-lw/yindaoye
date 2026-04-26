@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# 喵酱的 GCP 大清洗 + 按结算单抽 + TG通知脚本 (自动开API版) 🐾
+# 喵酱的 GCP 大清洗 + 活结算探测 + TG通知脚本 🐾
 # ==========================================
 
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
@@ -25,7 +25,7 @@ send_tg_msg() {
         --data-urlencode "parse_mode=HTML" > /dev/null
 }
 
-echo "🐾 喵酱启动【大清洗与严格单抽模式】喵！"
+echo "🐾 喵酱启动【活结算探测与单抽模式】喵！"
 PROJECTS=$(gcloud projects list --format="value(projectId)")
 
 if [ -z "$PROJECTS" ]; then
@@ -39,57 +39,57 @@ fi
 echo "======================================"
 echo "🧹 第一阶段：全网搜寻并摧毁旧的免费机器..."
 for PROJECT in $PROJECTS; do
-    echo "  -> 🔍 正在扫描项目: $PROJECT"
     EXISTING_VMS=$(gcloud compute instances list --project="$PROJECT" --filter="machineType:e2-micro" --format="value(name,zone)" 2>/dev/null)
     
     if [ -n "$EXISTING_VMS" ]; then
         echo -e "$EXISTING_VMS" | while read VM_INFO; do
             NAME=$(echo "$VM_INFO" | awk '{print $1}')
             VM_ZONE=$(echo "$VM_INFO" | awk '{print $2}')
-            
             if [ -n "$NAME" ]; then
-                echo "    💥 发现目标！正在摧毁项目 [$PROJECT] 中的 $NAME..."
+                echo "  -> 💥 发现目标！正在摧毁项目 [$PROJECT] 中的 $NAME..."
                 gcloud compute instances delete "$NAME" --project="$PROJECT" --zone="$VM_ZONE" --quiet
-                echo "    ✅ 摧毁成功！"
+                echo "  -> ✅ 摧毁成功！"
             fi
         done
     fi
 done
 
 # ==========================================
-# 第二阶段：按结算账户严格单抽创建
+# 第二阶段：探测活结算，单抽创建
 # ==========================================
 echo "======================================"
-echo "🎲 第二阶段：匹配结算账户，严格执行“一结算一机器”..."
+echo "🎲 第二阶段：探测健康结算账户，严格执行“一结算一机器”..."
 
 SHUFFLED_PROJECTS=$(echo "$PROJECTS" | shuf)
 declare -A PROCESSED_BILLING_ACCOUNTS
 SUCCESS_PROJECTS=()
 
 for PROJECT in $SHUFFLED_PROJECTS; do
-    echo "  -> ⚙️ 正在匹配项目 [$PROJECT] 的结算信息..."
-    
     # 获取结算账户 ID
     BILLING_ACCOUNT=$(gcloud beta billing projects describe "$PROJECT" --format="value(billingAccountName)" 2>/dev/null)
     
     if [ -z "$BILLING_ACCOUNT" ]; then
-        echo "    ⏭️ 无可用结算账户，跳过喵。"
         continue
     fi
 
-    # 检查这个结算账户是不是已经被抽中过了
+    # 如果这个结算账户已经处理过（不管是成功还是因为风控失败），都跳过
     if [ -n "${PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]}" ]; then
-        echo "    ⏭️ 跳过：该结算账户 [$BILLING_ACCOUNT] 已被使用，喵酱帮你守住钱包喵！"
         continue
     fi
 
-    echo "    🎉 结算账户 [$BILLING_ACCOUNT] 选中了项目: $PROJECT！"
-    PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="1"
+    echo "  -> ⚙️ 结算账户 [$BILLING_ACCOUNT] 选中了项目: $PROJECT"
+    
+    # 【核心探测机制】：尝试开启 API，这是检验结算账户是否被风控的唯一真理！
+    echo "    🔌 正在测试该结算账户是否健康 (尝试激活 API)..."
+    if ! gcloud services enable compute.googleapis.com --project="$PROJECT" >/dev/null 2>&1; then
+        echo "    ❌ 激活失败！该结算账户可能处于风控状态 (Suspicious activity) 喵！跳过该账户下的所有项目。"
+        PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="DEAD"
+        continue
+    fi
 
-    # 【核心修复】：为选中的项目激活 Compute Engine API
-    echo "    🔌 正在为该项目激活 Compute Engine API (这需要十几秒，请主人耐心等喵)..."
-    gcloud services enable compute.googleapis.com --project="$PROJECT" --quiet
-    sleep 15 # 等待 API 生效，防止 GCP 反应慢报错
+    echo "    ✨ API 激活成功！这是一个健康的结算账户喵！等待 15 秒生效..."
+    PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="ALIVE"
+    sleep 15 
 
     echo "    🚀 准备开机..."
     if ! gcloud compute instances create "$VM_NAME" \
@@ -120,7 +120,6 @@ for PROJECT in $SHUFFLED_PROJECTS; do
         --target-tags=allow-all-ingress \
         --quiet >/dev/null 2>&1 || true
 
-    # 抓取 IP
     IP=$(gcloud compute instances describe "$VM_NAME" --project="$PROJECT" --zone="$ZONE" --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
 
     # 远程配置环境与探针
@@ -153,14 +152,14 @@ IP：<code>${IP}</code>
     
     send_tg_msg "$TG_MSG"
 
-    SUCCESS_PROJECTS+=("🐾 IP: $IP | 项目: $PROJECT | [消息已推送至 TG]")
+    SUCCESS_PROJECTS+=("🐾 IP: $IP | 项目: $PROJECT | [已推送至 TG]")
 done
 
 echo -e "\n======================================"
 if [ ${#SUCCESS_PROJECTS[@]} -eq 0 ]; then
-    echo "❌ 报告主人，目前没有任何符合条件的新机器部署成功喵..."
+    echo "❌ 报告主人，没有部署成功。请检查是不是所有结算账户都被风控了喵..."
 else
-    echo "🎉 完美收工！以下是本次大清洗并新建的汇总喵："
+    echo "🎉 完美收工！本次成功开通的健康机器汇总："
     for RES in "${SUCCESS_PROJECTS[@]}"; do
         echo "$RES"
     done
