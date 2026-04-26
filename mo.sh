@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持全自动配置、纯 AQ. 格式专属密钥提取、全量 API 权限开通、企业组织防延迟适配
-# 版本: 2.6.0
+# 支持全自动配置、AQ 专属密钥提取、智能错误回显与防拦截降级机制
+# 版本: 2.7.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="2.6.0"
+VERSION="2.7.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 TEMP_DIR=""
@@ -120,7 +120,7 @@ enable_all_services() {
     sleep 10
 }
 
-# ===== 核心：仅提取 AQ. 格式专属密钥 (抗组织延迟版) =====
+# ===== 核心：提取 AQ. 格式专属密钥 (带智能降级机制) =====
 setup_and_extract_aq_key() {
     local project_id="$1"
     local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
@@ -155,23 +155,42 @@ setup_and_extract_aq_key() {
         done
     fi
 
-    # 4. 如果没有找到，强制生成并防延迟重试
+    # 4. 强制生成 AQ 密钥并打印错误日志
     log "INFO" "正在请求生成 AQ. 格式专属密钥..."
     local attempt=1
     local create_success=false
-    while [ $attempt -le 5 ]; do
-        if gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet >/dev/null 2>&1; then
+    while [ $attempt -le 6 ]; do
+        local create_err
+        if create_err=$(gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet 2>&1); then
             create_success=true
             break
         fi
-        log "WARN" "接口暂未就绪，等待组织权限同步 ($attempt/5)..."
-        sleep 8
+        
+        # 提取报错信息的最后一行展示给主人
+        local err_msg
+        err_msg=$(echo "$create_err" | tail -n 1 | tr -d '\r')
+        log "WARN" "接口未就绪或被拦截 ($attempt/6) -> 错误信息: $err_msg"
+        
+        # 如果是策略拦截，直接跳出重试不浪费时间
+        if [[ "$err_msg" == *"Policy"* ]] || [[ "$err_msg" == *"PermissionDenied"* && "$attempt" -ge 4 ]]; then
+            log "WARN" "检测到组织策略拦截或权限持续被拒，终止 AQ 密钥尝试喵。"
+            break
+        fi
+        
+        sleep 15
         attempt=$((attempt+1))
     done
 
-    # 5. 再次拉取并获取 AQ. 密钥
+    # B计划（降级方案）：如果 AQ 创建失败，生成普通的 AIza 密钥保底
+    if [ "$create_success" = false ]; then
+        log "WARN" "AQ. 格式密钥生成失败，启动 B 计划降级生成普通 API 密钥(AIza)..."
+        gcloud services api-keys create --project="$project_id" --display-name="Fallback API Key" --quiet >/dev/null 2>&1 || true
+    fi
+
+    # 5. 再次拉取获取密钥
     keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     if [ -n "$keys_list" ]; then
+        local fallback_key=""
         for key_name in $keys_list; do
             key_name=$(echo "$key_name" | tr -d '\r' | xargs)
             [ -z "$key_name" ] && continue
@@ -181,13 +200,11 @@ setup_and_extract_aq_key() {
                 echo "$api_key"
                 return 0
             fi
+            if [[ "$api_key" == AIza* ]]; then
+                fallback_key="$api_key"
+            fi
         done
         
-        # 极端情况兜底
-        local fallback_name
-        fallback_name=$(echo "$keys_list" | head -n 1 | tr -d '\r' | xargs)
-        local fallback_key
-        fallback_key=$(gcloud services api-keys get-key-string "$fallback_name" --format='value(keyString)' 2>/dev/null | tr -d '\r' | xargs)
         if [ -n "$fallback_key" ]; then
             echo "$fallback_key"
             return 0
@@ -230,7 +247,11 @@ vertex_create_projects() {
         local api_key
         if api_key=$(setup_and_extract_aq_key "$project_id"); then
             GENERATED_API_KEYS+=("$api_key")
-            log "SUCCESS" "AQ. 格式 API 密钥提取成功！"
+            if [[ "$api_key" == AQ.* ]]; then
+                log "SUCCESS" "AQ. 格式 API 密钥提取成功！"
+            else
+                log "SUCCESS" "AIza 普通格式 API 密钥降级提取成功！"
+            fi
             success=$((success+1))
         else
             log "WARN" "API 密钥提取失败！"
@@ -242,7 +263,7 @@ vertex_create_projects() {
     echo -e "\n${GREEN}====== 创建操作完成 ======${NC}"
     echo "总计成功: ${success}, 失败: ${failed}"
     if [ ${#GENERATED_API_KEYS[@]} -gt 0 ]; then
-        echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Agent Platform API 密钥 (AQ. 格式) ======${NC}"
+        echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Agent Platform API 密钥 ======${NC}"
         for k in "${GENERATED_API_KEYS[@]}"; do echo "$k"; done
         echo
     fi
@@ -264,7 +285,7 @@ vertex_configure_existing() {
     
     echo -e "\n${CYAN}主人想怎么配置现有项目呢？${NC}"
     echo "1. 手动挑选项目配置"
-    echo "2. 全自动一键配置 (自动选中所有关联当前账单的项目)"
+    echo "2. 全自动一键配置 (自动选中所有关联当前账单的项目，包括默认创建的 My First Project)"
     local list_choice
     read -r -p "请选择 [1-2, 默认: 1]: " list_choice
     list_choice=${list_choice:-1}
@@ -320,7 +341,11 @@ vertex_configure_existing() {
         local api_key
         if api_key=$(setup_and_extract_aq_key "$project_id"); then
             GENERATED_API_KEYS+=("$api_key")
-            log "SUCCESS" "AQ. 格式 API 密钥提取成功！"
+            if [[ "$api_key" == AQ.* ]]; then
+                log "SUCCESS" "AQ. 格式 API 密钥提取成功！"
+            else
+                log "SUCCESS" "AIza 普通格式 API 密钥降级提取成功！"
+            fi
             success=$((success+1))
         else
             log "WARN" "API 密钥提取失败！"
@@ -331,7 +356,7 @@ vertex_configure_existing() {
     echo -e "\n${GREEN}====== 配置操作完成 ======${NC}"
     echo "总计成功: ${success}, 失败: ${failed}"
     if [ ${#GENERATED_API_KEYS[@]} -gt 0 ]; then
-        echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Agent Platform API 密钥 (AQ. 格式) ======${NC}"
+        echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Agent Platform API 密钥 ======${NC}"
         for k in "${GENERATED_API_KEYS[@]}"; do echo "$k"; done
         echo
     fi
@@ -342,7 +367,7 @@ main() {
     echo -e "${CYAN}${BOLD}"
     echo "╔═══════════════════════════════════════════════════════╗"
     echo "║        Vertex AI 独立密钥管理工具 v${VERSION}               ║"
-    echo "║        (纯 AQ. 专属密钥提取 / 组织防延迟适配版)         ║"
+    echo "║        (抗组织拦截智能降级版 / 全量 API 权限拉满)       ║"
     echo "╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
@@ -382,7 +407,7 @@ main() {
         echo -e "           Vertex 操作菜单"
         echo -e "=============================================="
         echo "请选择操作:"
-        echo "1. 创建新项目并提取 Vertex 专属密钥 (AQ. 格式)"
+        echo "1. 创建新项目并提取 Vertex 专属密钥 (优先 AQ，遇阻退回 AIza)"
         echo "2. 在现有项目上开通权限并提取密钥 (支持一键全自动)"
         echo "0. 退出工具并摸摸喵酱"
         echo
