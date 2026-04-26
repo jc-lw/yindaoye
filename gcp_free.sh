@@ -1,118 +1,119 @@
 #!/bin/bash
 # ==========================================
-# 喵酱的 GCP 盲盒开机脚本 (按结算账户随机单抽版) 🐾
+# 喵酱的 GCP 终极破而后立 + 自动挂探针脚本 🐾
 # ==========================================
 
-ZONE="us-west1-a"
-MACHINE_TYPE="e2-micro"
+ZONE="us-west1-a" 
+MACHINE_TYPE="e2-micro" 
 IMAGE_FAMILY="debian-12"
 IMAGE_PROJECT="debian-cloud"
 SSH_PASS="202825"
 VM_NAME="free-tier-vm"
 
-echo "🐾 喵酱开始为主人扫描所有的项目并匹配结算账户喵..."
+echo "🐾 喵酱启动强制重建协议喵！正在扫描所有项目..."
 
-# 1. 获取所有项目，并用 shuf 随机打乱顺序（实现“随机抽取”的核心喵）
-SHUFFLED_PROJECTS=$(gcloud projects list --format="value(projectId)" | shuf)
+# 1. 获取当前账号下的所有项目 ID
+PROJECTS=$(gcloud projects list --format="value(projectId)")
+TARGET_PROJECT=""
 
-# 用于记录已经开过机器的结算账户
-declare -A PROCESSED_BILLING_ACCOUNTS
-SELECTED_PROJECTS=()
-RESULTS=()
+echo "🔍 开始全盘扫描现有的免费实例 (e2-micro)..."
+for PROJECT in $PROJECTS; do
+    if ! gcloud services check compute.googleapis.com --project="$PROJECT" >/dev/null 2>&1; then
+        continue
+    fi
 
-for PROJECT in $SHUFFLED_PROJECTS; do
-    # 尝试获取该项目的结算账户信息
-    BILLING_ACCOUNT=$(gcloud beta billing projects describe $PROJECT --format="value(billingAccountName)" 2>/dev/null)
+    if [ -z "$TARGET_PROJECT" ]; then
+        TARGET_PROJECT=$PROJECT
+    fi
+
+    EXISTING_VMS=$(gcloud compute instances list --project="$PROJECT" --filter="machineType:e2-micro" --format="value(name,zone)" 2>/dev/null)
     
-    # 如果该项目有结算账户
-    if [ -n "$BILLING_ACCOUNT" ]; then
-        # 检查这个结算账户是不是已经被抽中过了
-        if [ -z "${PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]}" ]; then
-            echo "🎉 结算账户 [$BILLING_ACCOUNT] 随机抽中了项目: $PROJECT 喵！"
-            PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="1"
-            SELECTED_PROJECTS+=("$PROJECT")
-        fi
+    if [ -n "$EXISTING_VMS" ]; then
+        echo -e "$EXISTING_VMS" | while read VM_INFO; do
+            NAME=$(echo "$VM_INFO" | awk '{print $1}')
+            VM_ZONE=$(echo "$VM_INFO" | awk '{print $2}')
+            
+            echo "======================================"
+            echo "⚠️ 喵酱在项目 [$PROJECT] 发现了旧的机器: $NAME"
+            echo "💥 准备执行数据销毁与删除指令... (5秒后执行)"
+            sleep 5
+            
+            gcloud compute instances delete "$NAME" --project="$PROJECT" --zone="$VM_ZONE" --quiet
+            echo "✅ 旧机器已化为星尘喵～"
+        done
     fi
 done
 
-if [ ${#SELECTED_PROJECTS[@]} -eq 0 ]; then
-    echo "⚠️ 喵酱没有找到任何绑定了结算账户的项目喵..."
+if [ -z "$TARGET_PROJECT" ]; then
+    echo "❌ 喵酱没有找到任何开启了结算账户的可用项目喵！"
     exit 1
 fi
 
-echo -e "\n🚀 抽签完毕！准备为选中的项目开通服务器喵！"
+echo -e "\n======================================"
+echo "🚀 扫荡完毕！准备在选定项目 [$TARGET_PROJECT] 中创建全新 VPS 喵！"
+gcloud config set project "$TARGET_PROJECT" >/dev/null 2>&1
 
-# 2. 开始为抽中的项目执行开机任务
-for PROJECT in "${SELECTED_PROJECTS[@]}"; do
-    echo -e "\n======================================"
-    echo "✨ 正在处理项目: $PROJECT"
-    gcloud config set project $PROJECT >/dev/null 2>&1
+# 2. 创建全新的免费规格实例
+gcloud compute instances create "$VM_NAME" \
+    --project="$TARGET_PROJECT" \
+    --zone="$ZONE" \
+    --machine-type="$MACHINE_TYPE" \
+    --image-family="$IMAGE_FAMILY" \
+    --image-project="$IMAGE_PROJECT" \
+    --network-tier=PREMIUM \
+    --tags=allow-all-ingress \
+    --quiet
 
-    # 启用 Compute Engine API
-    gcloud services enable compute.googleapis.com --project=$PROJECT >/dev/null 2>&1 || true
+echo "⏳ 给机器一点点时间苏醒，喵酱乖乖等待 20 秒..."
+sleep 20
 
-    # 创建实例
-    if gcloud compute instances describe $VM_NAME --zone=$ZONE >/dev/null 2>&1; then
-         echo "⚠️ 实例 $VM_NAME 已经存在喵，将直接尝试刷新防火墙和 SSH 配置！"
-    else
-         echo "🚀 正在创建 e2-micro 免费实例..."
-         gcloud compute instances create $VM_NAME \
-            --project=$PROJECT \
-            --zone=$ZONE \
-            --machine-type=$MACHINE_TYPE \
-            --image-family=$IMAGE_FAMILY \
-            --image-project=$IMAGE_PROJECT \
-            --network-tier=PREMIUM \
-            --tags=allow-all-ingress \
-            --quiet
-         
-         echo "⏳ 给 GCP 一点时间启动机器，喵酱原地转个圈 (等待 20 秒)..."
-         sleep 20
-    fi
+# 3. 配置防火墙：外部端口权限全部开放 0.0.0.0/0
+echo "🛡️ 正在开放所有外部端口 (0.0.0.0/0)..."
+gcloud compute firewall-rules create allow-all-ingress-custom \
+    --project="$TARGET_PROJECT" \
+    --direction=INGRESS \
+    --priority=1000 \
+    --network=default \
+    --action=ALLOW \
+    --rules=all \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags=allow-all-ingress \
+    --quiet >/dev/null 2>&1 || true
 
-    # 配置防火墙：外部端口权限全部开放 0.0.0.0/0
-    echo "🛡️ 正在开放所有端口 (0.0.0.0/0)..."
-    gcloud compute firewall-rules create allow-all-ingress-custom \
-        --project=$PROJECT \
-        --direction=INGRESS \
-        --priority=1000 \
-        --network=default \
-        --action=ALLOW \
-        --rules=all \
-        --source-ranges=0.0.0.0/0 \
-        --target-tags=allow-all-ingress \
-        --quiet >/dev/null 2>&1 || true
+IP=$(gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
 
-    # 获取外部 IP
-    IP=$(gcloud compute instances describe $VM_NAME --zone=$ZONE --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
-
-    # 生成内部执行脚本 (换源 + 改密码)
-    echo "🔧 正在远程开启 SSH 密码登录..."
-    cat << 'EOF' > remote_setup.sh
+# 4. 生成包含装环境、改密码和装探针的远程脚本
+echo "🔧 正在远程换源、装环境、开启 SSH 并自动挂载哪吒探针喵..."
+cat << 'EOF' > remote_setup.sh
 #!/bin/bash
+# 1. Debian 换源
 sed -i 's/deb.debian.org/mirrors.mit.edu/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+
+# 2. 提前安装好依赖环境 (解决 unzip 缺失报错)
+apt-get update -y
+apt-get install -y unzip curl wget
+
+# 3. 配置密码
 echo "root:202825" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
 sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
 systemctl restart ssh || systemctl restart sshd
+
+# 4. 下载并安装 Nezha Agent
+echo "🐾 正在启动 Nezha Agent..."
+curl -L https://raw.githubusercontent.com/nezhahq/scripts/main/agent/install.sh -o agent.sh
+chmod +x agent.sh
+env NZ_SERVER=45.142.166.116:8008 NZ_TLS=false NZ_CLIENT_SECRET=EyxBehjdWpW3hnrzXavynrDIsGjWzKRH ./agent.sh
 EOF
 
-    # 远程执行脚本
-    gcloud compute ssh $VM_NAME --zone=$ZONE --project=$PROJECT --command="sudo bash -s" < remote_setup.sh --quiet
-
-    if [ $? -eq 0 ]; then
-        echo "✅ $PROJECT 配置完美完成喵！"
-        RESULTS+=("IP: $IP | 账号: root | 密码: $SSH_PASS | 项目: $PROJECT")
-    else
-        echo "❌ $PROJECT 的 SSH 远程配置似乎有点小问题，主人可能需要检查一下 API 权限喵..."
-    fi
-    
-    rm -f remote_setup.sh
-done
+# 通过安全隧道执行
+gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$TARGET_PROJECT" --command="sudo bash -s" < remote_setup.sh --quiet
+rm -f remote_setup.sh
 
 echo -e "\n======================================"
-echo "🎉 喵酱的任务完成啦！本次成功开通的 VPS 汇总喵："
-for RES in "${RESULTS[@]}"; do
-    echo "🐾 $RES"
-done
+echo "🎉 喵酱的任务大功告成啦！机器已成功上线探针："
+echo "🐾 外网 IP: $IP"
+echo "🐾 登录账号: root"
+echo "🐾 登录密码: $SSH_PASS"
+echo "🐾 所属项目: $TARGET_PROJECT"
 echo "======================================"
