@@ -1,9 +1,8 @@
 #!/bin/bash
 # ==========================================
-# 喵酱的 GCP 大清洗 + 按结算单抽 + TG通知脚本 (防卡死优化版) 🐾
+# 喵酱的 GCP 大清洗 + 按结算单抽 + TG通知脚本 (自动开API版) 🐾
 # ==========================================
 
-# 🚫 核心修复：强制关闭 gcloud 的所有交互式询问，防止后台卡死！
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 ZONE="us-west1-a" 
@@ -41,7 +40,6 @@ echo "======================================"
 echo "🧹 第一阶段：全网搜寻并摧毁旧的免费机器..."
 for PROJECT in $PROJECTS; do
     echo "  -> 🔍 正在扫描项目: $PROJECT"
-    # 直接查询，如果有错误会自动因为 DISABLE_PROMPTS 退出并被忽略，不会卡死
     EXISTING_VMS=$(gcloud compute instances list --project="$PROJECT" --filter="machineType:e2-micro" --format="value(name,zone)" 2>/dev/null)
     
     if [ -n "$EXISTING_VMS" ]; then
@@ -64,7 +62,6 @@ done
 echo "======================================"
 echo "🎲 第二阶段：匹配结算账户，严格执行“一结算一机器”..."
 
-# 把项目列表打乱，实现真正的随机单抽
 SHUFFLED_PROJECTS=$(echo "$PROJECTS" | shuf)
 declare -A PROCESSED_BILLING_ACCOUNTS
 SUCCESS_PROJECTS=()
@@ -86,12 +83,15 @@ for PROJECT in $SHUFFLED_PROJECTS; do
         continue
     fi
 
-    echo "    🎉 结算账户 [$BILLING_ACCOUNT] 选中了项目: $PROJECT！准备开机..."
-    
-    # 标记该结算账户已使用
+    echo "    🎉 结算账户 [$BILLING_ACCOUNT] 选中了项目: $PROJECT！"
     PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="1"
 
-    # 创建新机器
+    # 【核心修复】：为选中的项目激活 Compute Engine API
+    echo "    🔌 正在为该项目激活 Compute Engine API (这需要十几秒，请主人耐心等喵)..."
+    gcloud services enable compute.googleapis.com --project="$PROJECT" --quiet
+    sleep 15 # 等待 API 生效，防止 GCP 反应慢报错
+
+    echo "    🚀 准备开机..."
     if ! gcloud compute instances create "$VM_NAME" \
         --project="$PROJECT" \
         --zone="$ZONE" \
@@ -145,7 +145,6 @@ EOF
 
     echo "    ✅ 部署成功喵！正在推送到 Telegram..."
     
-    # 构造 TG 消息
     TG_MSG="🐾 <b>喵酱汇报：新免费节点上线！</b>
 项目：<code>${PROJECT}</code>
 IP：<code>${IP}</code>
