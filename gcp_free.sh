@@ -1,7 +1,10 @@
 #!/bin/bash
 # ==========================================
-# 喵酱的 GCP 大清洗 + 按结算单抽 + TG通知脚本 🐾
+# 喵酱的 GCP 大清洗 + 按结算单抽 + TG通知脚本 (防卡死优化版) 🐾
 # ==========================================
+
+# 🚫 核心修复：强制关闭 gcloud 的所有交互式询问，防止后台卡死！
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 ZONE="us-west1-a" 
 MACHINE_TYPE="e2-micro" 
@@ -15,7 +18,6 @@ TG_TOKEN="7745672750:AAG7q5904SL9-fMfmS5TZnwu_10rQ4SDsHc"
 TG_CHAT_ID="7034468156"
 TG_API="https://api.telegram.org"
 
-# 发送 TG 消息的专属小工具喵
 send_tg_msg() {
     local text="$1"
     curl -s -X POST "${TG_API}/bot${TG_TOKEN}/sendMessage" \
@@ -38,19 +40,20 @@ fi
 echo "======================================"
 echo "🧹 第一阶段：全网搜寻并摧毁旧的免费机器..."
 for PROJECT in $PROJECTS; do
-    if ! gcloud compute instances list --project="$PROJECT" >/dev/null 2>&1; then
-        continue
-    fi
-    
+    echo "  -> 🔍 正在扫描项目: $PROJECT"
+    # 直接查询，如果有错误会自动因为 DISABLE_PROMPTS 退出并被忽略，不会卡死
     EXISTING_VMS=$(gcloud compute instances list --project="$PROJECT" --filter="machineType:e2-micro" --format="value(name,zone)" 2>/dev/null)
+    
     if [ -n "$EXISTING_VMS" ]; then
         echo -e "$EXISTING_VMS" | while read VM_INFO; do
             NAME=$(echo "$VM_INFO" | awk '{print $1}')
             VM_ZONE=$(echo "$VM_INFO" | awk '{print $2}')
             
-            echo "  -> 💥 正在摧毁项目 [$PROJECT] 中的 $NAME..."
-            gcloud compute instances delete "$NAME" --project="$PROJECT" --zone="$VM_ZONE" --quiet
-            echo "  -> ✅ 摧毁成功！"
+            if [ -n "$NAME" ]; then
+                echo "    💥 发现目标！正在摧毁项目 [$PROJECT] 中的 $NAME..."
+                gcloud compute instances delete "$NAME" --project="$PROJECT" --zone="$VM_ZONE" --quiet
+                echo "    ✅ 摧毁成功！"
+            fi
         done
     fi
 done
@@ -67,26 +70,25 @@ declare -A PROCESSED_BILLING_ACCOUNTS
 SUCCESS_PROJECTS=()
 
 for PROJECT in $SHUFFLED_PROJECTS; do
-    if ! gcloud compute instances list --project="$PROJECT" >/dev/null 2>&1; then
-        continue
-    fi
-
-    # 核心：获取该项目绑定的结算账户 ID
-    BILLING_ACCOUNT=$(gcloud billing projects describe "$PROJECT" --format="value(billingAccountName)" 2>/dev/null)
+    echo "  -> ⚙️ 正在匹配项目 [$PROJECT] 的结算信息..."
+    
+    # 获取结算账户 ID
+    BILLING_ACCOUNT=$(gcloud beta billing projects describe "$PROJECT" --format="value(billingAccountName)" 2>/dev/null)
     
     if [ -z "$BILLING_ACCOUNT" ]; then
+        echo "    ⏭️ 无可用结算账户，跳过喵。"
         continue
     fi
 
     # 检查这个结算账户是不是已经被抽中过了
     if [ -n "${PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]}" ]; then
-        echo "  -> ⏭️ 跳过 [$PROJECT]：其结算账户已开通机器，喵酱帮你守住钱包喵！"
+        echo "    ⏭️ 跳过：该结算账户 [$BILLING_ACCOUNT] 已被使用，喵酱帮你守住钱包喵！"
         continue
     fi
 
-    echo "  -> 🎉 结算账户 [$BILLING_ACCOUNT] 选中了项目: $PROJECT！准备开机..."
+    echo "    🎉 结算账户 [$BILLING_ACCOUNT] 选中了项目: $PROJECT！准备开机..."
     
-    # 标记该结算账户已使用，后续该结算下的项目全部跳过
+    # 标记该结算账户已使用
     PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="1"
 
     # 创建新机器
@@ -99,11 +101,11 @@ for PROJECT in $SHUFFLED_PROJECTS; do
         --network-tier=PREMIUM \
         --tags=allow-all-ingress \
         --quiet; then
-        echo "  -> ❌ 机器创建失败喵..."
+        echo "    ❌ 机器创建失败，可能是配额限制喵..."
         continue
     fi
 
-    echo "  -> ⏳ 等待机器苏醒 (20 秒)..."
+    echo "    ⏳ 等待机器苏醒 (20 秒)..."
     sleep 20
 
     # 开放防火墙
@@ -122,8 +124,8 @@ for PROJECT in $SHUFFLED_PROJECTS; do
     IP=$(gcloud compute instances describe "$VM_NAME" --project="$PROJECT" --zone="$ZONE" --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
 
     # 远程配置环境与探针
-    echo "  -> 🔧 正在配置环境与探针..."
-    cat << 'EOF' > remote_setup.sh
+    echo "    🔧 正在配置环境与探针..."
+    cat << 'EOF' > remote_setup_$PROJECT.sh
 #!/bin/bash
 sed -i 's/deb.debian.org/mirrors.mit.edu/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 apt-get update -y
@@ -138,12 +140,12 @@ chmod +x agent.sh
 env NZ_SERVER=45.142.166.116:8008 NZ_TLS=false NZ_CLIENT_SECRET=EyxBehjdWpW3hnrzXavynrDIsGjWzKRH ./agent.sh
 EOF
 
-    gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --command="sudo bash -s" < remote_setup.sh --quiet
-    rm -f remote_setup.sh
+    gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --command="sudo bash -s" < remote_setup_$PROJECT.sh --quiet
+    rm -f remote_setup_$PROJECT.sh
 
-    echo "  -> ✅ 部署成功喵！正在推送到 Telegram..."
+    echo "    ✅ 部署成功喵！正在推送到 Telegram..."
     
-    # 构造 HTML 格式的 TG 消息发送给主人
+    # 构造 TG 消息
     TG_MSG="🐾 <b>喵酱汇报：新免费节点上线！</b>
 项目：<code>${PROJECT}</code>
 IP：<code>${IP}</code>
