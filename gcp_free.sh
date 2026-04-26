@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# 喵酱的 GCP 终极破而后立 + 自动挂探针脚本 🐾
+# 喵酱的 GCP 终极破而后立 + 自动挂探针脚本 (Bug修复版) 🐾
 # ==========================================
 
 ZONE="us-west1-a" 
@@ -18,14 +18,19 @@ TARGET_PROJECT=""
 
 echo "🔍 开始全盘扫描现有的免费实例 (e2-micro)..."
 for PROJECT in $PROJECTS; do
-    if ! gcloud services check compute.googleapis.com --project="$PROJECT" >/dev/null 2>&1; then
+    # 【修复核心】直接尝试查询该项目的实例列表，如果失败（没结算/没开API），直接跳过
+    if ! gcloud compute instances list --project="$PROJECT" >/dev/null 2>&1; then
         continue
     fi
 
+    echo "✨ 成功读取到已激活结算的项目: $PROJECT 喵！"
+
+    # 记录第一个可用的项目作为后续建新机器的备用
     if [ -z "$TARGET_PROJECT" ]; then
         TARGET_PROJECT=$PROJECT
     fi
 
+    # 精准查找该项目下的 e2-micro 实例
     EXISTING_VMS=$(gcloud compute instances list --project="$PROJECT" --filter="machineType:e2-micro" --format="value(name,zone)" 2>/dev/null)
     
     if [ -n "$EXISTING_VMS" ]; then
@@ -34,13 +39,15 @@ for PROJECT in $PROJECTS; do
             VM_ZONE=$(echo "$VM_INFO" | awk '{print $2}')
             
             echo "======================================"
-            echo "⚠️ 喵酱在项目 [$PROJECT] 发现了旧的机器: $NAME"
-            echo "💥 准备执行数据销毁与删除指令... (5秒后执行)"
-            sleep 5
+            echo "⚠️ 喵酱在项目 [$PROJECT] 发现了旧的机器: $NAME (可用区: $VM_ZONE)"
+            echo "💥 准备执行数据销毁与删除指令... (3秒后执行)"
+            sleep 3
             
             gcloud compute instances delete "$NAME" --project="$PROJECT" --zone="$VM_ZONE" --quiet
             echo "✅ 旧机器已化为星尘喵～"
         done
+    else
+        echo "🐾 该项目里干干净净，没有旧的免费机器喵。"
     fi
 done
 
@@ -82,14 +89,14 @@ gcloud compute firewall-rules create allow-all-ingress-custom \
 
 IP=$(gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
 
-# 4. 生成包含装环境、改密码和装探针的远程脚本
+# 4. 远程装环境、改密码和装探针
 echo "🔧 正在远程换源、装环境、开启 SSH 并自动挂载哪吒探针喵..."
 cat << 'EOF' > remote_setup.sh
 #!/bin/bash
 # 1. Debian 换源
 sed -i 's/deb.debian.org/mirrors.mit.edu/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
-# 2. 提前安装好依赖环境 (解决 unzip 缺失报错)
+# 2. 提前安装好依赖环境
 apt-get update -y
 apt-get install -y unzip curl wget
 
@@ -111,7 +118,7 @@ gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$TARGET_PROJECT" --comma
 rm -f remote_setup.sh
 
 echo -e "\n======================================"
-echo "🎉 喵酱的任务大功告成啦！机器已成功上线探针："
+echo "🎉 喵酱的终极任务大功告成啦！机器已成功上线探针："
 echo "🐾 外网 IP: $IP"
 echo "🐾 登录账号: root"
 echo "🐾 登录密码: $SSH_PASS"
