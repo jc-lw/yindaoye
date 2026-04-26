@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# 喵酱的多项目全量扫荡与自动开机挂探针脚本 (终极修复版) 🐾
+# 喵酱的 GCP 大清洗 + 按结算单抽 + TG通知脚本 🐾
 # ==========================================
 
 ZONE="us-west1-a" 
@@ -10,51 +10,86 @@ IMAGE_PROJECT="debian-cloud"
 SSH_PASS="202825"
 VM_NAME="free-tier-vm"
 
-echo "🐾 喵酱开始全盘扫描您的 GCP 项目喵！"
+# Telegram 配置
+TG_TOKEN="7745672750:AAG7q5904SL9-fMfmS5TZnwu_10rQ4SDsHc"
+TG_CHAT_ID="7034468156"
+TG_API="https://api.telegram.org"
+
+# 发送 TG 消息的专属小工具喵
+send_tg_msg() {
+    local text="$1"
+    curl -s -X POST "${TG_API}/bot${TG_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TG_CHAT_ID}" \
+        --data-urlencode "text=${text}" \
+        --data-urlencode "parse_mode=HTML" > /dev/null
+}
+
+echo "🐾 喵酱启动【大清洗与严格单抽模式】喵！"
 PROJECTS=$(gcloud projects list --format="value(projectId)")
 
 if [ -z "$PROJECTS" ]; then
-    echo "❌ 无法获取项目列表，请检查 GCP 授权状态喵！"
+    echo "❌ 无法获取项目列表喵！请检查授权。"
     exit 1
 fi
 
-# 用来存放最后成功汇总数据的数组
-SUCCESS_PROJECTS=()
-
+# ==========================================
+# 第一阶段：无差别清洗所有现存的免费机器
+# ==========================================
+echo "======================================"
+echo "🧹 第一阶段：全网搜寻并摧毁旧的免费机器..."
 for PROJECT in $PROJECTS; do
-    echo "======================================"
-    echo "🔍 正在检测项目: $PROJECT"
-    
-    # 1. 强行启用/验证 Compute API（这是检测是否绑定有效结算的最准方法喵）
-    echo "  -> 正在验证结算状态和 Compute API 权限..."
-    # 注意：这里我们不再静默隐藏报错，如果真的卡住了主人能看到！
-    if ! gcloud services enable compute.googleapis.com --project="$PROJECT" --quiet; then
-        echo "  -> ⚠️ 未绑定结算账户或无权限，喵酱跳过它啦。"
+    if ! gcloud compute instances list --project="$PROJECT" >/dev/null 2>&1; then
         continue
     fi
     
-    echo "  -> ✨ 该项目结算与 API 完全正常喵！"
-
-    # 2. 检查是否有现存的 e2-micro 机器
-    echo "  -> 正在查找旧的免费服务器..."
     EXISTING_VMS=$(gcloud compute instances list --project="$PROJECT" --filter="machineType:e2-micro" --format="value(name,zone)" 2>/dev/null)
-    
     if [ -n "$EXISTING_VMS" ]; then
         echo -e "$EXISTING_VMS" | while read VM_INFO; do
             NAME=$(echo "$VM_INFO" | awk '{print $1}')
             VM_ZONE=$(echo "$VM_INFO" | awk '{print $2}')
             
-            echo "  -> ⚠️ 发现旧机器: $NAME (可用区: $VM_ZONE)"
-            echo "  -> 💥 正在执行销毁指令..."
+            echo "  -> 💥 正在摧毁项目 [$PROJECT] 中的 $NAME..."
             gcloud compute instances delete "$NAME" --project="$PROJECT" --zone="$VM_ZONE" --quiet
-            echo "  -> ✅ 旧机器销毁成功喵！"
+            echo "  -> ✅ 摧毁成功！"
         done
-    else
-        echo "  -> 🐾 没有发现旧机器，干干净净喵！"
+    fi
+done
+
+# ==========================================
+# 第二阶段：按结算账户严格单抽创建
+# ==========================================
+echo "======================================"
+echo "🎲 第二阶段：匹配结算账户，严格执行“一结算一机器”..."
+
+# 把项目列表打乱，实现真正的随机单抽
+SHUFFLED_PROJECTS=$(echo "$PROJECTS" | shuf)
+declare -A PROCESSED_BILLING_ACCOUNTS
+SUCCESS_PROJECTS=()
+
+for PROJECT in $SHUFFLED_PROJECTS; do
+    if ! gcloud compute instances list --project="$PROJECT" >/dev/null 2>&1; then
+        continue
     fi
 
-    # 3. 创建新机器
-    echo "  -> 🚀 正在创建全新的 e2-micro 实例..."
+    # 核心：获取该项目绑定的结算账户 ID
+    BILLING_ACCOUNT=$(gcloud billing projects describe "$PROJECT" --format="value(billingAccountName)" 2>/dev/null)
+    
+    if [ -z "$BILLING_ACCOUNT" ]; then
+        continue
+    fi
+
+    # 检查这个结算账户是不是已经被抽中过了
+    if [ -n "${PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]}" ]; then
+        echo "  -> ⏭️ 跳过 [$PROJECT]：其结算账户已开通机器，喵酱帮你守住钱包喵！"
+        continue
+    fi
+
+    echo "  -> 🎉 结算账户 [$BILLING_ACCOUNT] 选中了项目: $PROJECT！准备开机..."
+    
+    # 标记该结算账户已使用，后续该结算下的项目全部跳过
+    PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="1"
+
+    # 创建新机器
     if ! gcloud compute instances create "$VM_NAME" \
         --project="$PROJECT" \
         --zone="$ZONE" \
@@ -64,15 +99,14 @@ for PROJECT in $PROJECTS; do
         --network-tier=PREMIUM \
         --tags=allow-all-ingress \
         --quiet; then
-        echo "  -> ❌ 机器创建失败喵，可能是配额限制或网络异常。"
+        echo "  -> ❌ 机器创建失败喵..."
         continue
     fi
 
-    echo "  -> ⏳ 给机器一点点时间苏醒，等待 20 秒..."
+    echo "  -> ⏳ 等待机器苏醒 (20 秒)..."
     sleep 20
 
-    # 4. 配置防火墙：0.0.0.0/0
-    echo "  -> 🛡️ 正在开放所有外部端口 (0.0.0.0/0)..."
+    # 开放防火墙
     gcloud compute firewall-rules create allow-all-ingress-custom \
         --project="$PROJECT" \
         --direction=INGRESS \
@@ -84,12 +118,12 @@ for PROJECT in $PROJECTS; do
         --target-tags=allow-all-ingress \
         --quiet >/dev/null 2>&1 || true
 
-    # 5. 获取刚创建机器的外网 IP
+    # 抓取 IP
     IP=$(gcloud compute instances describe "$VM_NAME" --project="$PROJECT" --zone="$ZONE" --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
 
-    # 6. 远程换源、改密码、挂载探针
-    echo "  -> 🔧 正在远程换源、开启密码登录并挂载哪吒探针喵..."
-    cat << 'EOF' > remote_setup_$PROJECT.sh
+    # 远程配置环境与探针
+    echo "  -> 🔧 正在配置环境与探针..."
+    cat << 'EOF' > remote_setup.sh
 #!/bin/bash
 sed -i 's/deb.debian.org/mirrors.mit.edu/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 apt-get update -y
@@ -99,25 +133,33 @@ sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
 sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
 systemctl restart ssh || systemctl restart sshd
 
-# 启动哪吒
 curl -L https://raw.githubusercontent.com/nezhahq/scripts/main/agent/install.sh -o agent.sh
 chmod +x agent.sh
 env NZ_SERVER=45.142.166.116:8008 NZ_TLS=false NZ_CLIENT_SECRET=EyxBehjdWpW3hnrzXavynrDIsGjWzKRH ./agent.sh
 EOF
 
-    gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --command="sudo bash -s" < remote_setup_$PROJECT.sh --quiet
-    rm -f remote_setup_$PROJECT.sh
+    gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --command="sudo bash -s" < remote_setup.sh --quiet
+    rm -f remote_setup.sh
 
-    echo "  -> 🎉 项目 [$PROJECT] 配置完美完成喵！"
-    SUCCESS_PROJECTS+=("🐾 IP: $IP | 账号: root | 密码: $SSH_PASS | 项目: $PROJECT")
+    echo "  -> ✅ 部署成功喵！正在推送到 Telegram..."
+    
+    # 构造 HTML 格式的 TG 消息发送给主人
+    TG_MSG="🐾 <b>喵酱汇报：新免费节点上线！</b>
+项目：<code>${PROJECT}</code>
+IP：<code>${IP}</code>
+账号：<code>root</code>
+密码：<code>${SSH_PASS}</code>"
+    
+    send_tg_msg "$TG_MSG"
 
+    SUCCESS_PROJECTS+=("🐾 IP: $IP | 项目: $PROJECT | [消息已推送至 TG]")
 done
 
 echo -e "\n======================================"
 if [ ${#SUCCESS_PROJECTS[@]} -eq 0 ]; then
-    echo "❌ 喵酱彻底检查完了，但是没有一台机器部署成功喵，请主人看看上面有没有红色的报错信息哦！"
+    echo "❌ 报告主人，目前没有任何符合条件的新机器部署成功喵..."
 else
-    echo "🎉 喵酱的终极任务大功告成啦！本次所有成功开通的 VPS 汇总喵："
+    echo "🎉 完美收工！以下是本次大清洗并新建的汇总喵："
     for RES in "${SUCCESS_PROJECTS[@]}"; do
         echo "$RES"
     done
