@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持全自动配置、纯 AQ. 格式专属密钥提取、全量 API 权限开通
-# 版本: 2.5.0
+# 支持全自动配置、纯 AQ. 格式专属密钥提取、全量 API 权限开通、企业组织防延迟适配
+# 版本: 2.6.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="2.5.0"
+VERSION="2.6.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 TEMP_DIR=""
@@ -102,7 +102,6 @@ check_env() {
 
 enable_all_services() {
     local proj="$1"
-    # 霸气拉满！开通全部核心 API 权限
     local services=(
         "aiplatform.googleapis.com"
         "generativelanguage.googleapis.com"
@@ -117,16 +116,20 @@ enable_all_services() {
     for svc in "${services[@]}"; do
         retry gcloud services enable "$svc" --project="$proj" --quiet >/dev/null 2>&1 || true
     done
+    log "INFO" "等待 API 权限在全局节点同步 (组织架构耗时较长)..."
+    sleep 10
 }
 
-# ===== 核心：仅提取 AQ. 格式专属密钥 =====
+# ===== 核心：仅提取 AQ. 格式专属密钥 (抗组织延迟版) =====
 setup_and_extract_aq_key() {
     local project_id="$1"
     local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
     
-    # 1. 确保服务账号存在（AQ 密钥必须绑定服务账号）
+    # 1. 确保服务账号存在
     if ! gcloud iam service-accounts describe "$sa_email" --project="$project_id" &>/dev/null; then
         retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Agent SA" --project="$project_id" --quiet >/dev/null 2>&1 || true
+        log "INFO" "等待服务账号在组织架构中生效..."
+        sleep 10
     fi
     
     # 2. 赋予最高权限
@@ -134,8 +137,9 @@ setup_and_extract_aq_key() {
     for role in "${roles[@]}"; do
         retry gcloud projects add-iam-policy-binding "$project_id" --member="serviceAccount:${sa_email}" --role="$role" --quiet >/dev/null 2>&1 || true
     done
+    sleep 5 # 给 IAM 同步一点时间
 
-    # 3. 寻找或创建 AQ. 格式密钥
+    # 3. 寻找已有 AQ. 格式密钥
     local keys_list
     keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     if [ -n "$keys_list" ]; then
@@ -151,9 +155,21 @@ setup_and_extract_aq_key() {
         done
     fi
 
-    # 如果没有找到，强制生成绑定服务账号的 AQ 密钥
-    retry gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet >/dev/null 2>&1 || true
-    
+    # 4. 如果没有找到，强制生成并防延迟重试
+    log "INFO" "正在请求生成 AQ. 格式专属密钥..."
+    local attempt=1
+    local create_success=false
+    while [ $attempt -le 5 ]; do
+        if gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet >/dev/null 2>&1; then
+            create_success=true
+            break
+        fi
+        log "WARN" "接口暂未就绪，等待组织权限同步 ($attempt/5)..."
+        sleep 8
+        attempt=$((attempt+1))
+    done
+
+    # 5. 再次拉取并获取 AQ. 密钥
     keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     if [ -n "$keys_list" ]; then
         for key_name in $keys_list; do
@@ -248,7 +264,7 @@ vertex_configure_existing() {
     
     echo -e "\n${CYAN}主人想怎么配置现有项目呢？${NC}"
     echo "1. 手动挑选项目配置"
-    echo "2. 全自动一键配置 (自动选中所有关联当前账单的项目，包括默认创建的 My First Project)"
+    echo "2. 全自动一键配置 (自动选中所有关联当前账单的项目)"
     local list_choice
     read -r -p "请选择 [1-2, 默认: 1]: " list_choice
     list_choice=${list_choice:-1}
@@ -326,7 +342,7 @@ main() {
     echo -e "${CYAN}${BOLD}"
     echo "╔═══════════════════════════════════════════════════════╗"
     echo "║        Vertex AI 独立密钥管理工具 v${VERSION}               ║"
-    echo "║        (纯 AQ. 专属密钥提取 / 全量 API 权限开通)        ║"
+    echo "║        (纯 AQ. 专属密钥提取 / 组织防延迟适配版)         ║"
     echo "╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
