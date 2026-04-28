@@ -13,7 +13,7 @@ SSH_PASS="202825"
 VM_NAME="free-tier-vm"
 
 # Telegram 配置
-TG_TOKEN="7745672750:AAG7q5904SL9-fMfmS5TZnwu_10rQ4SDsHc"
+TG_TOKEN=""
 TG_CHAT_ID="7034468156"
 TG_API="https://api.telegram.org"
 
