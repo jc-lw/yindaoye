@@ -317,8 +317,8 @@ vertex_create_projects() {
                 skipped=$((skipped+1)); i=$((i+1)); continue
             fi
 
-            log "INFO" "账单绑定确认成功！开启 20 秒安全静默期，模拟人类操作避开 GCP 风控雷达..."
-            sleep 20
+            log "INFO" "账单绑定确认成功！开启 10 秒安全静默期，模拟人类操作避开 GCP 风控雷达..."
+            sleep 10
             
             enable_essential_services "$project_id"
             
