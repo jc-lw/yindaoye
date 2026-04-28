@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# 喵酱的 GCP 大清洗 + 活结算探测 + TG通知脚本 🐾
+# 喵酱的 GCP 大清洗 + 结算账户内全项目穷举 + TG通知脚本 🐾
 # ==========================================
 
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
@@ -25,7 +25,7 @@ send_tg_msg() {
         --data-urlencode "parse_mode=HTML" > /dev/null
 }
 
-echo "🐾 喵酱启动【活结算探测与单抽模式】喵！"
+echo "🐾 喵酱启动【活结算穷举突破模式】喵！"
 PROJECTS=$(gcloud projects list --format="value(projectId)")
 
 if [ -z "$PROJECTS" ]; then
@@ -55,43 +55,36 @@ for PROJECT in $PROJECTS; do
 done
 
 # ==========================================
-# 第二阶段：探测活结算，单抽创建
+# 第二阶段：穷举项目，直到该结算成功开出一台
 # ==========================================
 echo "======================================"
-echo "🎲 第二阶段：探测健康结算账户，严格执行“一结算一机器”..."
+echo "🎲 第二阶段：探测健康项目，严格执行“一结算一机器”..."
 
-SHUFFLED_PROJECTS=$(echo "$PROJECTS" | shuf)
-declare -A PROCESSED_BILLING_ACCOUNTS
+# 记录哪些结算账户已经【成功】开出机器了
+declare -A SUCCESSFUL_BILLING_ACCOUNTS
 SUCCESS_PROJECTS=()
 
-for PROJECT in $SHUFFLED_PROJECTS; do
-    # 获取结算账户 ID
+for PROJECT in $PROJECTS; do
+    # 1. 获取当前项目的结算账户
     BILLING_ACCOUNT=$(gcloud beta billing projects describe "$PROJECT" --format="value(billingAccountName)" 2>/dev/null)
     
     if [ -z "$BILLING_ACCOUNT" ]; then
         continue
     fi
 
-    # 如果这个结算账户已经处理过（不管是成功还是因为风控失败），都跳过
-    if [ -n "${PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]}" ]; then
+    # 2. 【核心判断】：如果这个结算账户已经成功开过机器了，才跳过
+    if [ "${SUCCESSFUL_BILLING_ACCOUNTS[$BILLING_ACCOUNT]}" == "1" ]; then
+        echo "  -> ⏭️ 结算账户 [$BILLING_ACCOUNT] 已经有成功的节点，跳过项目: $PROJECT 喵！"
         continue
     fi
 
-    echo "  -> ⚙️ 结算账户 [$BILLING_ACCOUNT] 选中了项目: $PROJECT"
+    echo "  -> ⚙️ 结算账户 [$BILLING_ACCOUNT] 正在尝试项目: $PROJECT"
     
-    # 【核心探测机制】：尝试开启 API，这是检验结算账户是否被风控的唯一真理！
-    echo "    🔌 正在测试该结算账户是否健康 (尝试激活 API)..."
-    if ! gcloud services enable compute.googleapis.com --project="$PROJECT" >/dev/null 2>&1; then
-        echo "    ❌ 激活失败！该结算账户可能处于风控状态 (Suspicious activity) 喵！跳过该账户下的所有项目。"
-        PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="DEAD"
-        continue
-    fi
+    echo "    🔌 正在激活 API..."
+    gcloud services enable compute.googleapis.com --project="$PROJECT" --quiet >/dev/null 2>&1
+    sleep 10 # 稍微等一下让 API 生效
 
-    echo "    ✨ API 激活成功！这是一个健康的结算账户喵！等待 15 秒生效..."
-    PROCESSED_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="ALIVE"
-    sleep 15 
-
-    echo "    🚀 准备开机..."
+    echo "    🚀 尝试创建机器..."
     if ! gcloud compute instances create "$VM_NAME" \
         --project="$PROJECT" \
         --zone="$ZONE" \
@@ -101,9 +94,15 @@ for PROJECT in $SHUFFLED_PROJECTS; do
         --network-tier=PREMIUM \
         --tags=allow-all-ingress \
         --quiet; then
-        echo "    ❌ 机器创建失败，可能是配额限制喵..."
-        continue
+        echo "    ❌ 机器创建失败 (可能该项目被风控被 Suspended)。喵酱会继续尝试该结算下的其他项目喵..."
+        continue # 失败了没关系，直接 continue，结算账户不会被锁定！
     fi
+
+    # ==============================
+    # 如果代码走到这里，说明机器创建成功了！
+    # ==============================
+    echo "    ✨ 机器创建成功！锁定该结算账户喵！"
+    SUCCESSFUL_BILLING_ACCOUNTS[$BILLING_ACCOUNT]="1" # 正式锁定该结算，防止扣费
 
     echo "    ⏳ 等待机器苏醒 (20 秒)..."
     sleep 20
@@ -152,14 +151,14 @@ IP：<code>${IP}</code>
     
     send_tg_msg "$TG_MSG"
 
-    SUCCESS_PROJECTS+=("🐾 IP: $IP | 项目: $PROJECT | [已推送至 TG]")
+    SUCCESS_PROJECTS+=("🐾 IP: $IP | 项目: $PROJECT | 结算: $BILLING_ACCOUNT")
 done
 
 echo -e "\n======================================"
 if [ ${#SUCCESS_PROJECTS[@]} -eq 0 ]; then
-    echo "❌ 报告主人，没有部署成功。请检查是不是所有结算账户都被风控了喵..."
+    echo "❌ 报告主人，所有结算账户下的所有项目都试过了，全部阵亡喵..."
 else
-    echo "🎉 完美收工！本次成功开通的健康机器汇总："
+    echo "🎉 完美收工！本次成功穷举出底线的机器汇总："
     for RES in "${SUCCESS_PROJECTS[@]}"; do
         echo "$RES"
     done
