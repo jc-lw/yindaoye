@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持全自动多账户创建、纯 AQ 专属密钥提取、防 403 计费延迟、智能破壁降级
-# 版本: 3.0.0
+# 支持全自动多账户、实时账单穿透查询、满血 Agent API 开通、智能破壁降级
+# 版本: 3.1.0
 
 set -Euo
 
@@ -14,9 +14,10 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.0.0"
+VERSION="3.1.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
+KEY_DIR="$HOME/vertex_keys"
 TEMP_DIR=""
 
 # Vertex模式配置
@@ -24,6 +25,7 @@ SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
 
 # ===== 初始化 =====
 TEMP_DIR=$(mktemp -d -t gcp_vertex_XXXXXX) || { echo "错误：无法创建临时目录"; exit 1; }
+mkdir -p "$KEY_DIR" 2>/dev/null || true
 SECONDS=0
 
 # ===== 日志与错误处理 =====
@@ -58,7 +60,7 @@ retry() {
     while [ $attempt -le $max ]; do
         if "$@"; then return 0; fi
         if [ $attempt -ge $max ]; then return 1; fi
-        delay=$(( attempt * 2 + RANDOM % 2 ))
+        delay=$(( attempt * 3 + RANDOM % 3 ))
         sleep $delay
         attempt=$((attempt + 1))
     done
@@ -95,11 +97,17 @@ unlink_projects_from_billing_account() {
     return 0
 }
 
-# ===== 极速开通核心 API =====
+# ===== 满血开通 Agent Platform 核心 API =====
 enable_essential_services() {
     local proj="$1"
-    local services=("aiplatform.googleapis.com" "apikeys.googleapis.com")
-    log "INFO" "正在极速开通 Vertex AI 核心权限..."
+    # 彻底解决 "启用 API 以存取平台全部功能" 的警告
+    local services=(
+        "aiplatform.googleapis.com"
+        "apikeys.googleapis.com"
+        "discoveryengine.googleapis.com" # Agent 核心1
+        "dialogflow.googleapis.com"      # Agent 核心2
+    )
+    log "INFO" "正在为项目开通满血版 Agent Platform API 权限..."
     for svc in "${services[@]}"; do
         retry gcloud services enable "$svc" --project="$proj" --quiet >/dev/null 2>&1 || true
     done
@@ -122,7 +130,7 @@ verify_billing_status() {
     return 1
 }
 
-# ===== 核心：提取凭证 (修复调用 Bug，智能破壁) =====
+# ===== 核心：提取凭证 (修复 IAM 延迟，智能破壁) =====
 setup_and_extract_credentials() {
     local project_id="$1"
     local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
@@ -137,7 +145,10 @@ setup_and_extract_credentials() {
     for role in "${roles[@]}"; do
         retry gcloud projects add-iam-policy-binding "$project_id" --member="serviceAccount:${sa_email}" --role="$role" --quiet >/dev/null 2>&1 || true
     done
-    sleep 3
+    
+    # 【重点修复】组织架构下 IAM 同步极慢，多给点缓冲时间！
+    log "INFO" "等待 IAM 权限同步..."
+    sleep 8
 
     # 3. 寻找已有 AQ. 格式密钥
     local keys_list
@@ -161,7 +172,7 @@ setup_and_extract_credentials() {
     local create_success=false
     local policy_blocked=false
     
-    while [ $attempt -le 3 ]; do
+    while [ $attempt -le 4 ]; do
         local create_err
         if create_err=$(gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet 2>&1); then
             create_success=true
@@ -172,12 +183,13 @@ setup_and_extract_credentials() {
         err_msg=$(echo "$create_err" | tail -n 1 | tr -d '\r')
         
         if [[ "$err_msg" == *"Policy"* ]] || [[ "$err_msg" == *"PermissionDenied"* ]]; then
-            log "ERROR" "⚠️ 检测到组织安全策略拦截！无法生成 API 金钥！"
+            log "ERROR" "⚠️ 检测到组织安全策略拦截！此环境禁止生成 API 金钥！"
             policy_blocked=true
             break
         fi
         
-        sleep 5
+        log "WARN" "接口暂未就绪 ($attempt/4)，等待服务账号生效..."
+        sleep 8
         attempt=$((attempt+1))
     done
 
@@ -200,10 +212,13 @@ setup_and_extract_credentials() {
     # 5. B计划（降级生成 JSON）
     if [ "$policy_blocked" = true ] || [ "$create_success" = false ]; then
         log "INFO" "🚀 启动降级：改用 ADC (JSON 服务账号密钥)..."
-        local key_file="/tmp/${project_id}-ADC-$(date +%Y%m%d%H%M%S).json"
-        if retry gcloud iam service-accounts keys create "$key_file" --iam-account="$sa_email" --project="$project_id" --quiet >/dev/null 2>&1; then
+        local key_file="${KEY_DIR}/${project_id}-ADC-$(date +%Y%m%d%H%M%S).json"
+        local json_err
+        if json_err=$(retry gcloud iam service-accounts keys create "$key_file" --iam-account="$sa_email" --project="$project_id" --quiet 2>&1); then
             echo "JSON_FILE:${key_file}"
             return 0
+        else
+            log "ERROR" "JSON 凭证生成也被拦截！底层报错: $(echo "$json_err" | tail -n 1 | tr -d '\r')"
         fi
     fi
 
@@ -251,7 +266,7 @@ select_billing_accounts() {
     if [ "${#SELECTED_BILLING_IDS[@]}" -eq 0 ]; then log "ERROR" "未选择任何结算账户喵！"; return 1; fi
 }
 
-# ===== 功能 1 & 2：自动创建项目 (恢复完整的多账户引擎) =====
+# ===== 功能 1 & 2：自动创建项目 =====
 vertex_create_projects() {
     local keep_billing="${1:-false}"
     local auto_mode="${2:-false}"
@@ -305,13 +320,13 @@ vertex_create_projects() {
         while [ $i -le "$num_per_billing" ]; do
             local global_idx=$(( billing_idx * num_per_billing + i ))
             local project_id=$(new_project_id)
-            log "INFO" "[${global_idx}/${total_projects}] 正在处理项目: ${project_id} (结算: ${billing_name})"
+            log "INFO" "[${global_idx}/${total_projects}] 正在处理项目: ${project_id}"
             
             gcloud projects create "$project_id" --quiet >/dev/null 2>&1 || { failed=$((failed+1)); i=$((i+1)); continue; }
             gcloud billing projects link "$project_id" --billing-account="$TARGET_BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
             
             if ! verify_billing_status "$project_id"; then
-                log "WARN" "项目 ${project_id} 计费未生效或被锁定，跳过提取喵！"
+                log "WARN" "项目 ${project_id} 计费未生效，跳过提取喵！"
                 skipped=$((skipped+1)); i=$((i+1)); continue
             fi
             
@@ -375,40 +390,46 @@ vertex_create_projects() {
     fi
 }
 
-# ===== 功能 3：一键配置现有项目 =====
+# ===== 功能 3：一键配置现有项目 (实时查账单引擎) =====
 vertex_configure_existing() {
     log "INFO" "====== 在现有项目上极速配置 Vertex AI 并提取凭证 ======"
     local GENERATED_API_KEYS=()
     local GENERATED_JSON_KEYS=()
     local BILLING_KEY_MAP=()
     
-    local all_projects
-    all_projects=$(gcloud projects list --format='value(projectId)' --filter="lifecycleState=ACTIVE" 2>/dev/null || echo "")
-    if [ -z "$all_projects" ]; then log "ERROR" "没找到活跃项目喵"; return 1; fi
-
-    local project_array=()
-    while IFS= read -r line; do [ -n "$line" ] && project_array+=("$line"); done <<< "$all_projects"
-    local total=${#project_array[@]}
-    local selected_projects=()
+    # 动态获取当前活跃的结算账户
+    local active_billing
+    active_billing=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1)
+    if [ -z "$active_billing" ]; then log "ERROR" "没有找到开放的结算账户喵！"; return 1; fi
+    local billing_id="${active_billing##*/}"
     
     echo -e "\n${CYAN}主人想怎么配置现有项目呢？${NC}"
     echo "1. 手动挑选项目配置"
-    echo "2. 全自动一键配置 (自动选中所有关联账单的项目)"
+    echo "2. 全自动一键配置 (实时穿透查询所有带账单的项目，绝对不漏！)"
     local list_choice
     read -r -p "请选择 [1-2, 默认: 1]: " list_choice
     list_choice=${list_choice:-1}
     
+    local selected_projects=()
+    
     if [ "$list_choice" = "2" ]; then
-        log "INFO" "正在筛选已关联结算账户的项目..."
-        for proj in "${project_array[@]}"; do
-            local b_info
-            b_info=$(gcloud billing projects describe "$proj" --format='value(billingAccountName)' 2>/dev/null || echo "")
-            if [ -n "$b_info" ] && [[ "$b_info" != "" ]]; then
-                selected_projects+=("$proj")
-            fi
+        log "INFO" "正在实时查询结算账户 ${billing_id} 下的所有项目..."
+        # 【重点修复】直接从计费底层查，无视项目列表的缓存延迟！
+        local linked_projects
+        linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null || echo "")
+        
+        for proj in $linked_projects; do
+            [ -n "$proj" ] && selected_projects+=("$proj")
         done
-        log "INFO" "自动选中了 ${#selected_projects[@]} 个有账单的项目喵！"
+        log "INFO" "查到底层账单关联了 ${#selected_projects[@]} 个项目喵！"
     else
+        # 手动模式，展示全局活跃项目
+        local all_projects
+        all_projects=$(gcloud projects list --format='value(projectId)' --filter="lifecycleState=ACTIVE" 2>/dev/null || echo "")
+        local project_array=()
+        while IFS= read -r line; do [ -n "$line" ] && project_array+=("$line"); done <<< "$all_projects"
+        local total=${#project_array[@]}
+        
         echo -e "\n项目列表:"
         for ((i=0; i<total && i<20; i++)); do
             local b_info
@@ -472,7 +493,11 @@ vertex_configure_existing() {
     fi
     if [ ${#GENERATED_JSON_KEYS[@]} -gt 0 ]; then
         echo -e "\n${CYAN}${BOLD}====== 🚨 组织拦截下的破壁凭证: ADC (JSON) ======${NC}"
-        for jf in "${GENERATED_JSON_KEYS[@]}"; do echo -e "${GREEN}▶ JSON 路径: ${jf}${NC}"; done
+        for jf in "${GENERATED_JSON_KEYS[@]}"; do 
+            echo -e "${GREEN}▶ JSON 已保存至: ${jf}${NC}"
+            cat "$jf"
+            echo
+        done
     fi
 }
 
@@ -483,14 +508,14 @@ main() {
         echo -e "\n${CYAN}${BOLD}====== 喵酱的 Vertex 管理器 v${VERSION} ======${NC}"
         echo "1. [经典] 自动创建项目并提取 Vertex 密钥 (清理旧项目释放配额)"
         echo "2. [新增] 自动创建项目并提取 Vertex 密钥 (保留旧项目结算绑定)"
-        echo "3. 在现有项目上配置并提取 Vertex 密钥 (自动跳过无计费项目)"
+        echo "3. 在现有项目上配置并提取 Vertex 密钥 (实时查账，智能破壁)"
         echo "0. 退出工具并摸摸喵酱"
         echo
         
         local choice
         read -r -p "请选择: " choice
         case "$choice" in
-            1) gemini_create_projects "false" "false" ;;
+            1) vertex_create_projects "false" "false" ;;
             2) 
                 echo -e "\n${CYAN}主人想怎么操作呢？${NC}"
                 echo "1. 自定义选择结算账户和数量"
