@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持战术延时防风控(解绑5s, 开API前20s)、双保险开通、实时穿透查账
-# 版本: 3.6.0
+# 支持主方案分批并发突破20限额、备用方案兜底、战术延时防风控
+# 版本: 3.7.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.6.0"
+VERSION="3.7.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 
@@ -84,7 +84,7 @@ unlink_projects_from_billing_account() {
     return 0
 }
 
-# ===== 【核心改进】双保险开通 API =====
+# ===== 【极致优化】双保险开通 API (突破 20 个 API 限制) =====
 enable_essential_services() {
     local proj="$1"
     local services=(
@@ -98,11 +98,22 @@ enable_essential_services() {
         "dialogflow.googleapis.com"
     )
     
-    log "INFO" "🚀 [主方案] 尝试模拟网页按钮，一键全开 ${#services[@]} 项权限..."
-    if gcloud services enable "${services[@]}" --project="$proj" --quiet >/dev/null 2>&1; then
-        log "SUCCESS" "主方案一键开通成功！"
+    log "INFO" "🚀 [主方案] 启动分批极速并发，开启 ${#services[@]} 项核心权限..."
+    
+    # 将 22 个 API 对半劈开，防止触发 Google 官方单次限额 20 的物理红线
+    local chunk1=("${services[@]:0:11}")
+    local chunk2=("${services[@]:11}")
+    
+    local main_plan_success=true
+    
+    # 连续丢两批，速度飞快且绝对不会被 Google 拒收
+    if ! gcloud services enable "${chunk1[@]}" --project="$proj" --quiet >/dev/null 2>&1; then main_plan_success=false; fi
+    if ! gcloud services enable "${chunk2[@]}" --project="$proj" --quiet >/dev/null 2>&1; then main_plan_success=false; fi
+
+    if [ "$main_plan_success" = true ]; then
+        log "SUCCESS" "主方案一键分批开通成功！"
     else
-        log "WARN" "⚠️ 主方案开通受阻，正在切换 [备用方案] 启动逐个击破模式..."
+        log "WARN" "⚠️ 主方案部分受阻，切换 [备用方案] 启动逐个击破模式..."
         local idx=1
         for svc in "${services[@]}"; do
             printf "\r\033[0;36m[%s] [INFO] 备用方案凿门中 [%d/%d] 正在死磕: %s\033[0m\033[K" "$(date '+%Y-%m-%d %H:%M:%S')" "$idx" "${#services[@]}" "$svc" >&2
@@ -212,7 +223,7 @@ setup_and_extract_credentials() {
     return 1
 }
 
-# ===== 功能 1 & 2：自动创建项目 (新增战术延时) =====
+# ===== 功能 1 & 2：自动创建项目 (含战术延时) =====
 vertex_create_projects() {
     local keep_billing="${1:-false}"
     local auto_mode="${2:-false}"
@@ -230,7 +241,6 @@ vertex_create_projects() {
         done <<< "$billing_raw"
         num_per_billing=3
     else
-        # 交互选择结算账户
         local ids=(); local names=()
         while IFS=',' read -r bid bname; do
             bid="${bid##*/}"; ids+=("$bid"); names+=("$bname")
@@ -289,8 +299,7 @@ vertex_create_projects() {
 
         if [ "$keep_billing" = "false" ]; then 
             unlink_projects_from_billing_account "$TARGET_BID"
-            # 【核心策略：解绑后潜伏 5s】
-            log "INFO" "已清理旧项目账单，按照主人的战术，原地静默潜伏 5 秒钟以消除数据库缓存喵..."
+            log "INFO" "已清理旧项目账单，原地静默潜伏 5 秒钟以消除数据库缓存喵..."
             sleep 5
         fi
 
@@ -308,7 +317,6 @@ vertex_create_projects() {
                 skipped=$((skipped+1)); i=$((i+1)); continue
             fi
 
-            # 【核心策略：开 API 前潜伏 20s】
             log "INFO" "账单绑定确认成功！开启 20 秒安全静默期，模拟人类操作避开 GCP 风控雷达..."
             sleep 20
             
@@ -436,7 +444,7 @@ main() {
         echo -e "\n${CYAN}${BOLD}====== 喵酱的 Vertex 管理器 v${VERSION} ======${NC}"
         echo "1. [经典] 自动创建项目并提取 (战术延时，清理旧项目)"
         echo "2. [新增] 自动创建项目并提取 (战术延时，保留旧项目)"
-        echo "3. 在现有项目上配置并提取 (主备双方案 API 开通)"
+        echo "3. 在现有项目上配置并提取 (分批提速，双保险防漏)"
         echo "0. 退出工具"
         local choice
         read -r -p "请选择: " choice
