@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持满血并发开通19项API、修复打印丢失、纯文本API密钥(优先AQ,退回AIza)
-# 版本: 3.2.0
+# 支持逐个击破开通22项API、强制校验启用状态防403、纯文本提取
+# 版本: 3.4.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.2.0"
+VERSION="3.4.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 
@@ -26,7 +26,7 @@ log() {
     local level="${1:-INFO}"
     local msg="${2:-}"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    # 【重大修复】所有日志输出重定向到 stderr (>&2)，防止污染函数的 stdout 返回值！
+    # 所有日志输出重定向到 stderr (>&2)，防止污染函数的 stdout 返回值
     case "$level" in
         "INFO")     echo -e "${CYAN}[${timestamp}] [INFO] ${msg}${NC}" >&2 ;;
         "SUCCESS")  echo -e "${GREEN}[${timestamp}] [SUCCESS] ${msg}${NC}" >&2 ;;
@@ -48,7 +48,7 @@ retry() {
     while [ $attempt -le $max ]; do
         if "$@"; then return 0; fi
         if [ $attempt -ge $max ]; then return 1; fi
-        delay=$(( attempt * 3 + RANDOM % 3 ))
+        delay=$(( attempt * 2 + RANDOM % 2 ))
         sleep $delay
         attempt=$((attempt + 1))
     done
@@ -85,10 +85,9 @@ unlink_projects_from_billing_account() {
     return 0
 }
 
-# ===== 满血极速开通 Agent Platform 全部依赖 API =====
+# ===== 满血逐个击破开通 Agent Platform 全部依赖 API =====
 enable_essential_services() {
     local proj="$1"
-    # 根据主人提供的最新底层依赖，补齐全部 19 项 API
     local services=(
         "agentregistry.googleapis.com"
         "aiplatform.googleapis.com"
@@ -113,9 +112,39 @@ enable_essential_services() {
         "discoveryengine.googleapis.com"
         "dialogflow.googleapis.com"
     )
-    log "INFO" "正在为项目并发极速开通 ${#services[@]} 项 Agent 核心权限..."
-    # 【提速秘籍】一次性将数组传给 gcloud，后台并发开通，速度提升十倍！
-    retry gcloud services enable "${services[@]}" --project="$proj" --quiet >/dev/null 2>&1 || true
+    
+    log "INFO" "启动【逐个击破】模式，为项目结结实实凿开 ${#services[@]} 个 API 大门..."
+    local idx=1
+    local total=${#services[@]}
+    
+    for svc in "${services[@]}"; do
+        # 单行滚动显示，避免刷屏，让主人看到凿开每一扇门的进度
+        printf "\r\033[0;36m[%s] [INFO] API凿门中 [%d/%d] 正在死磕: %s\033[0m\033[K" "$(date '+%Y-%m-%d %H:%M:%S')" "$idx" "$total" "$svc" >&2
+        retry gcloud services enable "$svc" --project="$proj" --quiet >/dev/null 2>&1 || true
+        idx=$((idx+1))
+    done
+    echo >&2 # 换行收尾
+    
+    log "SUCCESS" "22 项 API 请求已发送，正在强制校验核心 Vertex AI 状态..."
+    
+    # 强制校验 aiplatform.googleapis.com 是否真的被开启了 (防 403 核心机制)
+    local verify_attempt=1
+    while [ $verify_attempt -le 6 ]; do
+        local state
+        state=$(gcloud services list --project="$proj" --filter="config.name:aiplatform.googleapis.com" --format="value(state)" 2>/dev/null || echo "DISABLED")
+        
+        if [[ "$state" == "ENABLED" ]]; then
+            log "SUCCESS" "验证通过！Vertex AI API 已在底层确认激活！"
+            return 0
+        fi
+        
+        log "WARN" "Vertex AI 尚未就绪 (当前状态: $state)，等待 Google 服务器同步... ($verify_attempt/6)"
+        sleep 10
+        verify_attempt=$((verify_attempt+1))
+    done
+    
+    log "ERROR" "API 强制校验超时！可能需要手动检查项目。"
+    return 1
 }
 
 # ===== 坚固的计费检查 (防止 403) =====
@@ -213,7 +242,7 @@ setup_and_extract_credentials() {
         fi
     fi
 
-    # 5. B计划（彻底抛弃 JSON，降级生成标准 AIza 通用密钥）
+    # 5. B计划（降级生成标准 AIza 通用密钥）
     if [ "$policy_blocked" = true ] || [ "$create_success" = false ]; then
         log "INFO" "🚀 启动破壁计划：绕过服务账号拦截，直接生成标准 API 密钥 (AIza 格式)..."
         retry gcloud services api-keys create --project="$project_id" --display-name="Fallback API Key" --quiet >/dev/null 2>&1 || true
@@ -510,7 +539,7 @@ main() {
         echo -e "\n${CYAN}${BOLD}====== 喵酱的 Vertex 管理器 v${VERSION} ======${NC}"
         echo "1. [经典] 自动创建项目并提取 Vertex 密钥 (清理旧项目释放配额)"
         echo "2. [新增] 自动创建项目并提取 Vertex 密钥 (保留旧项目结算绑定)"
-        echo "3. 在现有项目上满血配置并提取 Vertex 密钥 (实时查账，完美打印)"
+        echo "3. 在现有项目上满血配置并提取 Vertex 密钥 (铁杵磨针逐个开通 API)"
         echo "0. 退出工具并摸摸喵酱"
         echo
         
