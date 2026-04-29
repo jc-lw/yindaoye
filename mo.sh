@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持AUP官方防风控伪装命名、满血 23 项 API、双端双持强行提取
-# 版本: 4.2.0
+# 支持AUP官方防风控伪装命名、双端双持提取、附带备用项目(备胎)防封机制
+# 版本: 4.3.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.2.0"
+VERSION="4.3.0"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
 
@@ -60,7 +60,7 @@ unique_suffix() {
     else echo "$(date +%s%N 2>/dev/null || date +%s)${RANDOM}" | sha256sum | cut -c1-2; fi
 }
 
-# 【找回的核心功能】完美伪装 Google 官方随机算法，防 AUP 风控
+# 【AUP 伪装机制】模拟 Google 官方随机算法
 new_project_id() {
     local adjectives=("abiding" "active" "adept" "agile" "alert" "ample" "astute" "awake" "aware" "bold" "brave" "bright" "brisk" "calm" "casual" "civil" "clever" "cloudy" "cobalt" "comic" "cool" "coral" "crisp" "daring" "dazzling" "deft" "direct" "divine" "eager" "early" "easy" "elite" "epic" "exact" "expert" "fair" "famous" "fancy" "fast" "fine" "firm" "first" "fit" "fleet" "fluent" "flying" "fond" "frank" "free" "fresh" "full" "fun" "gentle" "glad" "good" "grand" "great" "green" "handy" "happy" "hardy" "heroic" "high" "holy" "honest" "honor" "huge" "humble" "ideal" "intact" "iron" "jolly" "joyful" "keen" "kind" "large" "last" "late" "lean" "light" "live" "local" "logic" "long" "loyal" "lucky" "lunar" "magic" "main" "major" "merry" "mighty" "mint" "model" "modern" "moral" "native" "neat" "new" "nice" "noble" "normal" "novel" "open" "optic" "pacific" "peace" "peachy" "peak" "pearl" "perk" "pilot" "pious" "plain" "poetic" "polite" "prime" "primo" "prompt" "proud" "pure" "quick" "quiet" "rapid" "rare" "ready" "real" "rich" "right" "rigid" "robust" "royal" "safe" "sage" "sane" "scenic" "select" "sharp" "shining" "simple" "skill" "smart" "smile" "smooth" "snug" "sober" "solar" "solid" "sound" "spark" "speedy" "spring" "stable" "star" "steady" "stellar" "strong" "subtle" "sunny" "super" "sure" "swift" "talented" "tame" "tidy" "top" "tough" "true" "trusty" "unique" "upright" "urban" "valid" "valor" "vast" "vital" "vivid" "warm" "wealthy" "whole" "wise" "witty" "worth" "worthy" "young" "zenith")
     local nouns=("aegis" "aero" "agent" "alchemy" "alpha" "anchor" "apex" "apollo" "archer" "argon" "armor" "arrow" "atlas" "atom" "aura" "aurora" "axis" "badge" "banner" "base" "beacon" "beam" "bear" "beta" "bird" "blade" "bliss" "block" "blue" "board" "boat" "bolt" "bond" "bone" "book" "box" "branch" "bravo" "breeze" "bridge" "brook" "brush" "cable" "cache" "campus" "canal" "canvas" "cargo" "case" "castle" "cell" "center" "chain" "chair" "chart" "check" "chief" "chord" "circle" "city" "class" "clock" "cloud" "coast" "code" "coin" "color" "comet" "core" "craft" "crane" "crest" "crew" "cross" "crown" "cube" "curve" "cycle" "dance" "dart" "dash" "data" "dawn" "day" "deck" "delta" "depth" "desk" "dial" "diary" "digit" "disk" "dock" "domain" "door" "dove" "draft" "dream" "drill" "drive" "drop" "drum" "dual" "duke" "dust" "eagle" "earth" "east" "echo" "edge" "elite" "energy" "engine" "entry" "epoch" "equal" "equity" "era" "estate" "event" "exact" "expert" "extra" "face" "fact" "falcon" "fame" "feat" "field" "file" "fire" "firm" "flag" "flame" "flash" "fleet" "flight" "flock" "flow" "flower" "fluid" "flute" "focus" "force" "forge" "form" "format" "fort" "forum" "frame" "frost" "fund" "future" "galaxy" "game" "gate" "gear" "gem" "genius" "gift" "glide" "globe" "glory" "glow" "goal" "gold" "grace" "graph" "gravity" "grid" "group" "grove" "guard" "guest" "guide" "guild" "halo" "harbor" "haven" "hawk" "heart" "helm" "hero" "hill" "hinge" "hoist" "home" "honor" "hook" "hope" "horn" "host" "hour" "house" "hub" "hull" "idea" "image" "impact" "index" "ink" "iron" "island" "item" "jade" "jazz" "jet" "join" "joint" "joy" "judge" "jump" "key" "king" "kite" "knight" "knot" "lake" "land" "lane" "laser" "lead" "leaf" "leap" "life" "light" "line" "link" "lion" "list" "lock" "logic" "logo" "loop" "lord" "lotus" "luck" "lunar" "magic" "magnet" "mail" "main" "map" "mark" "mass" "master" "mate" "matrix" "max" "maze" "medal" "mega" "memo" "mesh" "meta" "metal" "meter" "method" "mind" "mint" "model" "moon" "motor" "mount" "muse" "music" "myth" "name" "nature" "navy" "neon" "nest" "net" "news" "nexus" "node" "norm" "north" "note" "nova" "novel" "null" "number" "oasis" "ocean" "office" "omega" "optic" "opus" "orbit" "order" "origin" "pace" "pack" "pad" "page" "palm" "panel" "paper" "park" "part" "pass" "past" "path" "peak" "pearl" "peer" "pen" "phase" "phone" "photo" "piece" "pilot" "pine" "ping" "pipe" "pixel" "plan" "planet" "plant" "plate" "play" "plot" "plug" "plus" "point" "pole" "polo" "pool" "port" "post" "power" "press" "prime" "prism" "prize" "probe" "prod" "profit" "prop" "prose" "pulse" "pump" "pure" "push" "quad" "quest" "quota" "race" "radar" "radio" "rail" "rain" "ramp" "rank" "rate" "ratio" "ray" "real" "record" "reef" "rest" "rhyme" "ride" "ridge" "ring" "rise" "risk" "river" "road" "rock" "role" "roll" "roof" "room" "root" "rope" "rose" "route" "rule" "run" "safe" "sage" "sail" "salt" "sand" "scale" "scan" "scene" "scope" "score" "scout" "sea" "seal" "seat" "seed" "seek" "self" "sense" "set" "shade" "shadow" "shaft" "shape" "share" "shell" "shift" "shine" "ship" "shire" "shoe" "shop" "shore" "show" "side" "sign" "signal" "silk" "site" "size" "skill" "sky" "slate" "smile" "snow" "soil" "solar" "solo" "song" "sonic" "sort" "soul" "sound" "source" "south" "space" "spark" "speed" "sphere" "spice" "spike" "spin" "spiral" "spirit" "spot" "spring" "spur" "squad" "square" "stack" "staff" "stage" "star" "start" "state" "statue" "status" "steel" "stem" "step" "stone" "stop" "store" "storm" "story" "stream" "street" "strike" "string" "strip" "style" "suit" "sum" "sun" "surf" "swan" "sync" "system" "table" "tack" "tag" "tail" "talk" "tank" "tape" "task" "team" "tech" "tempo" "tent" "term" "test" "text" "theme" "theory" "thing" "thread" "thrill" "tide" "tie" "tier" "tiger" "tile" "time" "tint" "title" "token" "tone" "tool" "top" "topic" "tour" "tower" "town" "track" "tract" "trade" "trail" "train" "trait" "trap" "tree" "trek" "trend" "trial" "tribe" "trick" "trio" "trip" "troop" "true" "trust" "truth" "tube" "tune" "turn" "twin" "type" "unit" "unity" "up" "urban" "user" "vale" "valley" "value" "valve" "vault" "vector" "vein" "vent" "verb" "verse" "vibe" "view" "villa" "vine" "vision" "visit" "voice" "void" "volt" "volume" "vote" "vow" "voyage" "walk" "wall" "ward" "wave" "way" "web" "week" "west" "wheel" "wind" "wing" "wire" "wise" "wish" "wolf" "wood" "word" "work" "world" "yard" "yarn" "year" "yield" "yolk" "zenith" "zephyr" "zero" "zone")
@@ -105,7 +105,7 @@ enable_essential_services() {
         "notebooks.googleapis.com" "observability.googleapis.com" "storage-component.googleapis.com"
         "telemetry.googleapis.com" "texttospeech.googleapis.com" "discoveryengine.googleapis.com"
         "dialogflow.googleapis.com" 
-        "generativelanguage.googleapis.com"  # Gemini AI Studio 核心权限
+        "generativelanguage.googleapis.com" 
     )
     
     log "INFO" "🚀 [主方案] 启动分批极速并发，开启 23 项核心权限..."
@@ -131,7 +131,6 @@ enable_essential_services() {
         log "SUCCESS" "备用方案执行完毕！"
     fi
     
-    # 强制状态校验
     log "INFO" "正在强制校验核心 Vertex AI 和 Gemini API 激活状态..."
     local verify_attempt=1
     while [ $verify_attempt -le 6 ]; do
@@ -187,7 +186,6 @@ setup_and_extract_credentials() {
 
     log "INFO" "正在向 Google 强行索要双端钥匙 (Agent + AI Studio)..."
     
-    # 1. 索要 Agent 的 AQ 密钥
     local create_err
     if ! create_err=$(gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet 2>&1); then
         local err_msg=$(echo "$create_err" | tail -n 1 | tr -d '\r')
@@ -196,10 +194,8 @@ setup_and_extract_credentials() {
         fi
     fi
 
-    # 2. 索要 AI Studio 的标准 AIza 密钥
     gcloud services api-keys create --project="$project_id" --display-name="Gemini Studio Key" --quiet >/dev/null 2>&1 || true
 
-    # 3. 提取
     local keys_list
     keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     
@@ -230,7 +226,7 @@ setup_and_extract_credentials() {
     if [ -n "$output" ]; then return 0; else return 1; fi
 }
 
-# ===== 功能 1 & 2：自动创建项目 (修复伪装逻辑) =====
+# ===== 功能 1 & 2：自动创建项目 =====
 vertex_create_projects() {
     local keep_billing="${1:-false}"
     
@@ -240,20 +236,72 @@ vertex_create_projects() {
     SELECTED_BILLING_IDS=()
     SELECTED_BILLING_NAMES=()
 
-    log "INFO" "🐱 开启【全自动模式】：每个结算账户创建 3 个项目"
-    while IFS=',' read -r bid bname; do
-        bid="${bid##*/}"; SELECTED_BILLING_IDS+=("$bid"); SELECTED_BILLING_NAMES+=("$bname")
-    done <<< "$billing_raw"
+    echo -e "\n${CYAN}主人想怎么操作呢？${NC}"
+    echo "1. 自定义选择结算账户和数量"
+    echo "2. 全自动 (为所有可用账户各创建3个项目)"
+    local sub_choice
+    read -r -p "请选择 [1-2, 默认: 1]: " sub_choice
+    sub_choice=${sub_choice:-1}
+
     local num_per_billing=3
+
+    if [ "$sub_choice" = "2" ]; then
+        log "INFO" "🐱 开启【全自动模式】：每个结算账户创建 3 个主力项目"
+        while IFS=',' read -r bid bname; do
+            bid="${bid##*/}"; SELECTED_BILLING_IDS+=("$bid"); SELECTED_BILLING_NAMES+=("$bname")
+        done <<< "$billing_raw"
+    else
+        local ids=(); local names=()
+        while IFS=',' read -r bid bname; do
+            bid="${bid##*/}"; ids+=("$bid"); names+=("$bname")
+        done <<< "$billing_raw"
+
+        echo -e "\n${CYAN}${BOLD}可用的结算账户：${NC}"
+        for idx in "${!ids[@]}"; do
+            echo -e "  ${GREEN}$((idx+1))${NC}. ${names[$idx]} (${ids[$idx]})"
+        done
+        echo -e "  ${GREEN}0${NC}. 全部选择"
+
+        local choice
+        read -r -p "请选择结算账户 (输入编号，多个用逗号分隔，如 1,3) [默认: 0]: " choice
+        choice=${choice:-0}
+
+        if [ "$choice" = "0" ]; then
+            SELECTED_BILLING_IDS=("${ids[@]}"); SELECTED_BILLING_NAMES=("${names[@]}")
+        else
+            IFS=',' read -ra selections <<< "$choice"
+            for sel in "${selections[@]}"; do
+                sel=$(echo "$sel" | tr -d ' ')
+                if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#ids[@]}" ]; then
+                    local si=$((sel-1))
+                    SELECTED_BILLING_IDS+=("${ids[$si]}")
+                    SELECTED_BILLING_NAMES+=("${names[$si]}")
+                fi
+            done
+        fi
+        
+        local num_input
+        read -r -p "每个结算账户创建几个项目？(支持数字如 3，或范围如 3-5) [默认: 3]: " num_input
+        num_input=${num_input:-3}
+        
+        if [[ "$num_input" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            local min="${BASH_REMATCH[1]}"; local max="${BASH_REMATCH[2]}"
+            if [ "$min" -le "$max" ]; then num_per_billing=$(( RANDOM % (max - min + 1) + min ))
+            else num_per_billing=$min; fi
+        elif [[ "$num_input" =~ ^[0-9]+$ ]]; then num_per_billing="$num_input"
+        else num_per_billing=3; fi
+    fi
 
     local total_projects=$(( num_per_billing * ${#SELECTED_BILLING_IDS[@]} ))
     local total_success=0; local total_failed=0; local total_skipped=0
     
     local GENERATED_AQ_KEYS=()
     local GENERATED_AIZA_KEYS=()
+    local BILLING_KEY_MAP_AQ=()
+    local BILLING_KEY_MAP_AIZA=()
 
-    if [ "$keep_billing" = "true" ]; then log "INFO" "====== 自动创建并提取 (保留旧结算绑定) ======"
-    else log "INFO" "====== 自动创建并提取 (释放旧配额) ======"; fi
+    if [ "$keep_billing" = "false" ]; then log "INFO" "====== 自动创建并提取 (释放旧配额，防封备胎启用) ======"
+    else log "INFO" "====== 自动创建并提取 (保留旧结算绑定) ======"; fi
 
     for billing_idx in "${!SELECTED_BILLING_IDS[@]}"; do
         local TARGET_BID="${SELECTED_BILLING_IDS[$billing_idx]}"
@@ -270,14 +318,11 @@ vertex_create_projects() {
         local success=0; local failed=0; local skipped=0; local i=1
         while [ $i -le "$num_per_billing" ]; do
             local global_idx=$(( billing_idx * num_per_billing + i ))
-            
-            # 【找回的 AUP 伪装机制核心代码】
             local project_id=$(new_project_id)
             local project_name=$(new_project_name)
             
-            log "INFO" "[${global_idx}/${total_projects}] 正在伪装创建项目: ID=${project_id} | Name=${project_name}"
+            log "INFO" "[主力 $global_idx/${total_projects}] 正在伪装创建项目: ID=${project_id} | Name=${project_name}"
             
-            # 使用 --name 完美伪装官方创建行为
             gcloud projects create "$project_id" --name="$project_name" --quiet >/dev/null 2>&1 || { failed=$((failed+1)); i=$((i+1)); continue; }
             gcloud billing projects link "$project_id" --billing-account="$TARGET_BID" --quiet >/dev/null 2>&1 || true
             
@@ -296,10 +341,14 @@ vertex_create_projects() {
                 local has_key=false
                 while IFS= read -r line; do
                     if [[ "$line" == AQ_KEY:* ]]; then
-                        GENERATED_AQ_KEYS+=("${line#AQ_KEY:}")
+                        local ak="${line#AQ_KEY:}"
+                        GENERATED_AQ_KEYS+=("$ak")
+                        BILLING_KEY_MAP_AQ+=("${billing_idx}:${ak}")
                         has_key=true
                     elif [[ "$line" == AIZA_KEY:* ]]; then
-                        GENERATED_AIZA_KEYS+=("${line#AIZA_KEY:}")
+                        local az="${line#AIZA_KEY:}"
+                        GENERATED_AIZA_KEYS+=("$az")
+                        BILLING_KEY_MAP_AIZA+=("${billing_idx}:${az}")
                         has_key=true
                     fi
                 done <<< "$extract_result"
@@ -317,6 +366,20 @@ vertex_create_projects() {
             fi
             i=$((i+1))
         done
+        
+        # 【备胎防封机制】选项1 独占：提取完主力 key 后，建 2 个备用防封项目
+        if [ "$keep_billing" = "false" ]; then
+            log "INFO" "🎁 战术储备：为您额外创建 2 个【备用项目】防风控..."
+            for backup_i in 1 2; do
+                local b_pid=$(new_project_id)
+                local b_pname=$(new_project_name)
+                log "INFO" "[备用 $backup_i/2] 正在潜伏建号: ID=${b_pid}"
+                gcloud projects create "$b_pid" --name="$b_pname" --quiet >/dev/null 2>&1 || true
+                # 尝试绑定备胎的账单
+                gcloud billing projects link "$b_pid" --billing-account="$TARGET_BID" --quiet >/dev/null 2>&1 || true
+            done
+            log "SUCCESS" "备用项目已就位！主力 403 时可随时转移账单复活喵！"
+        fi
 
         echo -e "${CYAN}  结算 ${billing_name} 小结: 成功 ${success} | 失败 ${failed} | 跳过 ${skipped}${NC}"
         total_success=$((total_success + success))
@@ -329,11 +392,32 @@ vertex_create_projects() {
     
     if [ ${#GENERATED_AQ_KEYS[@]} -gt 0 ]; then
         echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Vertex Agent 密钥 (AQ 格式) ======${NC}"
-        for k in "${GENERATED_AQ_KEYS[@]}"; do echo "$k"; done
+        for bi in "${!SELECTED_BILLING_IDS[@]}"; do
+            local count=0
+            local temp_keys=()
+            for entry in "${BILLING_KEY_MAP_AQ[@]}"; do
+                if [ "${entry%%:*}" = "$bi" ]; then count=$((count+1)); temp_keys+=("${entry#*:}"); fi
+            done
+            if [ "$count" -gt 0 ]; then
+                echo -e "\n${CYAN}${SELECTED_BILLING_NAMES[$bi]} (${SELECTED_BILLING_IDS[$bi]}) - ${count}个${NC}"
+                for k in "${temp_keys[@]}"; do echo "$k"; done
+            fi
+        done
     fi
+    
     if [ ${#GENERATED_AIZA_KEYS[@]} -gt 0 ]; then
         echo -e "\n${GREEN}${BOLD}====== 本次提取的 Gemini AI Studio 密钥 (AIza 格式) ======${NC}"
-        for k in "${GENERATED_AIZA_KEYS[@]}"; do echo "$k"; done
+        for bi in "${!SELECTED_BILLING_IDS[@]}"; do
+            local count=0
+            local temp_keys=()
+            for entry in "${BILLING_KEY_MAP_AIZA[@]}"; do
+                if [ "${entry%%:*}" = "$bi" ]; then count=$((count+1)); temp_keys+=("${entry#*:}"); fi
+            done
+            if [ "$count" -gt 0 ]; then
+                echo -e "\n${CYAN}${SELECTED_BILLING_NAMES[$bi]} (${SELECTED_BILLING_IDS[$bi]}) - ${count}个${NC}"
+                for k in "${temp_keys[@]}"; do echo "$k"; done
+            fi
+        done
         echo
     fi
 }
@@ -419,15 +503,15 @@ main() {
     check_env
     while true; do
         echo -e "\n${CYAN}${BOLD}====== 喵酱的 Vertex 管理器 v${VERSION} ======${NC}"
-        echo "1. [经典] 自动创建项目并提取双匙 (AUP防风控伪装，清理旧项目)"
-        echo "2. [新增] 自动创建项目并提取双匙 (AUP防风控伪装，保留旧项目)"
-        echo "3. 在现有项目上配置并强行提取双匙 (AQ + AIza 双端双持)"
+        echo "1. [经典] 自动创建项目并双持提取 (AUP伪装/解绑旧号/配备胎)"
+        echo "2. [新增] 自动创建项目并双持提取 (AUP伪装/保留旧号)"
+        echo "3. 在现有项目上配置并强行提取 (AQ + AIza 双端双持)"
         echo "0. 退出工具"
         local choice
         read -r -p "请选择: " choice
         case "$choice" in
-            1) vertex_create_projects "false" "true" ;;
-            2) vertex_create_projects "true" "true" ;;
+            1) vertex_create_projects "false" "false" ;;
+            2) vertex_create_projects "true" "false" ;;
             3) vertex_configure_existing ;;
             0) exit 0 ;;
             *) log "ERROR" "无效选项" ;;
