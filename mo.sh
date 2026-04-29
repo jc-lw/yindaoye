@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持满血 23 项 API 开通、双端双持提取 (强制生成 AQ 和 AIza 两把钥匙)
-# 版本: 3.9.0
+# 支持AUP官方防风控伪装命名、满血 23 项 API、双端双持强行提取
+# 版本: 4.2.0
 
 set -Euo
 
@@ -14,11 +14,8 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.9.0"
-PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
+VERSION="4.2.0"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
-
-# Vertex模式配置
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
 
 # ===== 日志与错误处理 =====
@@ -59,13 +56,24 @@ require_cmd() {
 }
 
 unique_suffix() { 
-    if command -v uuidgen &>/dev/null; then uuidgen | tr -d '-' | cut -c1-6 | tr '[:upper:]' '[:lower:]'
-    else echo "$(date +%s%N 2>/dev/null || date +%s)${RANDOM}" | sha256sum | cut -c1-6; fi
+    if command -v uuidgen &>/dev/null; then uuidgen | tr -d '-' | cut -c1-2 | tr '[:upper:]' '[:lower:]'
+    else echo "$(date +%s%N 2>/dev/null || date +%s)${RANDOM}" | sha256sum | cut -c1-2; fi
 }
 
+# 【找回的核心功能】完美伪装 Google 官方随机算法，防 AUP 风控
 new_project_id() {
-    local prefix="${1:-$PROJECT_PREFIX}"
-    echo "${prefix}-$(unique_suffix)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-30
+    local adjectives=("abiding" "active" "adept" "agile" "alert" "ample" "astute" "awake" "aware" "bold" "brave" "bright" "brisk" "calm" "casual" "civil" "clever" "cloudy" "cobalt" "comic" "cool" "coral" "crisp" "daring" "dazzling" "deft" "direct" "divine" "eager" "early" "easy" "elite" "epic" "exact" "expert" "fair" "famous" "fancy" "fast" "fine" "firm" "first" "fit" "fleet" "fluent" "flying" "fond" "frank" "free" "fresh" "full" "fun" "gentle" "glad" "good" "grand" "great" "green" "handy" "happy" "hardy" "heroic" "high" "holy" "honest" "honor" "huge" "humble" "ideal" "intact" "iron" "jolly" "joyful" "keen" "kind" "large" "last" "late" "lean" "light" "live" "local" "logic" "long" "loyal" "lucky" "lunar" "magic" "main" "major" "merry" "mighty" "mint" "model" "modern" "moral" "native" "neat" "new" "nice" "noble" "normal" "novel" "open" "optic" "pacific" "peace" "peachy" "peak" "pearl" "perk" "pilot" "pious" "plain" "poetic" "polite" "prime" "primo" "prompt" "proud" "pure" "quick" "quiet" "rapid" "rare" "ready" "real" "rich" "right" "rigid" "robust" "royal" "safe" "sage" "sane" "scenic" "select" "sharp" "shining" "simple" "skill" "smart" "smile" "smooth" "snug" "sober" "solar" "solid" "sound" "spark" "speedy" "spring" "stable" "star" "steady" "stellar" "strong" "subtle" "sunny" "super" "sure" "swift" "talented" "tame" "tidy" "top" "tough" "true" "trusty" "unique" "upright" "urban" "valid" "valor" "vast" "vital" "vivid" "warm" "wealthy" "whole" "wise" "witty" "worth" "worthy" "young" "zenith")
+    local nouns=("aegis" "aero" "agent" "alchemy" "alpha" "anchor" "apex" "apollo" "archer" "argon" "armor" "arrow" "atlas" "atom" "aura" "aurora" "axis" "badge" "banner" "base" "beacon" "beam" "bear" "beta" "bird" "blade" "bliss" "block" "blue" "board" "boat" "bolt" "bond" "bone" "book" "box" "branch" "bravo" "breeze" "bridge" "brook" "brush" "cable" "cache" "campus" "canal" "canvas" "cargo" "case" "castle" "cell" "center" "chain" "chair" "chart" "check" "chief" "chord" "circle" "city" "class" "clock" "cloud" "coast" "code" "coin" "color" "comet" "core" "craft" "crane" "crest" "crew" "cross" "crown" "cube" "curve" "cycle" "dance" "dart" "dash" "data" "dawn" "day" "deck" "delta" "depth" "desk" "dial" "diary" "digit" "disk" "dock" "domain" "door" "dove" "draft" "dream" "drill" "drive" "drop" "drum" "dual" "duke" "dust" "eagle" "earth" "east" "echo" "edge" "elite" "energy" "engine" "entry" "epoch" "equal" "equity" "era" "estate" "event" "exact" "expert" "extra" "face" "fact" "falcon" "fame" "feat" "field" "file" "fire" "firm" "flag" "flame" "flash" "fleet" "flight" "flock" "flow" "flower" "fluid" "flute" "focus" "force" "forge" "form" "format" "fort" "forum" "frame" "frost" "fund" "future" "galaxy" "game" "gate" "gear" "gem" "genius" "gift" "glide" "globe" "glory" "glow" "goal" "gold" "grace" "graph" "gravity" "grid" "group" "grove" "guard" "guest" "guide" "guild" "halo" "harbor" "haven" "hawk" "heart" "helm" "hero" "hill" "hinge" "hoist" "home" "honor" "hook" "hope" "horn" "host" "hour" "house" "hub" "hull" "idea" "image" "impact" "index" "ink" "iron" "island" "item" "jade" "jazz" "jet" "join" "joint" "joy" "judge" "jump" "key" "king" "kite" "knight" "knot" "lake" "land" "lane" "laser" "lead" "leaf" "leap" "life" "light" "line" "link" "lion" "list" "lock" "logic" "logo" "loop" "lord" "lotus" "luck" "lunar" "magic" "magnet" "mail" "main" "map" "mark" "mass" "master" "mate" "matrix" "max" "maze" "medal" "mega" "memo" "mesh" "meta" "metal" "meter" "method" "mind" "mint" "model" "moon" "motor" "mount" "muse" "music" "myth" "name" "nature" "navy" "neon" "nest" "net" "news" "nexus" "node" "norm" "north" "note" "nova" "novel" "null" "number" "oasis" "ocean" "office" "omega" "optic" "opus" "orbit" "order" "origin" "pace" "pack" "pad" "page" "palm" "panel" "paper" "park" "part" "pass" "past" "path" "peak" "pearl" "peer" "pen" "phase" "phone" "photo" "piece" "pilot" "pine" "ping" "pipe" "pixel" "plan" "planet" "plant" "plate" "play" "plot" "plug" "plus" "point" "pole" "polo" "pool" "port" "post" "power" "press" "prime" "prism" "prize" "probe" "prod" "profit" "prop" "prose" "pulse" "pump" "pure" "push" "quad" "quest" "quota" "race" "radar" "radio" "rail" "rain" "ramp" "rank" "rate" "ratio" "ray" "real" "record" "reef" "rest" "rhyme" "ride" "ridge" "ring" "rise" "risk" "river" "road" "rock" "role" "roll" "roof" "room" "root" "rope" "rose" "route" "rule" "run" "safe" "sage" "sail" "salt" "sand" "scale" "scan" "scene" "scope" "score" "scout" "sea" "seal" "seat" "seed" "seek" "self" "sense" "set" "shade" "shadow" "shaft" "shape" "share" "shell" "shift" "shine" "ship" "shire" "shoe" "shop" "shore" "show" "side" "sign" "signal" "silk" "site" "size" "skill" "sky" "slate" "smile" "snow" "soil" "solar" "solo" "song" "sonic" "sort" "soul" "sound" "source" "south" "space" "spark" "speed" "sphere" "spice" "spike" "spin" "spiral" "spirit" "spot" "spring" "spur" "squad" "square" "stack" "staff" "stage" "star" "start" "state" "statue" "status" "steel" "stem" "step" "stone" "stop" "store" "storm" "story" "stream" "street" "strike" "string" "strip" "style" "suit" "sum" "sun" "surf" "swan" "sync" "system" "table" "tack" "tag" "tail" "talk" "tank" "tape" "task" "team" "tech" "tempo" "tent" "term" "test" "text" "theme" "theory" "thing" "thread" "thrill" "tide" "tie" "tier" "tiger" "tile" "time" "tint" "title" "token" "tone" "tool" "top" "topic" "tour" "tower" "town" "track" "tract" "trade" "trail" "train" "trait" "trap" "tree" "trek" "trend" "trial" "tribe" "trick" "trio" "trip" "troop" "true" "trust" "truth" "tube" "tune" "turn" "twin" "type" "unit" "unity" "up" "urban" "user" "vale" "valley" "value" "valve" "vault" "vector" "vein" "vent" "verb" "verse" "vibe" "view" "villa" "vine" "vision" "visit" "voice" "void" "volt" "volume" "vote" "vow" "voyage" "walk" "wall" "ward" "wave" "way" "web" "week" "west" "wheel" "wind" "wing" "wire" "wise" "wish" "wolf" "wood" "word" "work" "world" "yard" "yarn" "year" "yield" "yolk" "zenith" "zephyr" "zero" "zone")
+    local adj=${adjectives[$RANDOM % ${#adjectives[@]}]}
+    local noun=${nouns[$RANDOM % ${#nouns[@]}]}
+    local num=$(printf "%06d" $((RANDOM % 1000000)))
+    local short_hash=$(unique_suffix)
+    echo "${adj}-${noun}-${num}-${short_hash}"
+}
+
+new_project_name() {
+    local num=$(printf "%d" $((10000 + RANDOM % 90000)))
+    echo "My Project ${num}"
 }
 
 check_env() {
@@ -158,14 +166,13 @@ verify_billing_status() {
     return 1
 }
 
-# ===== 【核心大改】双端双持提取：强行提取两把钥匙 =====
+# ===== 双端双持提取：强行提取两把钥匙 =====
 setup_and_extract_credentials() {
     local project_id="$1"
     local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
     local found_aq=""
     local found_aiza=""
     
-    # === 第一步：设置服务账号 (为生成 AQ 做准备) ===
     if ! gcloud iam service-accounts describe "$sa_email" --project="$project_id" &>/dev/null; then
         retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Agent SA" --project="$project_id" --quiet >/dev/null 2>&1 || true
     fi
@@ -178,10 +185,9 @@ setup_and_extract_credentials() {
     log "INFO" "同步 IAM 权限，防延迟深呼吸 15 秒..."
     sleep 15
 
-    # === 第二步：强行生成两把钥匙 (如果不存在的话) ===
     log "INFO" "正在向 Google 强行索要双端钥匙 (Agent + AI Studio)..."
     
-    # 1. 索要 Agent 的 AQ 密钥 (绑定 SA)
+    # 1. 索要 Agent 的 AQ 密钥
     local create_err
     if ! create_err=$(gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet 2>&1); then
         local err_msg=$(echo "$create_err" | tail -n 1 | tr -d '\r')
@@ -193,7 +199,7 @@ setup_and_extract_credentials() {
     # 2. 索要 AI Studio 的标准 AIza 密钥
     gcloud services api-keys create --project="$project_id" --display-name="Gemini Studio Key" --quiet >/dev/null 2>&1 || true
 
-    # === 第三步：彻底搜查并提取这两把钥匙 ===
+    # 3. 提取
     local keys_list
     keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     
@@ -211,7 +217,6 @@ setup_and_extract_credentials() {
         done
     fi
 
-    # === 第四步：输出结果 ===
     local output=""
     if [ -n "$found_aq" ]; then
         echo "AQ_KEY:${found_aq}"
@@ -222,14 +227,10 @@ setup_and_extract_credentials() {
         output="1"
     fi
 
-    if [ -n "$output" ]; then
-        return 0
-    else
-        return 1
-    fi
+    if [ -n "$output" ]; then return 0; else return 1; fi
 }
 
-# ===== 功能 1 & 2：自动创建项目 =====
+# ===== 功能 1 & 2：自动创建项目 (修复伪装逻辑) =====
 vertex_create_projects() {
     local keep_billing="${1:-false}"
     
@@ -269,11 +270,15 @@ vertex_create_projects() {
         local success=0; local failed=0; local skipped=0; local i=1
         while [ $i -le "$num_per_billing" ]; do
             local global_idx=$(( billing_idx * num_per_billing + i ))
+            
+            # 【找回的 AUP 伪装机制核心代码】
             local project_id=$(new_project_id)
+            local project_name=$(new_project_name)
             
-            log "INFO" "[${global_idx}/${total_projects}] 正在处理项目: ${project_id}"
+            log "INFO" "[${global_idx}/${total_projects}] 正在伪装创建项目: ID=${project_id} | Name=${project_name}"
             
-            gcloud projects create "$project_id" --quiet >/dev/null 2>&1 || { failed=$((failed+1)); i=$((i+1)); continue; }
+            # 使用 --name 完美伪装官方创建行为
+            gcloud projects create "$project_id" --name="$project_name" --quiet >/dev/null 2>&1 || { failed=$((failed+1)); i=$((i+1)); continue; }
             gcloud billing projects link "$project_id" --billing-account="$TARGET_BID" --quiet >/dev/null 2>&1 || true
             
             if ! verify_billing_status "$project_id"; then
@@ -414,9 +419,9 @@ main() {
     check_env
     while true; do
         echo -e "\n${CYAN}${BOLD}====== 喵酱的 Vertex 管理器 v${VERSION} ======${NC}"
-        echo "1. [经典] 自动创建项目并提取双匙 (战术延时，清理旧项目)"
-        echo "2. [新增] 自动创建项目并提取双匙 (战术延时，保留旧项目)"
-        echo "3. 在现有项目上配置并强行提取 双匙 (AQ + AIza 双端双持)"
+        echo "1. [经典] 自动创建项目并提取双匙 (AUP防风控伪装，清理旧项目)"
+        echo "2. [新增] 自动创建项目并提取双匙 (AUP防风控伪装，保留旧项目)"
+        echo "3. 在现有项目上配置并强行提取双匙 (AQ + AIza 双端双持)"
         echo "0. 退出工具"
         local choice
         read -r -p "请选择: " choice
