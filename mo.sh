@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持主方案分批并发突破20限额、备用方案兜底、战术延时防风控
-# 版本: 3.7.0
+# 支持全自动伪装创建(完美避开AUP风控)、双保险API开通、动态控制台链接
+# 版本: 4.0.0
 
 set -Euo
 
@@ -14,8 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="3.7.0"
-PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
+VERSION="4.0.0"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 
 # Vertex模式配置
@@ -58,13 +57,25 @@ require_cmd() {
 }
 
 unique_suffix() { 
-    if command -v uuidgen &>/dev/null; then uuidgen | tr -d '-' | cut -c1-6 | tr '[:upper:]' '[:lower:]'
-    else echo "$(date +%s%N 2>/dev/null || date +%s)${RANDOM}" | sha256sum | cut -c1-6; fi
+    if command -v uuidgen &>/dev/null; then uuidgen | tr -d '-' | cut -c1-2 | tr '[:upper:]' '[:lower:]'
+    else echo "$(date +%s%N 2>/dev/null || date +%s)${RANDOM}" | sha256sum | cut -c1-2; fi
 }
 
+# 【核心伪装机制】模拟 Google 官方控制台的随机生成算法
 new_project_id() {
-    local prefix="${1:-$PROJECT_PREFIX}"
-    echo "${prefix}-$(unique_suffix)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-30
+    local adjectives=("abiding" "active" "adept" "agile" "alert" "ample" "astute" "awake" "aware" "bold" "brave" "bright" "brisk" "calm" "casual" "civil" "clever" "cloudy" "cobalt" "comic" "cool" "coral" "crisp" "daring" "dazzling" "deft" "direct" "divine" "eager" "early" "easy" "elite" "epic" "exact" "expert" "fair" "famous" "fancy" "fast" "fine" "firm" "first" "fit" "fleet" "fluent" "flying" "fond" "frank" "free" "fresh" "full" "fun" "gentle" "glad" "good" "grand" "great" "green" "handy" "happy" "hardy" "heroic" "high" "holy" "honest" "honor" "huge" "humble" "ideal" "intact" "iron" "jolly" "joyful" "keen" "kind" "large" "last" "late" "lean" "light" "live" "local" "logic" "long" "loyal" "lucky" "lunar" "magic" "main" "major" "merry" "mighty" "mint" "model" "modern" "moral" "native" "neat" "new" "nice" "noble" "normal" "novel" "open" "optic" "pacific" "peace" "peachy" "peak" "pearl" "perk" "pilot" "pious" "plain" "poetic" "polite" "prime" "primo" "prompt" "proud" "pure" "quick" "quiet" "rapid" "rare" "ready" "real" "rich" "right" "rigid" "robust" "royal" "safe" "sage" "sane" "scenic" "select" "sharp" "shining" "simple" "skill" "smart" "smile" "smooth" "snug" "sober" "solar" "solid" "sound" "spark" "speedy" "spring" "stable" "star" "steady" "stellar" "strong" "subtle" "sunny" "super" "sure" "swift" "talented" "tame" "tidy" "top" "tough" "true" "trusty" "unique" "upright" "urban" "valid" "valor" "vast" "vital" "vivid" "warm" "wealthy" "whole" "wise" "witty" "worth" "worthy" "young" "zenith")
+    local nouns=("aegis" "aero" "agent" "alchemy" "alpha" "anchor" "apex" "apollo" "archer" "argon" "armor" "arrow" "atlas" "atom" "aura" "aurora" "axis" "badge" "banner" "base" "beacon" "beam" "bear" "beta" "bird" "blade" "bliss" "block" "blue" "board" "boat" "bolt" "bond" "bone" "book" "box" "branch" "bravo" "breeze" "bridge" "brook" "brush" "cable" "cache" "campus" "canal" "canvas" "cargo" "case" "castle" "cell" "center" "chain" "chair" "chart" "check" "chief" "chord" "circle" "city" "class" "clock" "cloud" "coast" "code" "coin" "color" "comet" "core" "craft" "crane" "crest" "crew" "cross" "crown" "cube" "curve" "cycle" "dance" "dart" "dash" "data" "dawn" "day" "deck" "delta" "depth" "desk" "dial" "diary" "digit" "disk" "dock" "domain" "door" "dove" "draft" "dream" "drill" "drive" "drop" "drum" "dual" "duke" "dust" "eagle" "earth" "east" "echo" "edge" "elite" "energy" "engine" "entry" "epoch" "equal" "equity" "era" "estate" "event" "exact" "expert" "extra" "face" "fact" "falcon" "fame" "feat" "field" "file" "fire" "firm" "flag" "flame" "flash" "fleet" "flight" "flock" "flow" "flower" "fluid" "flute" "focus" "force" "forge" "form" "format" "fort" "forum" "frame" "frost" "fund" "future" "galaxy" "game" "gate" "gear" "gem" "genius" "gift" "glide" "globe" "glory" "glow" "goal" "gold" "grace" "graph" "gravity" "grid" "group" "grove" "guard" "guest" "guide" "guild" "halo" "harbor" "haven" "hawk" "heart" "helm" "hero" "hill" "hinge" "hoist" "home" "honor" "hook" "hope" "horn" "host" "hour" "house" "hub" "hull" "idea" "image" "impact" "index" "ink" "iron" "island" "item" "jade" "jazz" "jet" "join" "joint" "joy" "judge" "jump" "key" "king" "kite" "knight" "knot" "lake" "land" "lane" "laser" "lead" "leaf" "leap" "life" "light" "line" "link" "lion" "list" "lock" "logic" "logo" "loop" "lord" "lotus" "luck" "lunar" "magic" "magnet" "mail" "main" "map" "mark" "mass" "master" "mate" "matrix" "max" "maze" "medal" "mega" "memo" "mesh" "meta" "metal" "meter" "method" "mind" "mint" "model" "moon" "motor" "mount" "muse" "music" "myth" "name" "nature" "navy" "neon" "nest" "net" "news" "nexus" "node" "norm" "north" "note" "nova" "novel" "null" "number" "oasis" "ocean" "office" "omega" "optic" "opus" "orbit" "order" "origin" "pace" "pack" "pad" "page" "palm" "panel" "paper" "park" "part" "pass" "past" "path" "peak" "pearl" "peer" "pen" "phase" "phone" "photo" "piece" "pilot" "pine" "ping" "pipe" "pixel" "plan" "planet" "plant" "plate" "play" "plot" "plug" "plus" "point" "pole" "polo" "pool" "port" "post" "power" "press" "prime" "prism" "prize" "probe" "prod" "profit" "prop" "prose" "pulse" "pump" "pure" "push" "quad" "quest" "quota" "race" "radar" "radio" "rail" "rain" "ramp" "rank" "rate" "ratio" "ray" "real" "record" "reef" "rest" "rhyme" "ride" "ridge" "ring" "rise" "risk" "river" "road" "rock" "role" "roll" "roof" "room" "root" "rope" "rose" "route" "rule" "run" "safe" "sage" "sail" "salt" "sand" "scale" "scan" "scene" "scope" "score" "scout" "sea" "seal" "seat" "seed" "seek" "self" "sense" "set" "shade" "shadow" "shaft" "shape" "share" "shell" "shift" "shine" "ship" "shire" "shoe" "shop" "shore" "show" "side" "sign" "signal" "silk" "site" "size" "skill" "sky" "slate" "smile" "snow" "soil" "solar" "solo" "song" "sonic" "sort" "soul" "sound" "source" "south" "space" "spark" "speed" "sphere" "spice" "spike" "spin" "spiral" "spirit" "spot" "spring" "spur" "squad" "square" "stack" "staff" "stage" "star" "start" "state" "statue" "status" "steel" "stem" "step" "stone" "stop" "store" "storm" "story" "stream" "street" "strike" "string" "strip" "style" "suit" "sum" "sun" "surf" "swan" "sync" "system" "table" "tack" "tag" "tail" "talk" "tank" "tape" "task" "team" "tech" "tempo" "tent" "term" "test" "text" "theme" "theory" "thing" "thread" "thrill" "tide" "tie" "tier" "tiger" "tile" "time" "tint" "title" "token" "tone" "tool" "top" "topic" "tour" "tower" "town" "track" "tract" "trade" "trail" "train" "trait" "trap" "tree" "trek" "trend" "trial" "tribe" "trick" "trio" "trip" "troop" "true" "trust" "truth" "tube" "tune" "turn" "twin" "type" "unit" "unity" "up" "urban" "user" "vale" "valley" "value" "valve" "vault" "vector" "vein" "vent" "verb" "verse" "vibe" "view" "villa" "vine" "vision" "visit" "voice" "void" "volt" "volume" "vote" "vow" "voyage" "walk" "wall" "ward" "wave" "way" "web" "week" "west" "wheel" "wind" "wing" "wire" "wise" "wish" "wolf" "wood" "word" "work" "world" "yard" "yarn" "year" "yield" "yolk" "zenith" "zephyr" "zero" "zone")
+    local adj=${adjectives[$RANDOM % ${#adjectives[@]}]}
+    local noun=${nouns[$RANDOM % ${#nouns[@]}]}
+    local num=$(printf "%06d" $((RANDOM % 1000000)))
+    local short_hash=$(unique_suffix)
+    echo "${adj}-${noun}-${num}-${short_hash}"
+}
+
+# 伪装控制台默认的 My Project xxxxx
+new_project_name() {
+    local num=$(printf "%d" $((10000 + RANDOM % 90000)))
+    echo "My Project ${num}"
 }
 
 check_env() {
@@ -84,7 +95,7 @@ unlink_projects_from_billing_account() {
     return 0
 }
 
-# ===== 【极致优化】双保险开通 API (突破 20 个 API 限制) =====
+# ===== 双保险开通 API (加入动态专属链接) =====
 enable_essential_services() {
     local proj="$1"
     local services=(
@@ -98,22 +109,23 @@ enable_essential_services() {
         "dialogflow.googleapis.com"
     )
     
-    log "INFO" "🚀 [主方案] 启动分批极速并发，开启 ${#services[@]} 项核心权限..."
+    # 动态链接，方便主人随时点击查看
+    local manual_link="https://console.cloud.google.com/agent-platform/studio/settings/api-keys?project=${proj}"
     
-    # 将 22 个 API 对半劈开，防止触发 Google 官方单次限额 20 的物理红线
+    log "INFO" "🚀 [主方案] 尝试分批一键全开 API，如果遇到问题可点此链接手动开通："
+    echo -e "${YELLOW}>> ${manual_link} <<${NC}" >&2
+    
     local chunk1=("${services[@]:0:11}")
     local chunk2=("${services[@]:11}")
-    
     local main_plan_success=true
     
-    # 连续丢两批，速度飞快且绝对不会被 Google 拒收
     if ! gcloud services enable "${chunk1[@]}" --project="$proj" --quiet >/dev/null 2>&1; then main_plan_success=false; fi
     if ! gcloud services enable "${chunk2[@]}" --project="$proj" --quiet >/dev/null 2>&1; then main_plan_success=false; fi
 
     if [ "$main_plan_success" = true ]; then
         log "SUCCESS" "主方案一键分批开通成功！"
     else
-        log "WARN" "⚠️ 主方案部分受阻，切换 [备用方案] 启动逐个击破模式..."
+        log "WARN" "⚠️ 主方案受阻，切换 [备用方案] 启动逐个击破模式..."
         local idx=1
         for svc in "${services[@]}"; do
             printf "\r\033[0;36m[%s] [INFO] 备用方案凿门中 [%d/%d] 正在死磕: %s\033[0m\033[K" "$(date '+%Y-%m-%d %H:%M:%S')" "$idx" "${#services[@]}" "$svc" >&2
@@ -124,7 +136,6 @@ enable_essential_services() {
         log "SUCCESS" "备用方案执行完毕！"
     fi
     
-    # 强制状态校验 (防 403 核心机制)
     log "INFO" "正在强制校验核心 Vertex AI API 激活状态..."
     local verify_attempt=1
     while [ $verify_attempt -le 6 ]; do
@@ -138,6 +149,8 @@ enable_essential_services() {
         sleep 10
         verify_attempt=$((verify_attempt+1))
     done
+    
+    log "ERROR" "API 激活校验失败，请访问链接手动启用: ${manual_link}"
     return 1
 }
 
@@ -223,7 +236,7 @@ setup_and_extract_credentials() {
     return 1
 }
 
-# ===== 功能 1 & 2：自动创建项目 (含战术延时) =====
+# ===== 功能 1 & 2：自动创建项目 (含战术延时伪装) =====
 vertex_create_projects() {
     local keep_billing="${1:-false}"
     local auto_mode="${2:-false}"
@@ -299,7 +312,8 @@ vertex_create_projects() {
 
         if [ "$keep_billing" = "false" ]; then 
             unlink_projects_from_billing_account "$TARGET_BID"
-            log "INFO" "已清理旧项目账单，原地静默潜伏 5 秒钟以消除数据库缓存喵..."
+            # 战术延时 1：解绑后潜伏
+            log "INFO" "已清理旧项目账单，战术潜伏 5 秒以消除 AUP 数据库缓存喵..."
             sleep 5
         fi
 
@@ -307,9 +321,12 @@ vertex_create_projects() {
         while [ $i -le "$num_per_billing" ]; do
             local global_idx=$(( billing_idx * num_per_billing + i ))
             local project_id=$(new_project_id)
-            log "INFO" "[${global_idx}/${total_projects}] 正在处理新建项目: ${project_id}"
+            local project_name=$(new_project_name)
             
-            gcloud projects create "$project_id" --quiet >/dev/null 2>&1 || { failed=$((failed+1)); i=$((i+1)); continue; }
+            log "INFO" "[${global_idx}/${total_projects}] 正在伪装创建项目: ID=${project_id} | Name=${project_name}"
+            
+            # 使用 --name 完美伪装官方创建行为
+            gcloud projects create "$project_id" --name="$project_name" --quiet >/dev/null 2>&1 || { failed=$((failed+1)); i=$((i+1)); continue; }
             gcloud billing projects link "$project_id" --billing-account="$TARGET_BID" --quiet >/dev/null 2>&1 || true
             
             if ! verify_billing_status "$project_id"; then
@@ -317,8 +334,9 @@ vertex_create_projects() {
                 skipped=$((skipped+1)); i=$((i+1)); continue
             fi
 
-            log "INFO" "账单绑定确认成功！开启 10 秒安全静默期，模拟人类操作避开 GCP 风控雷达..."
-            sleep 10
+            # 战术延时 2：开通前伪装
+            log "INFO" "账单绑定确认！开启 20 秒安全静默期，模拟人类操作避开 GCP AUP 风控雷达..."
+            sleep 20
             
             enable_essential_services "$project_id"
             
@@ -442,9 +460,9 @@ main() {
     check_env
     while true; do
         echo -e "\n${CYAN}${BOLD}====== 喵酱的 Vertex 管理器 v${VERSION} ======${NC}"
-        echo "1. [经典] 自动创建项目并提取 (战术延时，清理旧项目)"
-        echo "2. [新增] 自动创建项目并提取 (战术延时，保留旧项目)"
-        echo "3. 在现有项目上配置并提取 (分批提速，双保险防漏)"
+        echo "1. [经典] 自动创建项目并提取 (战术延时伪装，清理旧项目)"
+        echo "2. [新增] 自动创建项目并提取 (战术延时伪装，保留旧项目)"
+        echo "3. 在现有项目上配置并提取 (主备双方案 API 开通)"
         echo "0. 退出工具"
         local choice
         read -r -p "请选择: " choice
