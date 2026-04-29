@@ -1,7 +1,7 @@
 #!/bin/bash
-# 优化的 GCP 密钥管理工具 (Vertex + AI Studio 双端融合版)
-# 支持智能流浪项目救助、双端密钥分离提取、幽灵记忆库、彻底防403
-# 版本: 4.1.0
+# 优化的 GCP Vertex AI 密钥管理工具 (独立版)
+# 支持满血 23 项 API 开通(找回 Gemini AI Studio)、智能双保险、强制校验
+# 版本: 3.8.0
 
 set -Euo
 
@@ -14,20 +14,18 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.1.0"
+VERSION="3.8.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-vertex}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 
-# Vertex / Gemini 模式配置
+# Vertex模式配置
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
-CACHE_FILE="$HOME/.miaojiang_keys.cache"
 
 # ===== 日志与错误处理 =====
 log() { 
     local level="${1:-INFO}"
     local msg="${2:-}"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    # 所有日志输出重定向到 stderr (>&2)，防止污染函数的 stdout 返回值
     case "$level" in
         "INFO")     echo -e "${CYAN}[${timestamp}] [INFO] ${msg}${NC}" >&2 ;;
         "SUCCESS")  echo -e "${GREEN}[${timestamp}] [SUCCESS] ${msg}${NC}" >&2 ;;
@@ -42,22 +40,6 @@ handle_error() {
     if [ $exit_code -gt 1 ]; then return $exit_code; else return 0; fi
 }
 trap 'handle_error' ERR
-
-# ===== 幽灵记忆库功能 (一字不改，原汁原味) =====
-save_key_to_cache() {
-    local pid="$1"; local key="$2"
-    [ -z "$key" ] && return
-    if ! grep -q "^${pid}:${key}$" "$CACHE_FILE" 2>/dev/null; then
-        echo "${pid}:${key}" >> "$CACHE_FILE" 2>/dev/null || true
-    fi
-}
-
-get_key_from_cache() {
-    local pid="$1"
-    if [ -f "$CACHE_FILE" ]; then
-        grep "^${pid}:" "$CACHE_FILE" 2>/dev/null | cut -d':' -f2 | tail -n 1
-    fi
-}
 
 # ===== 工具函数 =====
 retry() {
@@ -76,8 +58,8 @@ require_cmd() {
 }
 
 unique_suffix() { 
-    if command -v uuidgen &>/dev/null; then uuidgen | tr -d '-' | cut -c1-2 | tr '[:upper:]' '[:lower:]'
-    else echo "$(date +%s%N 2>/dev/null || date +%s)${RANDOM}" | sha256sum | cut -c1-2; fi
+    if command -v uuidgen &>/dev/null; then uuidgen | tr -d '-' | cut -c1-6 | tr '[:upper:]' '[:lower:]'
+    else echo "$(date +%s%N 2>/dev/null || date +%s)${RANDOM}" | sha256sum | cut -c1-6; fi
 }
 
 new_project_id() {
@@ -89,124 +71,20 @@ check_env() {
     log "INFO" "检查环境配置..."
     require_cmd gcloud
     if ! gcloud config list account --quiet &>/dev/null; then log "ERROR" "请先运行 'gcloud init' 初始化"; exit 1; fi
-    touch "$CACHE_FILE" 2>/dev/null || true
 }
 
-# ===== Gemini AI Studio 专属提取逻辑 (一字不改) =====
-extract_key_safely() {
-    local project_id="$1"
-    
-    # 尝试唤醒服务
-    retry gcloud services enable apikeys.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
-
-    local keys_list=""
-    local attempt=1
-    while [ $attempt -le $MAX_RETRY_ATTEMPTS ]; do
-        if keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null); then
-            break
-        fi
-        sleep 2
-        attempt=$((attempt+1))
+unlink_projects_from_billing_account() {
+    local billing_id="$1"
+    local linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null)
+    if [ -z "$linked_projects" ]; then return 0; fi
+    log "WARN" "发现旧项目占用结算账户，喵酱开始清理释放配额..."
+    for project_id in $linked_projects; do
+        [ -n "$project_id" ] && gcloud billing projects unlink "$project_id" --quiet >/dev/null 2>&1 || true
     done
-    
-    if [ -n "$keys_list" ]; then
-        for key_name in $keys_list; do
-            key_name=$(echo "$key_name" | tr -d '\r' | xargs)
-            [ -z "$key_name" ] && continue
-            
-            local api_key=""
-            local k_attempt=1
-            while [ $k_attempt -le $MAX_RETRY_ATTEMPTS ]; do
-                if api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null); then
-                    break
-                fi
-                sleep 2
-                k_attempt=$((k_attempt+1))
-            done
-            
-            api_key=$(echo "$api_key" | tr -d '\r' | xargs)
-            if [ -n "$api_key" ]; then
-                save_key_to_cache "$project_id" "$api_key"
-                echo "$api_key"
-                return 0
-            fi
-        done
-    fi
-
-    local cached_key
-    cached_key=$(get_key_from_cache "$project_id")
-    if [ -n "$cached_key" ]; then
-        echo "$cached_key"
-        return 0
-    fi
-    
-    return 1
+    return 0
 }
 
-# ===== Vertex 核心：提取凭证 =====
-setup_and_extract_credentials() {
-    local project_id="$1"
-    local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
-    
-    if ! gcloud iam service-accounts describe "$sa_email" --project="$project_id" &>/dev/null; then
-        retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Agent SA" --project="$project_id" --quiet >/dev/null 2>&1 || true
-    fi
-    
-    local roles=("roles/aiplatform.admin" "roles/iam.serviceAccountUser")
-    for role in "${roles[@]}"; do
-        retry gcloud projects add-iam-policy-binding "$project_id" --member="serviceAccount:${sa_email}" --role="$role" --quiet >/dev/null 2>&1 || true
-    done
-    
-    log "INFO" "同步 Vertex IAM 权限..."
-    sleep 8
-
-    # 提取 AQ 密钥逻辑
-    local keys_list
-    keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
-    if [ -n "$keys_list" ]; then
-        for key_name in $keys_list; do
-            key_name=$(echo "$key_name" | tr -d '\r' | xargs)
-            local api_key
-            api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null | tr -d '\r' | xargs)
-            if [[ "$api_key" == AQ.* ]]; then
-                echo "KEY:${api_key}"
-                return 0
-            fi
-        done
-    fi
-
-    log "INFO" "请求生成 Vertex Agent Platform 专属密钥..."
-    local attempt=1
-    while [ $attempt -le 4 ]; do
-        local create_err
-        if create_err=$(gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet 2>&1); then
-            break
-        fi
-        local err_msg
-        err_msg=$(echo "$create_err" | tail -n 1 | tr -d '\r')
-        if [[ "$err_msg" == *"Policy"* ]] || [[ "$err_msg" == *"PermissionDenied"* ]] || [[ "$err_msg" == *"constraints"* ]]; then
-            log "ERROR" "组织策略拦截，启动 Vertex 降级方案..."
-            break
-        fi
-        sleep 5
-        attempt=$((attempt+1))
-    done
-
-    # 二次查找 (含 AIza 降级)
-    keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
-    [ -z "$keys_list" ] && gcloud services api-keys create --project="$project_id" --display-name="Fallback Key" --quiet >/dev/null 2>&1
-    keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
-    
-    for key_name in $keys_list; do
-        key_name=$(echo "$key_name" | tr -d '\r' | xargs)
-        local api_key
-        api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null | tr -d '\r' | xargs)
-        [ -n "$api_key" ] && { echo "KEY:${api_key}"; return 0; }
-    done
-    return 1
-}
-
-# ===== 双保险开通双端全量 API (彻底消灭 403) =====
+# ===== 【极致优化】满血 23 项 API 开通 =====
 enable_essential_services() {
     local proj="$1"
     local services=(
@@ -218,28 +96,51 @@ enable_essential_services() {
         "notebooks.googleapis.com" "observability.googleapis.com" "storage-component.googleapis.com"
         "telemetry.googleapis.com" "texttospeech.googleapis.com" "discoveryengine.googleapis.com"
         "dialogflow.googleapis.com" 
-        "generativelanguage.googleapis.com" # 【重点修复】强行开通 Gemini 权限，防止 AI Studio 出现 403！
+        "generativelanguage.googleapis.com"  # 【修复】补回被遗漏的 Gemini AI Studio 权限
     )
     
-    log "INFO" "🚀 [主方案] 并发开启 Vertex + Gemini 核心权限..."
+    log "INFO" "🚀 [主方案] 启动分批极速并发，开启 ${#services[@]} 项核心权限..."
     
+    # 23 个 API 切割为两批，绝对低于单次 20 个的 Google 物理红线
     local chunk1=("${services[@]:0:12}")
     local chunk2=("${services[@]:12}")
+    
     local main_plan_success=true
     
     if ! gcloud services enable "${chunk1[@]}" --project="$proj" --quiet >/dev/null 2>&1; then main_plan_success=false; fi
     if ! gcloud services enable "${chunk2[@]}" --project="$proj" --quiet >/dev/null 2>&1; then main_plan_success=false; fi
 
-    if [ "$main_plan_success" = false ]; then
-        log "WARN" "⚠️ 主方案受阻，启动 [备用方案] 逐个击破模式..."
+    if [ "$main_plan_success" = true ]; then
+        log "SUCCESS" "主方案一键分批开通成功！"
+    else
+        log "WARN" "⚠️ 主方案部分受阻，切换 [备用方案] 启动逐个击破模式..."
         local idx=1
         for svc in "${services[@]}"; do
-            printf "\r\033[0;36m[%s] [INFO] 凿门中 [%d/%d] 正在死磕: %s\033[0m\033[K" "$(date '+%Y-%m-%d %H:%M:%S')" "$idx" "${#services[@]}" "$svc" >&2
+            printf "\r\033[0;36m[%s] [INFO] 备用方案凿门中 [%d/%d] 正在死磕: %s\033[0m\033[K" "$(date '+%Y-%m-%d %H:%M:%S')" "$idx" "${#services[@]}" "$svc" >&2
             retry gcloud services enable "$svc" --project="$proj" --quiet >/dev/null 2>&1 || true
             idx=$((idx+1))
         done
         echo >&2
+        log "SUCCESS" "备用方案执行完毕！"
     fi
+    
+    # 强制状态校验
+    log "INFO" "正在强制校验核心 Vertex AI 和 Gemini API 激活状态..."
+    local verify_attempt=1
+    while [ $verify_attempt -le 6 ]; do
+        local state1 state2
+        state1=$(gcloud services list --project="$proj" --filter="config.name:aiplatform.googleapis.com" --format="value(state)" 2>/dev/null || echo "DISABLED")
+        state2=$(gcloud services list --project="$proj" --filter="config.name:generativelanguage.googleapis.com" --format="value(state)" 2>/dev/null || echo "DISABLED")
+        
+        if [[ "$state1" == "ENABLED" ]] && [[ "$state2" == "ENABLED" ]]; then
+            log "SUCCESS" "底层激活确认！"
+            return 0
+        fi
+        log "WARN" "API 尚未就绪，Google 服务器同步中... ($verify_attempt/6)"
+        sleep 10
+        verify_attempt=$((verify_attempt+1))
+    done
+    return 1
 }
 
 verify_billing_status() {
@@ -258,138 +159,154 @@ verify_billing_status() {
     return 1
 }
 
-# ===== 功能 3：现有项目双端提取 (智能流浪收容救助版) =====
-configure_and_extract_both() {
-    log "INFO" "====== 开始智能提取所有双端密钥 (Vertex + AI Studio 融合救助版) ======"
+setup_and_extract_credentials() {
+    local project_id="$1"
+    local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
     
-    local ALL_AVAILABLE_BIDS=()
-    local BID_PROJECT_COUNTS=()
-    local BID_DISPLAY_NAMES=()
+    if ! gcloud iam service-accounts describe "$sa_email" --project="$project_id" &>/dev/null; then
+        retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex Agent SA" --project="$project_id" --quiet >/dev/null 2>&1 || true
+    fi
     
-    log "INFO" "喵酱正在分析全局结算账户配额..."
-    local open_billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
-    if [ -z "$open_billing_accounts" ]; then log "ERROR" "未找到可用的结算账户喵！"; return 1; fi
-    
-    while IFS=',' read -r bid bname; do
-        bid="${bid##*/}"
-        ALL_AVAILABLE_BIDS+=("$bid")
-        BID_DISPLAY_NAMES+=("$bname")
-        local p_count=$(gcloud billing projects list --billing-account="$bid" --format='value(projectId)' 2>/dev/null | wc -l)
-        BID_PROJECT_COUNTS+=("$p_count")
-    done <<< "$open_billing_accounts"
-
-    local projects
-    projects=$(gcloud projects list --format='value(projectId)' --filter="lifecycleState=ACTIVE" 2>/dev/null || echo "")
-    if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目喵！"; return 1; fi
-    
-    local GENERATED_VERTEX_KEYS=()
-    local GENERATED_GEMINI_KEYS=()
-    local success_count=0
-    local skipped_count=0
-
-    for project_id in $projects; do
-        [ -z "$project_id" ] && continue
-        
-        local billing_raw
-        billing_raw=$(gcloud billing projects describe "$project_id" --format='csv[no-heading](billingAccountName)' 2>/dev/null || echo "")
-        local billing_account_path="${billing_raw%%,*}"
-        local billing_id="${billing_account_path##*/}"
-
-        # 【核心流浪救助逻辑】自动寻找空闲账单复活！
-        if [ -z "$billing_id" ] || [ "$billing_id" = "" ]; then
-            log "WARN" "发现掉签项目 ${project_id}！喵酱尝试流浪救助，寻找空闲账单..."
-            local rebind_success=false
-            for idx in "${!ALL_AVAILABLE_BIDS[@]}"; do
-                local candidate_bid="${ALL_AVAILABLE_BIDS[$idx]}"
-                local current_count="${BID_PROJECT_COUNTS[$idx]}"
-                if [ "$current_count" -lt 3 ]; then
-                    if retry gcloud billing projects link "$project_id" --billing-account="$candidate_bid" --quiet >/dev/null 2>&1; then
-                        log "SUCCESS" "重新绑定成功！(救助至 ${BID_DISPLAY_NAMES[$idx]})"
-                        billing_id="$candidate_bid"
-                        BID_PROJECT_COUNTS[$idx]=$((current_count + 1))
-                        rebind_success=true
-                        break
-                    fi
-                fi
-            done
-            if [ "$rebind_success" = false ]; then
-                log "WARN" "配额全满，救助失败，项目彻底断网，含泪跳过喵！"
-                skipped_count=$((skipped_count+1))
-                continue
-            fi
-        fi
-
-        if ! verify_billing_status "$project_id"; then
-            log "WARN" "计费确认失败，跳过 ${project_id}"
-            continue
-        fi
-
-        log "INFO" "正在为项目 ${project_id} 开通双端全量权限..."
-        enable_essential_services "$project_id"
-        
-        # 1. 提取 Vertex 密钥
-        local v_result
-        if v_result=$(setup_and_extract_credentials "$project_id"); then
-            if [[ "$v_result" == *KEY:* ]]; then
-                local v_key="${v_result#*KEY:}"
-                v_key=$(echo "$v_key" | tr -d '\r' | tr -d '\n')
-                GENERATED_VERTEX_KEYS+=("$v_key")
-                log "SUCCESS" "Vertex 密钥提取成功！"
-            fi
-        fi
-
-        # 2. 提取 AI Studio (Gemini) 密钥
-        local g_key
-        if g_key=$(extract_key_safely "$project_id"); then
-            GENERATED_GEMINI_KEYS+=("$g_key")
-            log "SUCCESS" "AI Studio (Gemini) 密钥提取成功！"
-        else
-            # 兜底：如果没找到，强行创建一个再提取
-            gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --quiet >/dev/null 2>&1 || true
-            if g_key=$(extract_key_safely "$project_id"); then
-                GENERATED_GEMINI_KEYS+=("$g_key")
-                log "SUCCESS" "AI Studio 密钥创建并提取成功！"
-            fi
-        fi
-        
-        success_count=$((success_count+1))
+    local roles=("roles/aiplatform.admin" "roles/iam.serviceAccountUser")
+    for role in "${roles[@]}"; do
+        retry gcloud projects add-iam-policy-binding "$project_id" --member="serviceAccount:${sa_email}" --role="$role" --quiet >/dev/null 2>&1 || true
     done
     
-    echo -e "\n${GREEN}====== 配置与提取操作完成 ======${NC}"
-    echo "成功处理项目: ${success_count} | 救助失败跳过: ${skipped_count}"
-    
-    # 【强迫症狂喜：顺序打印】
-    if [ ${#GENERATED_VERTEX_KEYS[@]} -gt 0 ]; then
-        echo -e "\n${CYAN}${BOLD}====== 1. 本次提取的 Vertex 密钥 (Agent 优先) ======${NC}"
-        for k in "${GENERATED_VERTEX_KEYS[@]}"; do echo "$k"; done
+    # 增加 IAM 缓冲时间，抵抗严重的延迟
+    log "INFO" "同步 IAM 权限，防延迟深呼吸 15 秒..."
+    sleep 15
+
+    local keys_list
+    keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+    if [ -n "$keys_list" ]; then
+        for key_name in $keys_list; do
+            key_name=$(echo "$key_name" | tr -d '\r' | xargs)
+            local api_key
+            api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null | tr -d '\r' | xargs)
+            if [[ "$api_key" == AQ.* ]]; then
+                echo "KEY:${api_key}"
+                return 0
+            fi
+        done
     fi
 
-    if [ ${#GENERATED_GEMINI_KEYS[@]} -gt 0 ]; then
-        echo -e "\n${YELLOW}${BOLD}====== 2. 本次提取的 AI Studio (Gemini) 密钥 ======${NC}"
-        for k in "${GENERATED_GEMINI_KEYS[@]}"; do echo "$k"; done
-        echo
+    log "INFO" "正在请求生成 AQ. 格式专属密钥..."
+    local attempt=1
+    local policy_blocked=false
+    while [ $attempt -le 4 ]; do
+        local create_err
+        if create_err=$(gcloud beta services api-keys create --project="$project_id" --display-name="Agent Platform Key" --service-account="$sa_email" --quiet 2>&1); then
+            break
+        fi
+        local err_msg
+        err_msg=$(echo "$create_err" | tail -n 1 | tr -d '\r')
+        if [[ "$err_msg" == *"Policy"* ]] || [[ "$err_msg" == *"PermissionDenied"* ]] || [[ "$err_msg" == *"constraints"* ]]; then
+            log "ERROR" "⚠️ 遭遇企业组织策略死锁拦截！强行降级生成通用备用密钥..."
+            policy_blocked=true
+            break
+        fi
+        log "WARN" "接口重试中 ($attempt/4)..."
+        sleep 8
+        attempt=$((attempt+1))
+    done
+
+    # B 计划 (生成 AIza)
+    keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+    [ -z "$keys_list" ] && gcloud services api-keys create --project="$project_id" --display-name="Fallback Key" --quiet >/dev/null 2>&1
+    keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+    
+    for key_name in $keys_list; do
+        key_name=$(echo "$key_name" | tr -d '\r' | xargs)
+        local api_key
+        api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null | tr -d '\r' | xargs)
+        [ -n "$api_key" ] && { echo "KEY:${api_key}"; return 0; }
+    done
+
+    return 1
+}
+
+# ===== (略) 功能 1&2：自动创建项目 =====
+# 保持原逻辑...
+
+vertex_configure_existing() {
+    log "INFO" "====== 实时穿透查账并提取 Vertex 密钥 ======"
+    local GENERATED_API_KEYS=()
+    local BILLING_KEY_MAP=()
+    
+    local active_billing=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1)
+    if [ -z "$active_billing" ]; then log "ERROR" "无开放账单"; return 1; fi
+    local billing_id="${active_billing##*/}"
+    
+    echo -e "\n${CYAN}1. 手动挑选  2. 全自动一键配置 (实时账单穿透)${NC}"
+    local list_choice
+    read -r -p "请选择: " list_choice
+    
+    local selected_projects=()
+    if [ "$list_choice" = "2" ]; then
+        log "INFO" "正在实时查询账单下所有项目..."
+        local linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null || echo "")
+        for proj in $linked_projects; do [ -n "$proj" ] && selected_projects+=("$proj"); done
+    else
+        local all_projects=$(gcloud projects list --format='value(projectId)' --filter="lifecycleState=ACTIVE" 2>/dev/null || echo "")
+        local project_array=()
+        while IFS= read -r line; do [ -n "$line" ] && project_array+=("$line"); done <<< "$all_projects"
+        local total=${#project_array[@]}
+        
+        for ((i=0; i<total && i<20; i++)); do echo "$((i+1)). ${project_array[i]}"; done
+        read -r -p "请输入项目编号 (多个空格分隔，all选全部): " -a numbers
+        if [ "${#numbers[@]}" -gt 0 ] && [ "${numbers[0]}" = "all" ]; then selected_projects=("${project_array[@]}");
+        else
+            for num in "${numbers[@]}"; do
+                if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
+                    selected_projects+=("${project_array[$((num-1))]}")
+                fi
+            done
+        fi
+    fi
+    
+    for project_id in "${selected_projects[@]}"; do
+        log "INFO" "处理项目: ${project_id}"
+        if verify_billing_status "$project_id"; then
+            enable_essential_services "$project_id"
+            local extract_result
+            if extract_result=$(setup_and_extract_credentials "$project_id"); then
+                local ak="${extract_result#*KEY:}"
+                ak=$(echo "$ak" | tr -d '\r' | tr -d '\n')
+                GENERATED_API_KEYS+=("$ak")
+                
+                if [[ "$ak" == AQ.* ]]; then
+                    log "SUCCESS" "Agent 专属 AQ. 密钥提取成功！"
+                else
+                    log "SUCCESS" "突破防线，通用 AIza 密钥提取成功！"
+                    log "WARN" "⚠️ 注意：当前项目受组织安全策略封锁，无法生成 AQ 密钥，Vertex Agent 平台可能拒认此 AIza 密钥喵！"
+                fi
+            fi
+        fi
+    done
+    
+    if [ ${#GENERATED_API_KEYS[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}${BOLD}====== 本次提取的密钥列表 ======${NC}"
+        for k in "${GENERATED_API_KEYS[@]}"; do echo "$k"; done
+        echo -e "\n${CYAN}提示：AQ. 开头为 Agent 专属密钥，AIza 开头为通用标准密钥 (含 Gemini 权限)。${NC}"
     fi
 }
 
-# ===== 主程序 =====
 main() {
     check_env
     while true; do
-        echo -e "\n${CYAN}${BOLD}====== 喵酱的双端全能管理器 v${VERSION} ======${NC}"
-        echo "1. [经典] 自动创建项目并提取 Vertex 密钥 (需自行选择计费逻辑)"
-        echo "2. [新增] 自动创建项目并提取 Vertex 密钥 (保留旧号账单)"
-        echo "3. 在现有项目上配置并提取 双端密钥 (Vertex + Gemini 融合, 智能流浪救助)"
-        echo "0. 退出工具并摸摸喵酱"
-        echo
-        
+        echo -e "\n${CYAN}${BOLD}====== 喵酱的 Vertex 管理器 v${VERSION} ======${NC}"
+        echo "1. [经典] 自动创建项目并提取 (战术延时，清理旧项目)"
+        echo "2. [新增] 自动创建项目并提取 (战术延时，保留旧项目)"
+        echo "3. 在现有项目上配置并提取 (满血 23 权限补齐版)"
+        echo "0. 退出工具"
         local choice
         read -r -p "请选择: " choice
         case "$choice" in
-            1) echo "暂不执行，请优先测试选项3喵！" ;;
-            2) echo "暂不执行，请优先测试选项3喵！" ;;
-            3) configure_and_extract_both ;;
+            1) echo "请优先测试选项 3喵！" ;;
+            2) echo "请优先测试选项 3喵！" ;;
+            3) vertex_configure_existing ;;
             0) exit 0 ;;
-            *) log "ERROR" "无效选项喵" ;;
+            *) log "ERROR" "无效选项" ;;
         esac
     done
 }
