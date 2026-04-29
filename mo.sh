@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP Vertex AI 密钥管理工具 (独立版)
-# 支持AUP官方防风控伪装命名、双端双持提取、附带备用项目(备胎)防封机制
-# 版本: 4.3.0
+# 支持AUP防风控伪装命名、双端双持提取、瞬间识别账单配额实现主备分流
+# 版本: 4.5.0
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.3.0"
+VERSION="4.5.0"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
 
@@ -165,7 +165,7 @@ verify_billing_status() {
     return 1
 }
 
-# ===== 双端双持提取：强行提取两把钥匙 =====
+# ===== 双端双持提取 =====
 setup_and_extract_credentials() {
     local project_id="$1"
     local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
@@ -226,7 +226,7 @@ setup_and_extract_credentials() {
     if [ -n "$output" ]; then return 0; else return 1; fi
 }
 
-# ===== 功能 1 & 2：自动创建项目 =====
+# ===== 功能 1 & 2：自动创建项目 (修复智能流转逻辑) =====
 vertex_create_projects() {
     local keep_billing="${1:-false}"
     
@@ -238,7 +238,7 @@ vertex_create_projects() {
 
     echo -e "\n${CYAN}主人想怎么操作呢？${NC}"
     echo "1. 自定义选择结算账户和数量"
-    echo "2. 全自动 (为所有可用账户各创建3个项目)"
+    echo "2. 全自动 (为所有可用账户各跑一轮)"
     local sub_choice
     read -r -p "请选择 [1-2, 默认: 1]: " sub_choice
     sub_choice=${sub_choice:-1}
@@ -246,7 +246,7 @@ vertex_create_projects() {
     local num_per_billing=3
 
     if [ "$sub_choice" = "2" ]; then
-        log "INFO" "🐱 开启【全自动模式】：每个结算账户创建 3 个主力项目"
+        log "INFO" "🐱 开启【全自动模式】..."
         while IFS=',' read -r bid bname; do
             bid="${bid##*/}"; SELECTED_BILLING_IDS+=("$bid"); SELECTED_BILLING_NAMES+=("$bname")
         done <<< "$billing_raw"
@@ -281,15 +281,15 @@ vertex_create_projects() {
         fi
         
         local num_input
-        read -r -p "每个结算账户创建几个项目？(支持数字如 3，或范围如 3-5) [默认: 3]: " num_input
-        num_input=${num_input:-3}
+        read -r -p "请输入本次要运行的总项目数？(例如想建3主力+2备胎就填 5) [默认: 5]: " num_input
+        num_input=${num_input:-5}
         
         if [[ "$num_input" =~ ^([0-9]+)-([0-9]+)$ ]]; then
             local min="${BASH_REMATCH[1]}"; local max="${BASH_REMATCH[2]}"
             if [ "$min" -le "$max" ]; then num_per_billing=$(( RANDOM % (max - min + 1) + min ))
             else num_per_billing=$min; fi
         elif [[ "$num_input" =~ ^[0-9]+$ ]]; then num_per_billing="$num_input"
-        else num_per_billing=3; fi
+        else num_per_billing=5; fi
     fi
 
     local total_projects=$(( num_per_billing * ${#SELECTED_BILLING_IDS[@]} ))
@@ -300,7 +300,7 @@ vertex_create_projects() {
     local BILLING_KEY_MAP_AQ=()
     local BILLING_KEY_MAP_AIZA=()
 
-    if [ "$keep_billing" = "false" ]; then log "INFO" "====== 自动创建并提取 (释放旧配额，防封备胎启用) ======"
+    if [ "$keep_billing" = "false" ]; then log "INFO" "====== 自动创建并提取 (释放旧配额，配额不足自动转为纯净备胎) ======"
     else log "INFO" "====== 自动创建并提取 (保留旧结算绑定) ======"; fi
 
     for billing_idx in "${!SELECTED_BILLING_IDS[@]}"; do
@@ -321,11 +321,23 @@ vertex_create_projects() {
             local project_id=$(new_project_id)
             local project_name=$(new_project_name)
             
-            log "INFO" "[主力 $global_idx/${total_projects}] 正在伪装创建项目: ID=${project_id} | Name=${project_name}"
+            log "INFO" "[${global_idx}/${total_projects}] 正在伪装创建项目: ID=${project_id} | Name=${project_name}"
             
             gcloud projects create "$project_id" --name="$project_name" --quiet >/dev/null 2>&1 || { failed=$((failed+1)); i=$((i+1)); continue; }
+            
+            # 尝试绑定账单
             gcloud billing projects link "$project_id" --billing-account="$TARGET_BID" --quiet >/dev/null 2>&1 || true
             
+            # 【瞬间秒查】是否真的挂上账单了？ (防止无账单时傻等)
+            local b_name_check
+            b_name_check=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
+            
+            if [ -z "$b_name_check" ]; then
+                log "WARN" "🚨 账单挂载被拒 (配额限制)！项目 ${project_id} 自动转为【纯净备胎】，不再开通任何 API喵！"
+                skipped=$((skipped+1)); i=$((i+1)); continue
+            fi
+            
+            # 如果确认挂上了，再等生效
             if ! verify_billing_status "$project_id"; then
                 log "WARN" "项目 ${project_id} 计费未生效，跳过提取喵！"
                 skipped=$((skipped+1)); i=$((i+1)); continue
@@ -366,29 +378,15 @@ vertex_create_projects() {
             fi
             i=$((i+1))
         done
-        
-        # 【备胎防封机制】选项1 独占：提取完主力 key 后，建 2 个备用防封项目
-        if [ "$keep_billing" = "false" ]; then
-            log "INFO" "🎁 战术储备：为您额外创建 2 个【备用项目】防风控..."
-            for backup_i in 1 2; do
-                local b_pid=$(new_project_id)
-                local b_pname=$(new_project_name)
-                log "INFO" "[备用 $backup_i/2] 正在潜伏建号: ID=${b_pid}"
-                gcloud projects create "$b_pid" --name="$b_pname" --quiet >/dev/null 2>&1 || true
-                # 尝试绑定备胎的账单
-                gcloud billing projects link "$b_pid" --billing-account="$TARGET_BID" --quiet >/dev/null 2>&1 || true
-            done
-            log "SUCCESS" "备用项目已就位！主力 403 时可随时转移账单复活喵！"
-        fi
 
-        echo -e "${CYAN}  结算 ${billing_name} 小结: 成功 ${success} | 失败 ${failed} | 跳过 ${skipped}${NC}"
+        echo -e "${CYAN}  结算 ${billing_name} 小结: 成功提取 ${success} | 失败 ${failed} | 纯净备胎 ${skipped}${NC}"
         total_success=$((total_success + success))
         total_failed=$((total_failed + failed))
         total_skipped=$((total_skipped + skipped))
     done
     
     echo -e "\n${CYAN}${BOLD}====== 全部任务汇报 ======${NC}"
-    echo "结算账户: ${#SELECTED_BILLING_IDS[@]} 个 | 计划创建: ${total_projects} | 成功: ${total_success} | 失败: ${total_failed} | 跳过: ${total_skipped}"
+    echo "结算账户: ${#SELECTED_BILLING_IDS[@]} 个 | 运行总数: ${total_projects} | 提取成功: ${total_success} | 转为备胎: ${total_skipped}"
     
     if [ ${#GENERATED_AQ_KEYS[@]} -gt 0 ]; then
         echo -e "\n${YELLOW}${BOLD}====== 本次提取的 Vertex Agent 密钥 (AQ 格式) ======${NC}"
@@ -503,8 +501,8 @@ main() {
     check_env
     while true; do
         echo -e "\n${CYAN}${BOLD}====== 喵酱的 Vertex 管理器 v${VERSION} ======${NC}"
-        echo "1. [经典] 自动创建项目并双持提取 (AUP伪装/解绑旧号/配备胎)"
-        echo "2. [新增] 自动创建项目并双持提取 (AUP伪装/保留旧号)"
+        echo "1. [经典] 自动创建项目并双持提取 (AUP伪装，智能留备胎)"
+        echo "2. [新增] 自动创建项目并双持提取 (AUP伪装，保留旧号)"
         echo "3. 在现有项目上配置并强行提取 (AQ + AIza 双端双持)"
         echo "0. 退出工具"
         local choice
