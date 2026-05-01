@@ -1,7 +1,7 @@
 #!/bin/bash
-# 优化的 GCP API 密钥管理工具 - 4.3.0 经典提取 + 1:1 官方 UI 命名复刻
+# 优化的 GCP API 密钥管理工具 - 4.3.0 经典提取 + 官方 UI 命名 + 完整提取复原版
 # 支持 Gemini API (全量提取 + 动态救助掉签项目重绑账单 + 幽灵记忆库)
-# 版本: 4.3.2
+# 版本: 4.3.3
 
 set -Euo
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.3.2"
+VERSION="4.3.3"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
 TEMP_DIR=""
@@ -86,7 +86,7 @@ new_project_name() {
   echo "My Project $((RANDOM % 90000 + 10000))"
 }
 
-# 完全模拟 GCP 官方 Web UI 的项目 ID 生成器 (形容词-名词-数字-可选尾巴)
+# 完全模拟 GCP 官方 Web UI 的项目 ID 生成器
 new_project_id() { 
   local adjs=("aesthetic" "bold" "brave" "calm" "clever" "cosmic" "dazzling" "deep" "epic" "fancy" "gentle" "happy" "jolly" "kind" "lively" "magic" "noble" "proud" "quiet" "rapid" "shiny" "smart" "sunny" "sweet" "vivid" "warm" "wild" "wise" "zesty")
   local nouns=("aleph" "beacon" "cloud" "dawn" "echo" "forge" "grove" "haven" "iris" "jewel" "kite" "leaf" "moon" "nexus" "oasis" "pulse" "quest" "ridge" "spark" "tide" "unity" "vortex" "wave" "zenith")
@@ -133,7 +133,6 @@ unlink_projects_from_billing_account() {
 extract_key_safely() {
   local project_id="$1"
   
-  # 尝试唤醒服务
   retry gcloud services enable apikeys.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
 
   local keys_list=""
@@ -283,16 +282,13 @@ gemini_create_projects() {
     while [ $i -le "$num_per_billing" ]; do
       local global_idx=$(( billing_idx * num_per_billing + i ))
       
-      # 使用全新的官方化命名和 ID
       local project_id=$(new_project_id)
       local project_name=$(new_project_name)
       
       log "INFO" "[${global_idx}/${total_projects}] 正在处理项目: ${project_name} [${project_id}] (结算: ${billing_name})"
       
-      # 创建项目时指定 --name 参数
       gcloud projects create "$project_id" --name="$project_name" || { failed=$((failed+1)); i=$((i+1)); continue; }
       gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" || true
-      gcloud billing projects describe "$project_id" >/dev/null 2>&1 || true
       
       local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
       if [ -z "$billing_info" ]; then
@@ -304,7 +300,6 @@ gemini_create_projects() {
       
       local key_output=""
       key_output=$(gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json) || true
-      if [ -n "$key_output" ]; then echo "$key_output"; fi
       
       local api_key=""
       api_key=$(parse_json "$key_output" ".keyString") || true
@@ -364,10 +359,140 @@ gemini_create_projects() {
   fi
 }
 
+# ===== 完整回归：提取现有项目逻辑 =====
 gemini_get_keys_from_existing() {
   log "INFO" "====== 从现有项目强力提取密钥 ======"
-  # （保留 4.3.0 选项3结构，此处为了精简省略重复逻辑，具体按 4.5.0 修复即可）
-  log "WARN" "已进入智能提取模式喵！"
+  
+  local open_billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
+  if [ -z "$open_billing_accounts" ]; then log "ERROR" "未找到可用的结算账户喵！"; return 1; fi
+  
+  local ALL_AVAILABLE_BIDS=()
+  local BID_PROJECT_COUNTS=()
+  local BID_DISPLAY_NAMES=()
+  
+  log "INFO" "喵酱正在分析结算账户配额..."
+  while IFS=',' read -r bid bname; do
+    bid="${bid##*/}"
+    ALL_AVAILABLE_BIDS+=("$bid")
+    BID_DISPLAY_NAMES+=("$bname")
+    local p_count=$(gcloud billing projects list --billing-account="$bid" --format='value(projectId)' 2>/dev/null | wc -l)
+    BID_PROJECT_COUNTS+=("$p_count")
+  done <<< "$open_billing_accounts"
+
+  local projects
+  projects=$(gcloud projects list --format='value(projectId)' 2>/dev/null || echo "")
+  if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目喵！"; return 1; fi
+  
+  local success=0; local skipped=0; local failed=0
+  local ALL_KEYS=()
+  local BILLING_IDS=()
+  local BILLING_NAMES=()
+  local BILLING_KEY_MAP=()
+
+  for project_id in $projects; do
+    [ -z "$project_id" ] && continue
+    
+    local billing_raw
+    billing_raw=$(gcloud billing projects describe "$project_id" --format='csv[no-heading](billingAccountName)' 2>/dev/null || echo "")
+    local billing_account_path="${billing_raw%%,*}"
+    local billing_id="${billing_account_path##*/}"
+    local billing_display_name
+
+    if [ -z "$billing_id" ] || [ "$billing_id" = "" ]; then
+      log "WARN" "发现掉签项目 ${project_id}！喵酱尝试寻找空闲账单重新绑定..."
+      local rebind_success=false
+      for idx in "${!ALL_AVAILABLE_BIDS[@]}"; do
+        local candidate_bid="${ALL_AVAILABLE_BIDS[$idx]}"
+        local current_count="${BID_PROJECT_COUNTS[$idx]}"
+        if [ "$current_count" -lt 3 ]; then
+          if retry gcloud billing projects link "$project_id" --billing-account="$candidate_bid" --quiet >/dev/null 2>&1; then
+            log "SUCCESS" "重新绑定成功！(绑定至 ${BID_DISPLAY_NAMES[$idx]})"
+            billing_id="$candidate_bid"
+            billing_display_name="${BID_DISPLAY_NAMES[$idx]}"
+            BID_PROJECT_COUNTS[$idx]=$((current_count + 1))
+            rebind_success=true
+            break
+          fi
+        fi
+      done
+
+      if [ "$rebind_success" = false ]; then
+        billing_id="Unlinked"
+        billing_display_name="未绑定结算账户 (配额全满，重绑失败)"
+      fi
+    else
+      billing_display_name=$(gcloud billing accounts describe "$billing_id" --format='value(displayName)' 2>/dev/null || echo "$billing_id")
+      [ -z "$billing_display_name" ] && billing_display_name="$billing_id"
+    fi
+
+    local bi=-1
+    for idx in "${!BILLING_IDS[@]}"; do
+      if [ "${BILLING_IDS[$idx]}" = "$billing_id" ]; then bi="$idx"; break; fi
+    done
+    if [ "$bi" -eq -1 ]; then
+      BILLING_IDS+=("$billing_id")
+      BILLING_NAMES+=("$billing_display_name")
+      bi="$(( ${#BILLING_IDS[@]} - 1 ))"
+    fi
+    
+    log "INFO" "正在提取项目: ${project_id} (结算: ${billing_display_name})"
+    
+    local api_key
+    if api_key=$(extract_key_safely "$project_id"); then
+      ALL_KEYS+=("$api_key")
+      BILLING_KEY_MAP+=("${bi}:${api_key}")
+      success=$((success+1))
+      log "SUCCESS" "找到已有密钥！"
+    else
+      if [ "$billing_id" = "Unlinked" ]; then
+        log "WARN" "项目彻底断网且记忆库无存档，含泪跳过喵！"
+        skipped=$((skipped+1))
+        continue
+      fi
+
+      retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
+      gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --quiet >/dev/null 2>&1 || true
+      
+      if api_key=$(extract_key_safely "$project_id"); then
+        ALL_KEYS+=("$api_key")
+        BILLING_KEY_MAP+=("${bi}:${api_key}")
+        success=$((success+1))
+        log "SUCCESS" "创建了新密钥！"
+      else
+        failed=$((failed+1))
+      fi
+    fi
+  done
+  
+  echo -e "\n${CYAN}====== 提取完成 ======${NC}"
+  echo "成功提取: $success | 无账单跳过: $skipped | 失败: $failed"
+  
+  if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
+    echo -e "\n${YELLOW}${BOLD}喵酱为你奉上所有密钥喵（按结算账户分组）：${NC}"
+    echo -e "${YELLOW}─────────────────────────────────────────${NC}"
+    for bi in "${!BILLING_IDS[@]}"; do
+      local b_name="${BILLING_NAMES[$bi]}"
+      local b_id="${BILLING_IDS[$bi]}"
+      local count=0
+      local keys_for_this_billing=()
+
+      for entry in "${BILLING_KEY_MAP[@]}"; do
+        local e_bi="${entry%%:*}"
+        local e_key="${entry#*:}"
+        if [ "$e_bi" = "$bi" ]; then 
+          count=$((count+1))
+          keys_for_this_billing+=("$e_key")
+        fi
+      done
+
+      if [ "$count" -gt 0 ]; then
+        echo -e "\n${CYAN}${BOLD}${b_name} - ${b_id}  (${count} 个密钥)${NC}"
+        for k in "${keys_for_this_billing[@]}"; do echo "$k"; done
+      fi
+    done
+    echo -e "\n${YELLOW}─────────────────────────────────────────${NC}"
+    echo -e "共 ${GREEN}${#ALL_KEYS[@]}${NC} 个密钥\n"
+  fi
 }
 
 gemini_delete_projects() {
