@@ -1,9 +1,9 @@
 #!/bin/bash
-# 优化的 GCP API 密钥管理工具 - 4.3.0 经典提取 + 官方 UI 命名 + 完整提取复原版
+# 优化的 GCP API 密钥管理工具 - 4.3.0 经典提取 + 官方 UI 命名 + 删站转移重建
 # 支持 Gemini API (全量提取 + 动态救助掉签项目重绑账单 + 幽灵记忆库)
-# 版本: 4.3.3
+# 版本: 4.3.4
 
-set -Euo
+set -Euo pipefail
 
 # ===== 颜色定义 =====
 RED='\033[0;31m'
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.3.3"
+VERSION="4.3.4"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
 TEMP_DIR=""
@@ -132,7 +132,6 @@ unlink_projects_from_billing_account() {
 # ===== 核心提取逻辑 (原汁原味 4.3.0) =====
 extract_key_safely() {
   local project_id="$1"
-  
   retry gcloud services enable apikeys.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
 
   local keys_list=""
@@ -175,7 +174,6 @@ extract_key_safely() {
     echo "$cached_key"
     return 0
   fi
-  
   return 1
 }
 
@@ -506,6 +504,79 @@ gemini_delete_projects() {
   done
 }
 
+# ===== 新增：选项5 删站 -> 转移结算 -> 建3个项目并提取 =====
+rebuild_and_transfer_billing() {
+  log "INFO" "====== 选项5: 清理重建与结算转移 ======"
+  
+  local CURRENT_ACCOUNT="$(gcloud config get-value account 2>/dev/null)"
+  log "INFO" "当前登录账号: $CURRENT_ACCOUNT"
+  
+  local TARGET_EMAIL
+  read -r -p "请输入接收结算权限的目标邮箱 [直接回车默认: $CURRENT_ACCOUNT]: " TARGET_EMAIL
+  TARGET_EMAIL=${TARGET_EMAIL:-$CURRENT_ACCOUNT}
+  
+  # 1. 转移结算权限
+  log "INFO" "正在查找可用的结算账户..."
+  local billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null)
+  if [ -z "$billing_accounts" ]; then
+    log "WARN" "未找到活动的结算账户，跳过结算转移。"
+  else
+    for billing_name in $billing_accounts; do
+      local billing_id="${billing_name#billingAccounts/}"
+      log "INFO" "处理结算账户: $billing_id"
+      
+      local policy_json
+      policy_json=$(gcloud beta billing accounts get-iam-policy "$billing_id" --format=json 2>/dev/null || echo "")
+      if [ -n "$policy_json" ]; then
+        local roles=$(python3 -c '
+import sys, json
+try:
+    policy = json.loads(sys.argv[1])
+    member = "user:" + sys.argv[2]
+    roles = set()
+    for b in policy.get("bindings", []):
+        if member in b.get("members", []):
+            roles.add(b.get("role"))
+    for r in sorted(roles):
+        print(r)
+except Exception as e:
+    pass
+' "$policy_json" "$CURRENT_ACCOUNT")
+        
+        if [ -n "$roles" ]; then
+          log "INFO" "为目标邮箱 $TARGET_EMAIL 赋予权限..."
+          for role in $roles; do
+            log "INFO" " -> 授予 $role"
+            gcloud beta billing accounts add-iam-policy-binding "$billing_id" \
+              --member="user:$TARGET_EMAIL" \
+              --role="$role" --quiet >/dev/null 2>&1 || log "WARN" "授权 $role 失败"
+          done
+        else
+          log "WARN" "未在结算 $billing_id 找到当前账号的 IAM 角色喵。"
+        fi
+      fi
+    done
+  fi
+  
+  # 2. 逐个删除所有项目 (按要求每次等待 3 秒)
+  log "INFO" "====== 开始删除所有项目 ======"
+  local all_projects=$(gcloud projects list --format="value(projectId)" 2>/dev/null || echo "")
+  if [ -z "$all_projects" ]; then
+    log "INFO" "没有需要删除的项目喵。"
+  else
+    for p in $all_projects; do
+      log "INFO" "正在删除项目 $p ..."
+      gcloud projects delete "$p" --quiet >/dev/null 2>&1 || log "WARN" "删除项目 $p 失败"
+      log "INFO" "等待 3 秒..."
+      sleep 3
+    done
+  fi
+  
+  # 3. 自动创建 3 个项目并提取
+  log "INFO" "====== 开始重新创建 3 个项目并提取密钥 ======"
+  gemini_create_projects "false" "true"
+}
+
 # ===== 主菜单 =====
 show_menu() {
   echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
@@ -513,6 +584,7 @@ show_menu() {
   echo "2. [防风控] 自动创建项目并提取密钥 (保留旧项目结算绑定)"
   echo "3. 从现有项目提取密钥"
   echo "4. 批量删除项目"
+  echo "5. [终极] 删全站 -> 转移结算 -> 自动建3个项目并提取"
   echo "0. 退出并摸摸喵酱"
   local choice
   read -r -p "请主人吩咐: " choice
@@ -531,6 +603,7 @@ show_menu() {
       ;;
     3) check_env && gemini_get_keys_from_existing ;;
     4) check_env && gemini_delete_projects ;;
+    5) check_env && rebuild_and_transfer_billing ;;
     0) exit 0 ;;
     *) log "ERROR" "指令无效喵！" ;; 
   esac
