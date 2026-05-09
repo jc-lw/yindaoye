@@ -1,7 +1,8 @@
 #!/bin/bash
-# 优化的 GCP API 密钥管理工具 - 4.3.0经典提取 + 官方命名 + 选项5(护盾重建)
-# 支持 Gemini API (全量提取 + 动态救助掉签项目重绑账单 + 幽灵记忆库)
-# 版本: 4.3.5
+# 优化的 GCP API 密钥管理工具 - 经典护航版
+# 支持 Gemini API (全量提取 + 动态救助 + 幽灵记忆库)
+# 修复了选项3打印丢失 Bug，增加了官方强制人工激活付费层级的防封锁提示
+# 版本: 4.3.6
 
 set -Euo pipefail
 
@@ -14,7 +15,8 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.3.5"
+VERSION="4.3.6"
+PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang-api}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
 TEMP_DIR=""
@@ -50,6 +52,17 @@ cleanup_resources() {
 }
 trap cleanup_resources EXIT
 
+# ===== 【新增】强制升级付费层级提示 =====
+prompt_upgrade_billing() {
+  echo -e "\n${YELLOW}${BOLD}⚠️ 喵酱的防风控与付费激活提示：${NC}"
+  echo -e "根据 Google Cloud 官方底层安全限制，${RED}无法通过任何代码或脚本将「免费试用」自动激活为「付费层级」${NC}。"
+  echo -e "（因为授权信用卡扣费必须人工点击法律条款）。"
+  echo -e "如果您的账号还是免费层级，接下来极易触发 403 封禁或配额不足！"
+  echo -e "请务必前往下方链接，点击顶部的 ${GREEN}【激活 (Activate) / 升级 (Upgrade)】${NC} 按钮："
+  echo -e "${CYAN}👉 https://console.cloud.google.com/billing ${NC}"
+  read -r -p "确认您已手动激活付费层级后，请按回车键继续执行脚本 (Press Enter to continue)..." _
+}
+
 # ===== 幽灵记忆库功能 =====
 save_key_to_cache() {
   local pid="$1"; local key="$2"
@@ -81,12 +94,10 @@ retry() {
 
 require_cmd() { if ! command -v "$1" &>/dev/null; then log "ERROR" "缺少依赖: $1"; exit 1; fi; }
 
-# 完全模拟 GCP 官方 Web UI 的项目名称生成器
 new_project_name() { 
   echo "My Project $((RANDOM % 90000 + 10000))"
 }
 
-# 完全模拟 GCP 官方 Web UI 的项目 ID 生成器
 new_project_id() { 
   local adjs=("aesthetic" "bold" "brave" "calm" "clever" "cosmic" "dazzling" "deep" "epic" "fancy" "gentle" "happy" "jolly" "kind" "lively" "magic" "noble" "proud" "quiet" "rapid" "shiny" "smart" "sunny" "sweet" "vivid" "warm" "wild" "wise" "zesty")
   local nouns=("aleph" "beacon" "cloud" "dawn" "echo" "forge" "grove" "haven" "iris" "jewel" "kite" "leaf" "moon" "nexus" "oasis" "pulse" "quest" "ridge" "spark" "tide" "unity" "vortex" "wave" "zenith")
@@ -129,7 +140,7 @@ unlink_projects_from_billing_account() {
   return 0
 }
 
-# ===== 核心提取逻辑 (原汁原味 4.3.0) =====
+# ===== 核心提取逻辑 (原汁原味) =====
 extract_key_safely() {
   local project_id="$1"
   retry gcloud services enable apikeys.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
@@ -237,9 +248,10 @@ select_billing_accounts() {
   fi
 }
 
-# ===== 选项1、2 核心逻辑：经典创建跑马灯流程 =====
+# ===== 选项1、2 核心逻辑 =====
 gemini_create_projects() {
-  # (为精简字数和保持结构完整，此处复用前面的完整逻辑即可)
+  prompt_upgrade_billing
+  
   local keep_billing="${1:-false}"
   local auto_mode="${2:-false}"
   
@@ -303,6 +315,7 @@ gemini_create_projects() {
       
       gcloud projects create "$project_id" --name="$project_name" || { failed=$((failed+1)); i=$((i+1)); continue; }
       gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" || true
+      gcloud billing projects describe "$project_id" || true
       
       local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
       if [ -z "$billing_info" ]; then
@@ -338,26 +351,38 @@ gemini_create_projects() {
   fi
 }
 
-# ===== 选项3 核心逻辑：提取现有项目 =====
+# ===== 【已修复 Bug】选项3 核心逻辑：提取现有项目 =====
 gemini_get_keys_from_existing() {
+  prompt_upgrade_billing
+  
   log "INFO" "====== 从现有项目强力提取密钥 ======"
   local projects
   projects=$(gcloud projects list --format='value(projectId)' 2>/dev/null || echo "")
   if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目喵！"; return 1; fi
   
   local success=0; local failed=0
+  local ALL_KEYS=()
+  
   for project_id in $projects; do
     log "INFO" "正在提取项目: ${project_id}"
     local api_key=$(_extract_single_project "$project_id")
     if [ -n "$api_key" ]; then
       log "SUCCESS" "提取成功: $api_key"
+      ALL_KEYS+=("$project_id : $api_key")
       success=$((success+1))
     else
       log "WARN" "提取失败喵"
       failed=$((failed+1))
     fi
   done
+  
   echo -e "\n${CYAN}成功提取: $success | 失败: $failed${NC}"
+  
+  if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
+    echo -e "\n${YELLOW}${BOLD}====== 喵酱为你奉上所有提取到的密钥 ======${NC}"
+    for k in "${ALL_KEYS[@]}"; do echo -e "${GREEN}$k${NC}"; done
+    echo
+  fi
 }
 
 # ===== 选项4 核心逻辑：批量删除 =====
@@ -374,6 +399,8 @@ gemini_delete_projects() {
 
 # ===== 新增：选项5 删站(保护原始) -> 转移结算 -> 建2个提取1+2 =====
 rebuild_and_transfer_billing() {
+  prompt_upgrade_billing
+
   log "INFO" "====== 选项5: 终极护盾转移重建模式 ======"
   
   # 0. 确认原始项目
