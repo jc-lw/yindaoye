@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - 经典护航版
 # 支持 Gemini API (全量提取 + 动态救助掉签项目重绑账单 + 幽灵记忆库)
-# 修复：选项3完美打印 + 强制人工激活计费拦截 + 选项5智能读取默认项目
+# 修复：选项5全网穿透自动抓取 "My First Project" 护盾ID
 # 版本: 4.3.8
 
 set -Euo pipefail
@@ -48,13 +48,13 @@ trap 'handle_error' ERR
 
 cleanup_resources() {
   if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then rm -rf "$TEMP_DIR" 2>/dev/null || true; fi
-  echo -e "\n${CYAN}期待下次为您服务～${NC}"
+  echo -e "\n${CYAN}喵酱期待下次为主人服务喵～${NC}"
 }
 trap cleanup_resources EXIT
 
 # ===== 强制升级付费层级拦截提示 =====
 prompt_upgrade_billing() {
-  echo -e "\n${YELLOW}${BOLD}⚠️ 风控防御与付费激活提示：${NC}"
+  echo -e "\n${YELLOW}${BOLD}⚠️ 喵酱的风控防御与付费激活提示：${NC}"
   echo -e "根据 Google Cloud 官方安全限制，${RED}代码无法自动将「免费试用」升级为「付费层级」${NC}。"
   echo -e "如果您的账号尚未激活付费层级，接下来将触发 403 封禁或配额不足！"
   echo -e "请务必点击下方链接，在网页顶部点击 ${GREEN}【激活 (Activate) / 升级 (Upgrade)】${NC} 按钮："
@@ -93,12 +93,10 @@ retry() {
 
 require_cmd() { if ! command -v "$1" &>/dev/null; then log "ERROR" "缺少依赖: $1"; exit 1; fi; }
 
-# 完全模拟 GCP 官方 Web UI 的项目名称生成器
 new_project_name() { 
   echo "My Project $((RANDOM % 90000 + 10000))"
 }
 
-# 完全模拟 GCP 官方 Web UI 的项目 ID 生成器
 new_project_id() { 
   local adjs=("aesthetic" "bold" "brave" "calm" "clever" "cosmic" "dazzling" "deep" "epic" "fancy" "gentle" "happy" "jolly" "kind" "lively" "magic" "noble" "proud" "quiet" "rapid" "shiny" "smart" "sunny" "sweet" "vivid" "warm" "wild" "wise" "zesty")
   local nouns=("aleph" "beacon" "cloud" "dawn" "echo" "forge" "grove" "haven" "iris" "jewel" "kite" "leaf" "moon" "nexus" "oasis" "pulse" "quest" "ridge" "spark" "tide" "unity" "vortex" "wave" "zenith")
@@ -114,7 +112,7 @@ new_project_id() {
 
 check_env() {
   require_cmd gcloud
-  if ! gcloud config list account --quiet &>/dev/null; then log "ERROR" "请先运行 'gcloud init'！"; exit 1; fi
+  if ! gcloud config list account --quiet &>/dev/null; then log "ERROR" "请先运行 'gcloud init'喵！"; exit 1; fi
 }
 
 parse_json() {
@@ -134,14 +132,13 @@ unlink_projects_from_billing_account() {
   local billing_id="$1"
   local linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null)
   if [ -z "$linked_projects" ]; then return 0; fi
-  log "WARN" "发现旧项目占用结算账户，开始清理释放配额..."
+  log "WARN" "发现旧项目占用结算账户，喵酱开始清理释放配额..."
   for project_id in $linked_projects; do
     [ -n "$project_id" ] && gcloud billing projects unlink "$project_id" --quiet >/dev/null 2>&1 || true
   done
   return 0
 }
 
-# ===== 核心提取逻辑 =====
 extract_key_safely() {
   local project_id="$1"
   retry gcloud services enable apikeys.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
@@ -203,10 +200,9 @@ _extract_single_project() {
   echo "$api_key"
 }
 
-# ===== 结算账户选择 =====
 select_billing_accounts() {
   local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
-  if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户！"; return 1; fi
+  if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户喵！"; return 1; fi
 
   local ids=(); local names=()
   while IFS=',' read -r bid bname; do
@@ -244,11 +240,10 @@ select_billing_accounts() {
   fi
 
   if [ "${#SELECTED_BILLING_IDS[@]}" -eq 0 ]; then
-    log "ERROR" "未选择任何结算账户！"; return 1
+    log "ERROR" "未选择任何结算账户喵！"; return 1
   fi
 }
 
-# ===== 选项1、2 核心逻辑 =====
 gemini_create_projects() {
   prompt_upgrade_billing
   
@@ -264,9 +259,9 @@ gemini_create_projects() {
   local num_per_billing
 
   if [ "$auto_mode" = "true" ]; then
-    log "INFO" "开启【全自动模式】：将为所有可用结算账户各创建 3 个项目！"
+    log "INFO" "🐱 喵酱已开启【全自动模式】：将为所有可用结算账户各创建 3 个项目喵！"
     local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
-    if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户！"; return 1; fi
+    if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户喵！"; return 1; fi
 
     SELECTED_BILLING_IDS=()
     SELECTED_BILLING_NAMES=()
@@ -318,7 +313,7 @@ gemini_create_projects() {
       
       local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
       if [ -z "$billing_info" ]; then
-        log "WARN" "项目 ${project_id} 未绑定结算账户，跳过密钥提取！"
+        log "WARN" "项目 ${project_id} 未绑定结算账户，跳过密钥提取喵！"
         skipped=$((skipped+1)); i=$((i+1)); continue
       fi
       
@@ -344,20 +339,19 @@ gemini_create_projects() {
   done
   
   if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
-    echo -e "\n${YELLOW}${BOLD}为您奉上所有提取的密钥：${NC}"
+    echo -e "\n${YELLOW}${BOLD}喵酱为你奉上所有提取的密钥喵：${NC}"
     for k in "${ALL_KEYS[@]}"; do echo "$k"; done
     echo
   fi
 }
 
-# ===== 选项3 核心逻辑：提取现有项目 =====
 gemini_get_keys_from_existing() {
   prompt_upgrade_billing
   
   log "INFO" "====== 从现有项目强力提取密钥 ======"
   local projects
   projects=$(gcloud projects list --format='value(projectId)' 2>/dev/null || echo "")
-  if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目！"; return 1; fi
+  if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目喵！"; return 1; fi
   
   local success=0; local failed=0
   local ALL_KEYS=()
@@ -370,7 +364,7 @@ gemini_get_keys_from_existing() {
       ALL_KEYS+=("[${project_id}] : ${api_key}") 
       success=$((success+1))
     else
-      log "WARN" "提取失败"
+      log "WARN" "提取失败喵"
       failed=$((failed+1))
     fi
   done
@@ -378,13 +372,12 @@ gemini_get_keys_from_existing() {
   echo -e "\n${CYAN}成功提取: $success | 失败: $failed${NC}"
 
   if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
-    echo -e "\n${YELLOW}${BOLD}====== 为您奉上所有提取到的密钥 ======${NC}"
+    echo -e "\n${YELLOW}${BOLD}====== 喵酱为你奉上所有提取到的密钥 ======${NC}"
     for k in "${ALL_KEYS[@]}"; do echo -e "${GREEN}$k${NC}"; done
     echo
   fi
 }
 
-# ===== 选项4 核心逻辑：批量删除 =====
 gemini_delete_projects() {
   log "INFO" "====== 删除现有项目 ======"
   read -r -p "输入项目前缀进行批量删除 (留空取消): " prefix
@@ -396,21 +389,27 @@ gemini_delete_projects() {
   done
 }
 
-# ===== 选项5 智能提取默认项目 -> 转移结算 -> 建2个提取1+2 =====
+# ===== 【已修复】选项5 智能全网探测默认护盾ID =====
 rebuild_and_transfer_billing() {
   prompt_upgrade_billing
 
   log "INFO" "====== 选项5: 终极护盾转移重建模式 ======"
   
-  # 0. 智能探测默认项目ID
-  local default_project
-  default_project=$(gcloud config get-value project 2>/dev/null || echo "")
+  # 0. 智能全网穿透探测初始 "My First Project" 护盾ID
+  local default_project=""
+  log "INFO" "喵酱正在后台全网扫描默认的『My First Project』喵..."
+  default_project=$(gcloud projects list --filter="name='My First Project'" --format="value(projectId)" 2>/dev/null | head -n 1 || echo "")
+  
+  if [ -z "$default_project" ]; then
+    # 兜底：如果没找到 My First Project，则抓取目前设置的 default project
+    default_project=$(gcloud config get-value project 2>/dev/null || echo "")
+  fi
   
   local ORIGINAL_PROJECT=""
   while [ -z "$ORIGINAL_PROJECT" ]; do
-    echo -e "${YELLOW}⚠️ 警告：接下来的操作会删除其他所有项目！${NC}"
+    echo -e "${YELLOW}⚠️ 喵酱警告：接下来的操作会删除其他所有项目！${NC}"
     if [ -n "$default_project" ]; then
-      read -r -p "请输入绝对不能删除的【原始项目 ID】[直接回车默认保护当前项目: ${default_project}]: " ORIGINAL_PROJECT
+      read -r -p "请输入绝对不能删除的【原始项目 ID】[直接回车默认保护: ${default_project}]: " ORIGINAL_PROJECT
       ORIGINAL_PROJECT=${ORIGINAL_PROJECT:-$default_project}
     else
       read -r -p "请输入绝对不能删除的【原始项目 ID】(必填): " ORIGINAL_PROJECT
@@ -428,7 +427,7 @@ rebuild_and_transfer_billing() {
   log "INFO" "正在查找可用的结算账户..."
   local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1)
   if [ -z "$billing_raw" ]; then
-    log "ERROR" "未找到活动的结算账户，无法继续！"
+    log "ERROR" "未找到活动的结算账户，无法继续喵！"
     return 1
   fi
   local TARGET_BILLING_ID="${billing_raw#billingAccounts/}"
@@ -468,12 +467,12 @@ except Exception as e:
   if [ -n "$all_projects" ]; then
     for p in $all_projects; do
       if [ "$p" = "$ORIGINAL_PROJECT" ]; then
-        log "SUCCESS" "检测到原始项目 [$p]，已死死抱住，绝对不删！"
+        log "SUCCESS" "检测到原始项目 [$p]，喵酱已死死抱住，绝对不删！"
         continue
       fi
       log "INFO" "正在删除项目 $p ..."
       gcloud projects delete "$p" --quiet >/dev/null 2>&1 || true
-      log "INFO" "休眠 3 秒，防止风控..."
+      log "INFO" "休眠 3 秒，防止风控喵..."
       sleep 3
     done
   fi
@@ -486,7 +485,7 @@ except Exception as e:
   local orig_key=$(_extract_single_project "$ORIGINAL_PROJECT")
   if [ -n "$orig_key" ]; then
     FINAL_KEYS+=("【原始项目】 $ORIGINAL_PROJECT : $orig_key")
-    log "SUCCESS" "原始项目密钥提取成功！"
+    log "SUCCESS" "原始项目密钥提取成功喵！"
   else
     log "WARN" "原始项目提取失败！"
   fi
@@ -504,40 +503,40 @@ except Exception as e:
       local new_key=$(_extract_single_project "$pid")
       if [ -n "$new_key" ]; then
         FINAL_KEYS+=("【新建项目】 $pid : $new_key")
-        log "SUCCESS" "新项目密钥提取成功！"
+        log "SUCCESS" "新项目密钥提取成功喵！"
       else
         log "WARN" "新项目提取失败！"
       fi
     else
-      log "ERROR" "新项目创建失败..."
+      log "ERROR" "新项目创建失败喵..."
     fi
     sleep 3
   done
 
   # 5. 打印最终的 3 个 Key
-  echo -e "\n${YELLOW}${BOLD}====== 终极提取报告 ======${NC}"
+  echo -e "\n${YELLOW}${BOLD}====== 喵酱的终极提取报告 ======${NC}"
   for k in "${FINAL_KEYS[@]}"; do
     echo -e "${CYAN}${k}${NC}"
   done
-  echo -e "\n${GREEN}任务圆满完成！${NC}"
+  echo -e "\n${GREEN}任务圆满完成！喵酱要奖励一个罐头喵！${NC}"
 }
 
 # ===== 主菜单 =====
 show_menu() {
-  echo -e "\n${CYAN}${BOLD}====== GCP API 管理器 v${VERSION} ======${NC}"
+  echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
   echo "1. [经典] 自动创建项目并提取密钥 (清理旧项目释放配额)"
   echo "2. [防风控] 自动创建项目并提取密钥 (保留旧项目结算绑定)"
   echo "3. 从现有项目提取密钥"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 删闲置 -> 建2个凑齐3密钥"
-  echo "0. 退出"
+  echo "0. 退出并摸摸喵酱"
   local choice
-  read -r -p "请选择: " choice
+  read -r -p "请主人吩咐: " choice
   case "$choice" in
     1) check_env && gemini_create_projects "false" "false" ;;
     2) 
       check_env || return
-      echo -e "\n${CYAN}请选择操作方式：${NC}"
+      echo -e "\n${CYAN}主人想怎么操作呢？${NC}"
       echo "1. 自定义选择结算账户和数量"
       echo "2. 全自动 (为所有可用账户各创建3个项目)"
       local sub_choice
@@ -550,7 +549,7 @@ show_menu() {
     4) check_env && gemini_delete_projects ;;
     5) check_env && rebuild_and_transfer_billing ;;
     0) exit 0 ;;
-    *) log "ERROR" "指令无效！" ;; 
+    *) log "ERROR" "指令无效喵！" ;; 
   esac
 }
 
