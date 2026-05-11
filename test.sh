@@ -1,8 +1,8 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - 经典护航版
 # 支持 Gemini API (全量提取 + 动态救助掉签项目重绑账单 + 幽灵记忆库)
-# 修复：选项5全网穿透自动抓取 "My First Project" 护盾ID
-# 版本: 4.3.8
+# 修复：选项3、5 增加底部纯净 API Key 列表，方便一键复制
+# 版本: 4.3.9
 
 set -Euo pipefail
 
@@ -15,7 +15,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.3.8"
+VERSION="4.3.9"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang-api}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -287,7 +287,6 @@ gemini_create_projects() {
   local total_projects=$(( num_per_billing * ${#SELECTED_BILLING_IDS[@]} ))
   local total_success=0; local total_failed=0; local total_skipped=0
   local ALL_KEYS=()
-  local BILLING_KEY_MAP=()
 
   for billing_idx in "${!SELECTED_BILLING_IDS[@]}"; do
     local GEMINI_BILLING_ACCOUNT="${SELECTED_BILLING_IDS[$billing_idx]}"
@@ -322,7 +321,6 @@ gemini_create_projects() {
       if [ -n "$api_key" ]; then
         save_key_to_cache "$project_id" "$api_key"
         ALL_KEYS+=("$api_key")
-        BILLING_KEY_MAP+=("${billing_idx}:${api_key}")
         log "SUCCESS" "成功提取密钥！"
         success=$((success+1))
       else
@@ -339,12 +337,13 @@ gemini_create_projects() {
   done
   
   if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
-    echo -e "\n${YELLOW}${BOLD}喵酱为你奉上所有提取的密钥喵：${NC}"
-    for k in "${ALL_KEYS[@]}"; do echo "$k"; done
+    echo -e "\n${GREEN}${BOLD}====== 纯净密钥列表 (方便一键复制) ======${NC}"
+    for k in "${ALL_KEYS[@]}"; do echo -e "${GREEN}$k${NC}"; done
     echo
   fi
 }
 
+# ===== 选项3 核心逻辑：提取现有项目 =====
 gemini_get_keys_from_existing() {
   prompt_upgrade_billing
   
@@ -354,14 +353,16 @@ gemini_get_keys_from_existing() {
   if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目喵！"; return 1; fi
   
   local success=0; local failed=0
-  local ALL_KEYS=()
+  local ALL_KEYS_WITH_ID=()
+  local ALL_KEYS_RAW=()
   
   for project_id in $projects; do
     log "INFO" "正在提取项目: ${project_id}"
     local api_key=$(_extract_single_project "$project_id")
     if [ -n "$api_key" ]; then
       log "SUCCESS" "提取成功: $api_key"
-      ALL_KEYS+=("[${project_id}] : ${api_key}") 
+      ALL_KEYS_WITH_ID+=("[${project_id}] : ${api_key}") 
+      ALL_KEYS_RAW+=("${api_key}") 
       success=$((success+1))
     else
       log "WARN" "提取失败喵"
@@ -371,13 +372,17 @@ gemini_get_keys_from_existing() {
   
   echo -e "\n${CYAN}成功提取: $success | 失败: $failed${NC}"
 
-  if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
+  if [ "${#ALL_KEYS_RAW[@]}" -gt 0 ]; then
     echo -e "\n${YELLOW}${BOLD}====== 喵酱为你奉上所有提取到的密钥 ======${NC}"
-    for k in "${ALL_KEYS[@]}"; do echo -e "${GREEN}$k${NC}"; done
+    for k in "${ALL_KEYS_WITH_ID[@]}"; do echo -e "${CYAN}$k${NC}"; done
+    
+    echo -e "\n${GREEN}${BOLD}====== 纯净密钥列表 (方便一键复制) ======${NC}"
+    for k in "${ALL_KEYS_RAW[@]}"; do echo -e "${GREEN}$k${NC}"; done
     echo
   fi
 }
 
+# ===== 选项4 核心逻辑：批量删除 =====
 gemini_delete_projects() {
   log "INFO" "====== 删除现有项目 ======"
   read -r -p "输入项目前缀进行批量删除 (留空取消): " prefix
@@ -389,19 +394,18 @@ gemini_delete_projects() {
   done
 }
 
-# ===== 【已修复】选项5 智能全网探测默认护盾ID =====
+# ===== 选项5 智能全网探测默认护盾ID =====
 rebuild_and_transfer_billing() {
   prompt_upgrade_billing
 
   log "INFO" "====== 选项5: 终极护盾转移重建模式 ======"
   
-  # 0. 智能全网穿透探测初始 "My First Project" 护盾ID
+  # 0. 智能探测默认项目ID
   local default_project=""
   log "INFO" "喵酱正在后台全网扫描默认的『My First Project』喵..."
   default_project=$(gcloud projects list --filter="name='My First Project'" --format="value(projectId)" 2>/dev/null | head -n 1 || echo "")
   
   if [ -z "$default_project" ]; then
-    # 兜底：如果没找到 My First Project，则抓取目前设置的 default project
     default_project=$(gcloud config get-value project 2>/dev/null || echo "")
   fi
   
@@ -461,7 +465,7 @@ except Exception as e:
     fi
   fi
   
-  # 2. 逐个删除其他项目 (遇原项目则跳过)
+  # 2. 逐个删除其他项目
   log "INFO" "====== 开始清理非保护项目 ======"
   local all_projects=$(gcloud projects list --format="value(projectId)" 2>/dev/null || echo "")
   if [ -n "$all_projects" ]; then
@@ -477,14 +481,16 @@ except Exception as e:
     done
   fi
   
-  local FINAL_KEYS=()
+  local FINAL_KEYS_WITH_ID=()
+  local FINAL_KEYS_RAW=()
   
   # 3. 处理原始项目
   log "INFO" "====== 开始处理原始项目并提取密钥 ======"
   gcloud billing projects link "$ORIGINAL_PROJECT" --billing-account="$TARGET_BILLING_ID" --quiet >/dev/null 2>&1 || true
   local orig_key=$(_extract_single_project "$ORIGINAL_PROJECT")
   if [ -n "$orig_key" ]; then
-    FINAL_KEYS+=("【原始项目】 $ORIGINAL_PROJECT : $orig_key")
+    FINAL_KEYS_WITH_ID+=("【原始项目】 $ORIGINAL_PROJECT : $orig_key")
+    FINAL_KEYS_RAW+=("$orig_key")
     log "SUCCESS" "原始项目密钥提取成功喵！"
   else
     log "WARN" "原始项目提取失败！"
@@ -502,7 +508,8 @@ except Exception as e:
       gcloud billing projects link "$pid" --billing-account="$TARGET_BILLING_ID" --quiet >/dev/null 2>&1 || true
       local new_key=$(_extract_single_project "$pid")
       if [ -n "$new_key" ]; then
-        FINAL_KEYS+=("【新建项目】 $pid : $new_key")
+        FINAL_KEYS_WITH_ID+=("【新建项目】 $pid : $new_key")
+        FINAL_KEYS_RAW+=("$new_key")
         log "SUCCESS" "新项目密钥提取成功喵！"
       else
         log "WARN" "新项目提取失败！"
@@ -513,11 +520,14 @@ except Exception as e:
     sleep 3
   done
 
-  # 5. 打印最终的 3 个 Key
-  echo -e "\n${YELLOW}${BOLD}====== 喵酱的终极提取报告 ======${NC}"
-  for k in "${FINAL_KEYS[@]}"; do
-    echo -e "${CYAN}${k}${NC}"
-  done
+  # 5. 打印最终提取结果
+  if [ "${#FINAL_KEYS_RAW[@]}" -gt 0 ]; then
+    echo -e "\n${YELLOW}${BOLD}====== 喵酱的终极提取报告 ======${NC}"
+    for k in "${FINAL_KEYS_WITH_ID[@]}"; do echo -e "${CYAN}${k}${NC}"; done
+    
+    echo -e "\n${GREEN}${BOLD}====== 纯净密钥列表 (方便一键复制) ======${NC}"
+    for k in "${FINAL_KEYS_RAW[@]}"; do echo -e "${GREEN}${k}${NC}"; done
+  fi
   echo -e "\n${GREEN}任务圆满完成！喵酱要奖励一个罐头喵！${NC}"
 }
 
