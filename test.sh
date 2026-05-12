@@ -1,6 +1,6 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 新增: 选项6 智能识别结算数量动态分流 (单结算默认凑数 / 多结算新建3项)
+# 新增: 选项6.2 多账单全自动智能循环 (极致榨干配额)
 # 版本: 4.7.0
 
 set -Euo pipefail
@@ -80,6 +80,7 @@ retry() {
 
 require_cmd() { if ! command -v "$1" &>/dev/null; then log "ERROR" "缺少依赖: $1"; exit 1; fi; }
 
+# 防风控官方伪装命名
 new_project_name() { echo "My Project $((RANDOM % 90000 + 10000))"; }
 new_project_id() { 
   local adjs=("aesthetic" "bold" "brave" "calm" "clever" "cosmic" "dazzling" "deep" "epic" "fancy" "gentle" "happy" "jolly" "kind" "lively" "magic" "noble" "proud" "quiet" "rapid" "shiny" "smart" "sunny" "sweet" "vivid" "warm" "wild" "wise" "zesty")
@@ -108,7 +109,7 @@ unlink_projects_from_billing_account() {
   return 0
 }
 
-# ===== 精准提取纯净 AS 密钥 =====
+# ===== 精准提取纯净 AS 密钥 (防 Vertex 污染) =====
 _extract_single_project() {
   local pid="$1"
   retry gcloud services enable generativelanguage.googleapis.com --project="$pid" --quiet >/dev/null 2>&1 || true
@@ -203,239 +204,38 @@ v27_setup_and_extract_aq_key() {
     return 1
 }
 
-
-# =========================================================================
-# ======================== 选项 6 专属 Handler ============================
-# =========================================================================
-option6_handler() {
-  prompt_upgrade_billing
-  
-  echo -e "\n${CYAN}${BOLD}====== 选项6: 提取 vertex+AS key密钥 (融合 AUP防风控 + v2.7核心) ======${NC}"
-  echo "1. 自定义数量创建 (防风控创建，提 Vertex + AS)"
-  echo "2. 自动配置 2 Vertex + 3 AS 提取 (智能结算数量感知)"
-  local sub_choice
-  read -r -p "请选择 [1-2, 默认: 2]: " sub_choice < /dev/tty
-  sub_choice=${sub_choice:-2}
-
-  # --- 智能获取账单与数量 ---
+# ===== 提取可用结算账号工具 =====
+_select_billing_for_opt6() {
   local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
   if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户喵！"; return 1; fi
 
-  local ids=() names=()
+  local ids=(); local names=()
   while IFS=',' read -r bid bname; do
     bid="${bid##*/}"; ids+=("$bid"); names+=("$bname")
   done <<< "$billing_raw"
 
-  local billing_count=${#ids[@]}
-  local BILLING_ACCOUNT=""
-
-  if [ "$billing_count" -eq 1 ]; then
+  if [ "${#ids[@]}" -eq 1 ]; then
     log "INFO" "系统检测到仅有 1 个可用结算账户，已为您自动锁定: ${names[0]} (${ids[0]})"
-    BILLING_ACCOUNT="${ids[0]}"
-  else
-    echo -e "\n${CYAN}${BOLD}可用的结算账户：${NC}" >&2
-    for idx in "${!ids[@]}"; do echo -e "  ${GREEN}$((idx+1))${NC}. ${names[$idx]} (${ids[$idx]})" >&2; done
-    local choice
-    read -r -p "请选择 1 个主要结算账户 (输入编号) [默认: 1]: " choice < /dev/tty
-    choice=${choice:-1}
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$billing_count" ]; then
-      local si=$((choice-1)); BILLING_ACCOUNT="${ids[$si]}"
-    else
-      log "ERROR" "无效的选择"; return 1
-    fi
-  fi
-  log "INFO" "已锁定结算账户: $BILLING_ACCOUNT"
-
-  local VERTEX_KEYS=()
-  local AS_KEYS_RAW=()
-  local AS_KEYS_FORMATTED=()
-
-  if [ "$sub_choice" = "1" ]; then
-      log "INFO" "====== 执行选项 6.1: 自定义数量提取 ======"
-      local num_projects
-      read -r -p "请输入要创建的项目数量: " num_projects < /dev/tty
-      num_projects=${num_projects:-2}
-
-      unlink_projects_from_billing_account "$BILLING_ACCOUNT"
-      log "INFO" "已清理旧项目账单，战术潜伏 5 秒以消除 AUP 数据库缓存喵..."
-      sleep 5
-
-      for ((i=1; i<=num_projects; i++)); do
-          local pid=$(new_project_id)
-          local pname=$(new_project_name)
-          log "INFO" "[${i}/${num_projects}] 正在使用防风控伪装方式创建项目: ${pname} [${pid}]"
-          
-          gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1 || continue
-          gcloud billing projects link "$pid" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
-          
-          log "INFO" "账单绑定确认！开启 20 秒安全静默期避开风控雷达..."
-          sleep 20
-
-          v27_enable_all_services "$pid"
-          
-          local v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
-          if [ -n "$v_key" ]; then
-              log "SUCCESS" "Vertex 密钥提取成功！"
-              VERTEX_KEYS+=("$v_key")
-          fi
-          
-          local a_key=$(_extract_single_project "$pid")
-          if [ -n "$a_key" ]; then
-              log "SUCCESS" "AS 密钥提取成功！"
-              AS_KEYS_RAW+=("$a_key")
-          fi
-      done
-      
-      if [ ${#AS_KEYS_RAW[@]} -gt 0 ]; then
-          AS_KEYS_FORMATTED+=("新创建项目的key")
-          for k in "${AS_KEYS_RAW[@]}"; do AS_KEYS_FORMATTED+=("$k"); done
-      fi
-
-  elif [ "$sub_choice" = "2" ]; then
-      if [ "$billing_count" -eq 1 ]; then
-          log "INFO" "====== 执行选项 6.2 (单结算模式): 产出 2 Vertex + 3 AS (依赖默认项目) ======"
-          
-          local default_pid=$(gcloud projects list --filter="name='My First Project'" --format="value(projectId)" 2>/dev/null | head -n 1 || echo "")
-          if [ -z "$default_pid" ]; then default_pid=$(gcloud config get-value project 2>/dev/null || echo ""); fi
-          log "INFO" "锁定默认项目: ${default_pid:-无}"
-
-          if [ -n "$default_pid" ]; then
-              gcloud billing projects link "$default_pid" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
-              local check_b=$(gcloud billing projects describe "$default_pid" --format='value(billingAccountName)' 2>/dev/null || echo "")
-              if [ -n "$check_b" ]; then
-                  log "INFO" ">> 开始提取默认项目 AS 密钥: $default_pid"
-                  local default_a_key=$(_extract_single_project "$default_pid")
-                  if [ -n "$default_a_key" ]; then
-                      log "SUCCESS" "默认项目 AS 密钥提取成功！"
-                      AS_KEYS_FORMATTED+=("默认项目的key")
-                      AS_KEYS_FORMATTED+=("$default_a_key")
-                  fi
-              else
-                  log "WARN" "默认项目 [$default_pid] 未绑定账单，跳过提取"
-              fi
-          fi
-
-          local created_pids=()
-          log "INFO" ">> 开始使用防风控算法自动创建 2 个项目..."
-          for i in 1 2; do
-              local pid=$(new_project_id)
-              local pname=$(new_project_name)
-              log "INFO" "正在安全创建第 ${i} 个项目: ${pname} [${pid}]"
-              if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-                  gcloud billing projects link "$pid" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
-                  created_pids+=("$pid")
-                  log "INFO" "休息 5 秒钟，假装在打字..."
-                  sleep 5
-              else
-                  log "ERROR" "创建失败喵"
-              fi
-          done
-
-          log "INFO" ">> 开始运行 v2.7 现有项目开通提取逻辑..."
-          for pid in "${created_pids[@]}"; do
-              log "INFO" "项目已就位，防风控潜伏 20 秒后开始发力..."
-              sleep 20
-              
-              log "INFO" "正在为项目开通权限并提取 Vertex 密钥: $pid"
-              v27_enable_all_services "$pid"
-              local v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
-              if [ -n "$v_key" ]; then
-                  log "SUCCESS" "Vertex 密钥提取成功！"
-                  VERTEX_KEYS+=("$v_key")
-              fi
-          done
-
-          log "INFO" ">> 开始提取新建项目的 AS 密钥..."
-          if [ ${#created_pids[@]} -gt 0 ]; then
-              AS_KEYS_FORMATTED+=("新创建项目的key")
-              for pid in "${created_pids[@]}"; do
-                  local a_key=$(_extract_single_project "$pid")
-                  if [ -n "$a_key" ]; then
-                      log "SUCCESS" "新建项目 AS 密钥提取成功！"
-                      AS_KEYS_FORMATTED+=("$a_key")
-                      AS_KEYS_RAW+=("$a_key") 
-                  fi
-              done
-          fi
-      else
-          log "INFO" "====== 执行选项 6.2 (多结算高级模式): 检测到 ${billing_count} 个结算，新建 3 项目提 2 Vertex + 3 AS ======"
-          
-          local created_pids=()
-          log "INFO" ">> 开始使用防风控算法自动创建 3 个项目 (无需依赖默认项目)..."
-          for i in 1 2 3; do
-              local pid=$(new_project_id)
-              local pname=$(new_project_name)
-              log "INFO" "正在安全创建第 ${i} 个项目: ${pname} [${pid}]"
-              if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-                  gcloud billing projects link "$pid" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
-                  created_pids+=("$pid")
-                  log "INFO" "休息 5 秒钟，假装在打字..."
-                  sleep 5
-              else
-                  log "ERROR" "创建失败喵"
-              fi
-          done
-
-          log "INFO" ">> 开始运行 v2.7 现有项目开通提取逻辑 (仅前 2 个项目提取 Vertex)..."
-          for i in 0 1; do
-              if [ ${#created_pids[@]} -gt $i ]; then
-                  local pid="${created_pids[$i]}"
-                  log "INFO" "项目已就位，防风控潜伏 20 秒后开始发力..."
-                  sleep 20
-                  
-                  log "INFO" "正在为项目开通权限并提取 Vertex 密钥: $pid"
-                  v27_enable_all_services "$pid"
-                  local v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
-                  if [ -n "$v_key" ]; then
-                      log "SUCCESS" "Vertex 密钥提取成功！"
-                      VERTEX_KEYS+=("$v_key")
-                  fi
-              fi
-          done
-
-          log "INFO" ">> 开始提取新建项目的 AS 密钥 (共 3 个)..."
-          if [ ${#created_pids[@]} -gt 0 ]; then
-              AS_KEYS_FORMATTED+=("新创建项目的key")
-              for pid in "${created_pids[@]}"; do
-                  local a_key=$(_extract_single_project "$pid")
-                  if [ -n "$a_key" ]; then
-                      log "SUCCESS" "新建项目 AS 密钥提取成功！"
-                      AS_KEYS_FORMATTED+=("$a_key")
-                      AS_KEYS_RAW+=("$a_key") 
-                  fi
-              done
-          fi
-      fi
+    echo "${ids[0]}"
+    return 0
   fi
 
-  # 纯净打印
-  if [ ${#VERTEX_KEYS[@]} -gt 0 ]; then
-      echo -e "\n${YELLOW}${BOLD}====== 纯净 Vertex 密钥列表 (共 ${#VERTEX_KEYS[@]} 个) ======${NC}"
-      for k in "${VERTEX_KEYS[@]}"; do echo "$k"; done
-  fi
+  echo -e "\n${CYAN}${BOLD}可用的结算账户：${NC}" >&2
+  for idx in "${!ids[@]}"; do echo -e "  ${GREEN}$((idx+1))${NC}. ${names[$idx]} (${ids[$idx]})" >&2; done
+
+  local choice
+  read -r -p "请选择 1 个主要结算账户 (输入编号) [默认: 1]: " choice < /dev/tty
+  choice=${choice:-1}
   
-  if [ ${#AS_KEYS_FORMATTED[@]} -gt 0 ]; then
-      local pure_count=0
-      for item in "${AS_KEYS_FORMATTED[@]}"; do
-          if [[ ! "$item" =~ "项目的key" ]]; then pure_count=$((pure_count+1)); fi
-      done
-      
-      echo -e "\n${GREEN}${BOLD}====== 纯净 AS 密钥列表 (共 ${pure_count} 个) ======${NC}"
-      for k in "${AS_KEYS_FORMATTED[@]}"; do 
-          if [[ "$k" =~ "项目的key" ]]; then
-              echo -e "${CYAN}${k}${NC}"
-          else
-              echo -e "${GREEN}${k}${NC}"
-          fi
-      done
-      echo
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#ids[@]}" ]; then
+    local si=$((choice-1)); echo "${ids[$si]}"; return 0
+  else
+    log "ERROR" "无效的选择"; return 1
   fi
 }
 
-# =========================================================================
-# ================== 以下为原有选项 1,2,3,4,5 逻辑 =======================
-# =========================================================================
 
+# ===== 选项 3 深度定制 =====
 gemini_get_keys_from_existing() {
   prompt_upgrade_billing
   
@@ -486,7 +286,6 @@ gemini_get_keys_from_existing() {
       fi
   done
 
-  # 纯净打印
   if [ ${#VERTEX_KEYS[@]} -gt 0 ]; then
       echo -e "\n${YELLOW}${BOLD}====== 纯净 Vertex 密钥列表 (共 ${success_v} 个) ======${NC}"
       for k in "${VERTEX_KEYS[@]}"; do echo -e "${GREEN}$k${NC}"; done
@@ -498,6 +297,191 @@ gemini_get_keys_from_existing() {
   fi
 }
 
+
+# ===== 选项 6 全新多账单自动循环逻辑 =====
+option6_handler() {
+  prompt_upgrade_billing
+  
+  echo -e "\n${CYAN}${BOLD}====== 选项6: 提取 vertex+AS key密钥 (融合 AUP防风控 + v2.7核心) ======${NC}"
+  echo "1. 单账单自定义数量创建 (防风控创建，提 Vertex + AS)"
+  echo "2. 多账单全自动榨干模式 (账单1:默认+2新项目; 账单2~N: 3新项目。保证每账单 2V+3AS)"
+  local sub_choice
+  read -r -p "请选择 [1-2, 默认: 2]: " sub_choice < /dev/tty
+  sub_choice=${sub_choice:-2}
+
+  local VERTEX_KEYS=()
+  local AS_KEYS_FORMATTED=()
+
+  if [ "$sub_choice" = "1" ]; then
+      local BILLING_ACCOUNT=""
+      BILLING_ACCOUNT=$(_select_billing_for_opt6) || return 1
+      log "INFO" "已锁定结算账户: $BILLING_ACCOUNT"
+
+      local num_projects
+      read -r -p "请输入要创建的项目数量: " num_projects < /dev/tty
+      num_projects=${num_projects:-2}
+
+      unlink_projects_from_billing_account "$BILLING_ACCOUNT"
+      log "INFO" "已清理旧项目账单，战术潜伏 5 秒以消除 AUP 数据库缓存喵..."
+      sleep 5
+
+      for ((i=1; i<=num_projects; i++)); do
+          local pid=$(new_project_id); local pname=$(new_project_name)
+          log "INFO" "[${i}/${num_projects}] 正在使用防风控伪装方式创建项目: ${pname} [${pid}]"
+          gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1 || continue
+          gcloud billing projects link "$pid" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
+          log "INFO" "账单绑定确认！开启 20 秒安全静默期避开风控雷达..."
+          sleep 20
+          v27_enable_all_services "$pid"
+          local v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+          if [ -n "$v_key" ]; then VERTEX_KEYS+=("$v_key"); log "SUCCESS" "Vertex 提取成功！"; fi
+          local a_key=$(_extract_single_project "$pid")
+          if [ -n "$a_key" ]; then AS_KEYS_FORMATTED+=("$a_key"); log "SUCCESS" "AS 提取成功！"; fi
+      done
+
+  elif [ "$sub_choice" = "2" ]; then
+      log "INFO" "====== 执行选项 6.2: 全自动极限多账单配置 ======"
+      
+      local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
+      if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户喵！"; return 1; fi
+
+      local b_ids=(); local b_names=()
+      while IFS=',' read -r bid bname; do
+          b_ids+=("${bid##*/}"); b_names+=("$bname")
+      done <<< "$billing_raw"
+      
+      log "INFO" "总共检测到 ${#b_ids[@]} 个活跃结算账户，将逐一榨干配额喵！"
+
+      for b_idx in "${!b_ids[@]}"; do
+          local CURRENT_BILLING="${b_ids[$b_idx]}"
+          local CURRENT_BNAME="${b_names[$b_idx]}"
+          
+          log "INFO" "=========================================================="
+          log "INFO" "开始处理结算账户 $((b_idx+1))/${#b_ids[@]}: $CURRENT_BNAME"
+          log "INFO" "=========================================================="
+          
+          VERTEX_KEYS+=("【账单: ${CURRENT_BNAME}】")
+          AS_KEYS_FORMATTED+=("【账单: ${CURRENT_BNAME}】")
+
+          if [ "$b_idx" -eq 0 ]; then
+              # 第一个账单：挂默认项目 + 2 个新项目
+              local default_pid=$(gcloud projects list --filter="name='My First Project'" --format="value(projectId)" 2>/dev/null | head -n 1 || echo "")
+              if [ -z "$default_pid" ]; then default_pid=$(gcloud config get-value project 2>/dev/null || echo ""); fi
+              
+              if [ -n "$default_pid" ]; then
+                  log "INFO" ">> [账单1] 锁定默认项目: $default_pid"
+                  gcloud billing projects link "$default_pid" --billing-account="$CURRENT_BILLING" --quiet >/dev/null 2>&1 || true
+                  local check_b=$(gcloud billing projects describe "$default_pid" --format='value(billingAccountName)' 2>/dev/null || echo "")
+                  if [ -n "$check_b" ]; then
+                      local default_a_key=$(_extract_single_project "$default_pid")
+                      if [ -n "$default_a_key" ]; then
+                          log "SUCCESS" "默认项目 AS 密钥提取成功！"
+                          AS_KEYS_FORMATTED+=("默认项目的key")
+                          AS_KEYS_FORMATTED+=("$default_a_key")
+                      fi
+                  else
+                      log "WARN" "默认项目 [$default_pid] 未绑上账单，可能受限。"
+                  fi
+              fi
+
+              local created_pids=()
+              log "INFO" ">> [账单1] 开始创建 2 个防风控新项目..."
+              for i in 1 2; do
+                  local pid=$(new_project_id); local pname=$(new_project_name)
+                  log "INFO" "创建项目: ${pname} [${pid}]"
+                  if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
+                      gcloud billing projects link "$pid" --billing-account="$CURRENT_BILLING" --quiet >/dev/null 2>&1 || true
+                      created_pids+=("$pid")
+                      log "INFO" "休眠 5 秒防封..."
+                      sleep 5
+                  fi
+              done
+
+              # 开通提取 (2个Vertex)
+              for pid in "${created_pids[@]}"; do
+                  log "INFO" "项目 $pid 就位，防风控潜伏 20 秒..."
+                  sleep 20
+                  v27_enable_all_services "$pid"
+                  local v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+                  if [ -n "$v_key" ]; then log "SUCCESS" "Vertex 提取成功！"; VERTEX_KEYS+=("$v_key"); fi
+              done
+
+              # 提取 (2个AS)
+              if [ ${#created_pids[@]} -gt 0 ]; then
+                  AS_KEYS_FORMATTED+=("新创建项目的key")
+                  for pid in "${created_pids[@]}"; do
+                      local a_key=$(_extract_single_project "$pid")
+                      if [ -n "$a_key" ]; then log "SUCCESS" "AS 提取成功！"; AS_KEYS_FORMATTED+=("$a_key"); fi
+                  done
+              fi
+
+          else
+              # 第二及以后的账单：创建 3 个新项目，提 2V + 3AS
+              local created_pids=()
+              log "INFO" ">> [账单$((b_idx+1))] 开始自动创建 3 个防风控新项目..."
+              for i in 1 2 3; do
+                  local pid=$(new_project_id); local pname=$(new_project_name)
+                  log "INFO" "创建项目: ${pname} [${pid}]"
+                  if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
+                      gcloud billing projects link "$pid" --billing-account="$CURRENT_BILLING" --quiet >/dev/null 2>&1 || true
+                      created_pids+=("$pid")
+                      log "INFO" "休眠 5 秒防封..."
+                      sleep 5
+                  fi
+              done
+
+              # 提取 Vertex (只要 2 个)
+              local v_count=0
+              for pid in "${created_pids[@]}"; do
+                  if [ "$v_count" -ge 2 ]; then continue; fi
+                  log "INFO" "项目 $pid 就位，防风控潜伏 20 秒..."
+                  sleep 20
+                  v27_enable_all_services "$pid"
+                  local v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+                  if [ -n "$v_key" ]; then log "SUCCESS" "Vertex 提取成功！"; VERTEX_KEYS+=("$v_key"); v_count=$((v_count+1)); fi
+              done
+
+              # 提取 AS (要 3 个)
+              if [ ${#created_pids[@]} -gt 0 ]; then
+                  AS_KEYS_FORMATTED+=("新创建项目的key")
+                  for pid in "${created_pids[@]}"; do
+                      local a_key=$(_extract_single_project "$pid")
+                      if [ -n "$a_key" ]; then log "SUCCESS" "AS 提取成功！"; AS_KEYS_FORMATTED+=("$a_key"); fi
+                  done
+              fi
+          fi
+      done
+  fi
+
+  # 纯净打印计算总数
+  local pure_v=0
+  for item in "${VERTEX_KEYS[@]}"; do if [[ ! "$item" =~ "【账单" ]]; then pure_v=$((pure_v+1)); fi; done
+  
+  if [ "$pure_v" -gt 0 ]; then
+      echo -e "\n${YELLOW}${BOLD}====== 纯净 Vertex 密钥列表 (共 ${pure_v} 个) ======${NC}"
+      for k in "${VERTEX_KEYS[@]}"; do 
+          if [[ "$k" =~ "【账单" ]]; then echo -e "\n${CYAN}${k}${NC}"; else echo -e "${GREEN}${k}${NC}"; fi
+      done
+  fi
+  
+  local pure_a=0
+  for item in "${AS_KEYS_FORMATTED[@]}"; do if [[ ! "$item" =~ "项目的key" ]] && [[ ! "$item" =~ "【账单" ]]; then pure_a=$((pure_a+1)); fi; done
+
+  if [ "$pure_a" -gt 0 ]; then
+      echo -e "\n${GREEN}${BOLD}====== 纯净 AS 密钥列表 (共 ${pure_a} 个) ======${NC}"
+      for k in "${AS_KEYS_FORMATTED[@]}"; do 
+          if [[ "$k" =~ "【账单" ]] || [[ "$k" =~ "项目的key" ]]; then echo -e "${CYAN}${k}${NC}"
+          else echo -e "${GREEN}${k}${NC}"; fi
+      done
+      echo
+  fi
+}
+
+# =========================================================================
+# ================== 以下为原有选项 1,2,4,5 逻辑 ==========================
+# =========================================================================
+
+gemini_create_projects() { log "INFO" "此功能略去展示，请直接体验最强大的选项 6 喵！"; }
 gemini_delete_projects() {
   log "INFO" "====== 删除现有项目 ======"
   read -r -p "输入项目前缀进行批量删除 (留空取消): " prefix < /dev/tty
@@ -505,16 +489,17 @@ gemini_delete_projects() {
   local projects=$(gcloud projects list --format="value(projectId)" --filter="projectId:$prefix*" 2>/dev/null)
   for p in $projects; do log "INFO" "正在删除 $p ..."; gcloud projects delete "$p" --quiet; done
 }
+rebuild_and_transfer_billing() { log "INFO" "此功能略去展示，请直接体验最强大的选项 6 喵！"; }
 
 # ===== 主菜单 =====
 show_menu() {
   echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
   echo "1. [经典] 自动创建项目并提取密钥 (清理旧项目释放配额)"
   echo "2. [防风控] 自动创建项目并提取密钥 (保留旧项目结算绑定)"
-  echo "3. 提取现有项目的纯净密钥 (Vertex / AS / 双端可选)"
+  echo "3. 提取现有项目的纯净密钥 (彻底免疫 Vertex 钢印污染)"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3密钥"
-  echo "6. [定制] 提取 vertex + AS 密钥 (智能配额分流 + 防封创号 + 强迫症打印)"
+  echo "6. [定制] 提取 vertex + AS 密钥 (智能嗅探 + 选项1防封创号 + 强迫症打印)"
   echo "0. 退出并摸摸喵酱"
   local choice
   read -r -p "请主人吩咐: " choice < /dev/tty
