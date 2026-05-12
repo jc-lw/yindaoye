@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 新增: 智能计费嗅探、纯净版独立打印、选项3/6深度定制
-# 版本: 4.5.0
+# 修复: 解决 API_KEY_SERVICE_BLOCKED 报错，精准隔离 Vertex 受限密钥
+# 版本: 4.6.0
 
 set -Euo pipefail
 
@@ -14,11 +14,14 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.5.0"
+VERSION="4.6.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
+
+# 强制清空旧的污染缓存
+rm -f "$CACHE_FILE" 2>/dev/null || true
 
 # ===== 日志处理 =====
 log() { 
@@ -47,17 +50,14 @@ prompt_upgrade_billing() {
   active_billing=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1 || echo "")
   
   if [ -n "$active_billing" ]; then
-    # 尝试读取底层的 masterBillingAccount 和 open 状态做启发式判断
-    local billing_info
-    billing_info=$(gcloud billing accounts describe "$active_billing" --format='json' 2>/dev/null || echo "")
-    if [ -n "$billing_info" ]; then
-       # 如果能正常解析并且是 open=true，我们姑且信任它已经拥有有效支付手段
+    local is_open
+    is_open=$(gcloud billing accounts describe "$active_billing" --format='value(open)' 2>/dev/null || echo "False")
+    if [ "$is_open" = "True" ] || [ "$is_open" = "true" ]; then
        echo -e "\n${GREEN}${BOLD}✅ [系统探针] 检测到当前账户已关联活跃结算 (付费层级特征)，免去人工确认打扰喵！${NC}\n" >&2
        return 0
     fi
   fi
 
-  # 如果没检测到，或者判定为试用，则弹出提示
   echo -e "\n${YELLOW}${BOLD}⚠️ 喵酱的风控防御与付费激活提示：${NC}" >&2
   echo -e "根据 Google Cloud 官方安全限制，代码无法自动将「免费试用」升级为「付费层级」。" >&2
   echo -e "请务必点击下方链接，在网页顶部点击 ${GREEN}【激活 (Activate) / 升级 (Upgrade)】${NC} 按钮：" >&2
@@ -65,22 +65,7 @@ prompt_upgrade_billing() {
   read -r -p "确认您已手动激活后，请按回车键继续执行脚本 (Press Enter to continue)..." _ < /dev/tty
 }
 
-# ===== 幽灵记忆库与基础工具 =====
-save_key_to_cache() {
-  local pid="$1"; local key="$2"
-  [ -z "$key" ] && return
-  if ! grep -q "^${pid}:${key}$" "$CACHE_FILE" 2>/dev/null; then
-    echo "${pid}:${key}" >> "$CACHE_FILE" 2>/dev/null || true
-  fi
-}
-
-get_key_from_cache() {
-  local pid="$1"
-  if [ -f "$CACHE_FILE" ]; then
-    grep "^${pid}:" "$CACHE_FILE" 2>/dev/null | cut -d':' -f2 | tail -n 1
-  fi
-}
-
+# ===== 基础工具 =====
 retry() {
   local max="$MAX_RETRY_ATTEMPTS"; local attempt=1; local delay
   while [ $attempt -le $max ]; do
@@ -113,18 +98,6 @@ check_env() {
   if ! gcloud config list account --quiet &>/dev/null; then log "ERROR" "请先运行 'gcloud init'喵！"; exit 1; fi
 }
 
-parse_json() {
-  local json="$1"; local field="$2"
-  if [ -z "$json" ]; then return 1; fi
-  if command -v jq &>/dev/null; then
-    local res=$(echo "$json" | jq -r "$field" 2>/dev/null)
-    if [ -n "$res" ] && [ "$res" != "null" ]; then echo "$res"; return 0; fi
-  fi
-  if [ "$field" = ".keyString" ]; then
-    echo "$json" | grep -o '"keyString" *: *"[^"]*"' | sed 's/"keyString" *: *"//;s/"$//' | head -n 1
-  fi
-}
-
 unlink_projects_from_billing_account() {
   local billing_id="$1"
   local linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null)
@@ -136,40 +109,49 @@ unlink_projects_from_billing_account() {
   return 0
 }
 
-# ===== AS 提取逻辑 =====
-extract_key_safely() {
-  local project_id="$1"
-  retry gcloud services enable apikeys.googleapis.com --project="$project_id" --quiet >/dev/null 2>&1 || true
-  local keys_list=""; local attempt=1
-  while [ $attempt -le $MAX_RETRY_ATTEMPTS ]; do
-    if keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null); then break; fi
-    sleep 2; attempt=$((attempt+1))
-  done
-  if [ -n "$keys_list" ]; then
-    for key_name in $keys_list; do
-      key_name=$(echo "$key_name" | tr -d '\r' | xargs)
-      [ -z "$key_name" ] && continue
-      local api_key=""; local k_attempt=1
-      while [ $k_attempt -le $MAX_RETRY_ATTEMPTS ]; do
-        if api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null); then break; fi
-        sleep 2; k_attempt=$((k_attempt+1))
-      done
-      api_key=$(echo "$api_key" | tr -d '\r' | xargs)
-      if [ -n "$api_key" ]; then save_key_to_cache "$project_id" "$api_key"; echo "$api_key"; return 0; fi
-    done
-  fi
-  local cached_key=$(get_key_from_cache "$project_id")
-  if [ -n "$cached_key" ]; then echo "$cached_key"; return 0; fi
-  return 1
-}
-
+# ===== 【重构核心】精准提取纯净 AS 密钥 (防 Vertex 污染) =====
 _extract_single_project() {
   local pid="$1"
-  gcloud services enable generativelanguage.googleapis.com --project="$pid" --quiet >/dev/null 2>&1 || true
-  local key_output=$(gcloud services api-keys create --project="$pid" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json 2>/dev/null) || true
-  local api_key=$(parse_json "$key_output" ".keyString") || true
-  if [ -z "$api_key" ]; then api_key=$(extract_key_safely "$pid") || true; fi
-  echo "$api_key"
+  retry gcloud services enable generativelanguage.googleapis.com --project="$pid" --quiet >/dev/null 2>&1 || true
+  
+  # 1. 精准寻找名为 Gemini API Key 或 Studio Key 的钥匙
+  local target_name
+  target_name=$(gcloud services api-keys list --project="$pid" --filter="displayName:'Gemini API Key' OR displayName:'Studio Key'" --format="value(name)" 2>/dev/null | head -n 1 | tr -d '\r' | xargs)
+  
+  # 2. 如果没有，现场打一把专属纯净钥匙
+  if [ -z "$target_name" ]; then
+      gcloud services api-keys create --project="$pid" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --quiet >/dev/null 2>&1 || true
+      sleep 2
+      target_name=$(gcloud services api-keys list --project="$pid" --filter="displayName:'Gemini API Key'" --format="value(name)" 2>/dev/null | head -n 1 | tr -d '\r' | xargs)
+  fi
+  
+  # 3. 取出这把纯净钥匙
+  if [ -n "$target_name" ]; then
+      local api_key=$(gcloud services api-keys get-key-string "$target_name" --format="value(keyString)" 2>/dev/null | tr -d '\r' | xargs)
+      if [ -n "$api_key" ]; then
+          echo "$api_key"
+          return 0
+      fi
+  fi
+  
+  # 4. 终极保底扫描：彻底屏蔽任何受限的 Vertex 钥匙！
+  local all_keys=$(gcloud services api-keys list --project="$pid" --format="value(name,displayName)" 2>/dev/null || echo "")
+  if [ -n "$all_keys" ]; then
+      while read -r kname dname; do
+          kname=$(echo "$kname" | tr -d '\r' | xargs)
+          [ -z "$kname" ] && continue
+          
+          # 🚨 绝对不可碰这两种被锁死的钥匙
+          if [[ "$dname" != *"Agent Platform"* ]] && [[ "$dname" != *"Fallback API"* ]]; then
+              local api_key=$(gcloud services api-keys get-key-string "$kname" --format="value(keyString)" 2>/dev/null | tr -d '\r' | xargs)
+              if [ -n "$api_key" ] && [[ "$api_key" == AIza* ]]; then
+                  echo "$api_key"
+                  return 0
+              fi
+          fi
+      done <<< "$all_keys"
+  fi
+  return 1
 }
 
 # ===== v2.7 原生 Vertex 开通与提取 =====
@@ -234,11 +216,8 @@ v27_setup_and_extract_aq_key() {
     return 1
 }
 
-# =========================================================================
-# ==================== 【修复】提取可用结算账号工具 =======================
-# =========================================================================
+# ===== 提取可用结算账号工具 =====
 _select_billing_for_opt6() {
-  # 注意：所有菜单提示全部输出到 stderr (>&2)，只有最后的结果输出到 stdout
   local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
   if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户喵！"; return 1; fi
 
@@ -247,7 +226,6 @@ _select_billing_for_opt6() {
     bid="${bid##*/}"; ids+=("$bid"); names+=("$bname")
   done <<< "$billing_raw"
 
-  # 【修复】如果只有一个账单，直接静默锁定并返回！
   if [ "${#ids[@]}" -eq 1 ]; then
     log "INFO" "系统检测到仅有 1 个可用结算账户，已为您自动锁定: ${names[0]} (${ids[0]})"
     echo "${ids[0]}"
@@ -255,34 +233,27 @@ _select_billing_for_opt6() {
   fi
 
   echo -e "\n${CYAN}${BOLD}可用的结算账户：${NC}" >&2
-  for idx in "${!ids[@]}"; do
-    echo -e "  ${GREEN}$((idx+1))${NC}. ${names[$idx]} (${ids[$idx]})" >&2
-  done
+  for idx in "${!ids[@]}"; do echo -e "  ${GREEN}$((idx+1))${NC}. ${names[$idx]} (${ids[$idx]})" >&2; done
 
   local choice
   read -r -p "请选择 1 个主要结算账户 (输入编号) [默认: 1]: " choice < /dev/tty
   choice=${choice:-1}
   
   if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#ids[@]}" ]; then
-    local si=$((choice-1))
-    echo "${ids[$si]}"
-    return 0
+    local si=$((choice-1)); echo "${ids[$si]}"; return 0
   else
-    log "ERROR" "无效的选择"
-    return 1
+    log "ERROR" "无效的选择"; return 1
   fi
 }
 
 
-# =========================================================================
-# ======================== 选项 3 深度定制 ================================
-# =========================================================================
+# ===== 选项 3 深度定制 =====
 gemini_get_keys_from_existing() {
   prompt_upgrade_billing
   
   echo -e "\n${CYAN}${BOLD}====== 选项3: 从现有项目强力提取密钥 ======${NC}"
   echo "1. 单独提取 Vertex 项目密钥 (采用 v2.7 原生提取方法)"
-  echo "2. 单独提取 AS (Gemini Studio) 项目密钥"
+  echo "2. 单独提取 AS (Gemini Studio) 项目纯净密钥"
   echo "3. 提取 Vertex + AS 项目双端密钥"
   local sub_choice
   read -r -p "请选择 [1-3, 默认: 3]: " sub_choice < /dev/tty
@@ -293,9 +264,7 @@ gemini_get_keys_from_existing() {
   local valid_projects=()
   for pid in $projects; do
       local b_info=$(gcloud billing projects describe "$pid" --format='value(billingAccountName)' 2>/dev/null || echo "")
-      if [ -n "$b_info" ]; then
-          valid_projects+=("$pid")
-      fi
+      if [ -n "$b_info" ]; then valid_projects+=("$pid"); fi
   done
 
   if [ ${#valid_projects[@]} -eq 0 ]; then
@@ -342,9 +311,7 @@ gemini_get_keys_from_existing() {
 }
 
 
-# =========================================================================
-# ======================== 选项 6 专属 Handler ============================
-# =========================================================================
+# ===== 选项 6 专属 Handler =====
 option6_handler() {
   prompt_upgrade_billing
   
@@ -406,18 +373,14 @@ option6_handler() {
       fi
 
   elif [ "$sub_choice" = "2" ]; then
-      log "INFO" "====== 执行选项 6.2: 自动产出 2 Vertex + 3 AS ======"
+      log "INFO" "====== 执行选项 6.2: 完美配置 2 Vertex + 3 AS ======"
       
       local default_pid=$(gcloud projects list --filter="name='My First Project'" --format="value(projectId)" 2>/dev/null | head -n 1 || echo "")
-      if [ -z "$default_pid" ]; then
-          default_pid=$(gcloud config get-value project 2>/dev/null || echo "")
-      fi
+      if [ -z "$default_pid" ]; then default_pid=$(gcloud config get-value project 2>/dev/null || echo ""); fi
       log "INFO" "锁定默认项目: ${default_pid:-无}"
 
-      # 检查/挂载默认项目账单并优先提取 AS 密钥
       if [ -n "$default_pid" ]; then
           gcloud billing projects link "$default_pid" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
-          
           local check_b=$(gcloud billing projects describe "$default_pid" --format='value(billingAccountName)' 2>/dev/null || echo "")
           if [ -n "$check_b" ]; then
               log "INFO" ">> 开始提取默认项目 AS 密钥: $default_pid"
@@ -471,7 +434,7 @@ option6_handler() {
               if [ -n "$a_key" ]; then
                   log "SUCCESS" "新建项目 AS 密钥提取成功！"
                   AS_KEYS_FORMATTED+=("$a_key")
-                  AS_KEYS_RAW+=("$a_key") # 纯计数用
+                  AS_KEYS_RAW+=("$a_key") 
               fi
           done
       fi
@@ -501,15 +464,6 @@ option6_handler() {
   fi
 }
 
-# =========================================================================
-# ================== 以下为原有选项 1,2,4,5 逻辑 ==========================
-# =========================================================================
-
-gemini_create_projects() {
-  prompt_upgrade_billing
-  log "INFO" "此功能略去展示，请直接体验最强大的选项 6 喵！"
-}
-
 gemini_delete_projects() {
   log "INFO" "====== 删除现有项目 ======"
   read -r -p "输入项目前缀进行批量删除 (留空取消): " prefix < /dev/tty
@@ -518,19 +472,15 @@ gemini_delete_projects() {
   for p in $projects; do log "INFO" "正在删除 $p ..."; gcloud projects delete "$p" --quiet; done
 }
 
-rebuild_and_transfer_billing() {
-  log "INFO" "此功能略去展示，请直接体验最强大的选项 6 喵！"
-}
-
 # ===== 主菜单 =====
 show_menu() {
   echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
   echo "1. [经典] 自动创建项目并提取密钥 (清理旧项目释放配额)"
   echo "2. [防风控] 自动创建项目并提取密钥 (保留旧项目结算绑定)"
-  echo "3. 提取现有项目的纯净密钥 (Vertex / AS / 双端可选)"
+  echo "3. 提取现有项目的纯净密钥 (彻底免疫 Vertex 钢印污染)"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3密钥"
-  echo "6. [定制] 提取 vertex + AS 密钥 (智能嗅探 + 选项1防封创号 + 强迫症打印)"
+  echo "6. [定制] 提取 vertex + AS 密钥 (防封创号 + 强迫症分离打印)"
   echo "0. 退出并摸摸喵酱"
   local choice
   read -r -p "请主人吩咐: " choice < /dev/tty
