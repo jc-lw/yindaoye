@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 修复: 完整恢复选项 1、2、5 的经典执行逻辑，满血全开！
-# 版本: 4.8.0
+# 新增选项 7: 毁灭重生模式 (删光带账单项目，每账单重建1项目提纯净AS)
+# 版本: 4.9.0
 
 set -Euo pipefail
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.8.0"
+VERSION="4.9.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -203,9 +203,7 @@ v27_setup_and_extract_aq_key() {
     return 1
 }
 
-# =========================================================================
-# ================== 恢复选项 1、2 的提取可用结算账号 =======================
-# =========================================================================
+# ===== 提取可用结算账号工具 =====
 select_billing_accounts() {
   local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
   if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户喵！"; return 1; fi
@@ -276,9 +274,7 @@ _select_billing_for_opt6() {
   fi
 }
 
-# =========================================================================
-# ================== 恢复选项 1、2：经典与防风控逻辑 =======================
-# =========================================================================
+# ===== 选项 1、2：经典与防风控逻辑 =====
 gemini_create_projects() {
   prompt_upgrade_billing
   local keep_billing="${1:-false}"
@@ -434,7 +430,7 @@ gemini_delete_projects() {
   for p in $projects; do log "INFO" "正在删除 $p ..."; gcloud projects delete "$p" --quiet; done
 }
 
-# ===== 恢复选项 5: 护盾模式 =====
+# ===== 选项 5: 护盾模式 =====
 rebuild_and_transfer_billing() {
   prompt_upgrade_billing
   log "INFO" "====== 选项5: 终极护盾转移重建模式 ======"
@@ -702,6 +698,90 @@ option6_handler() {
   fi
 }
 
+# ===== 选项 7 毁灭重生模式 =====
+option7_handler() {
+  prompt_upgrade_billing
+  
+  echo -e "\n${CYAN}${BOLD}====== 选项7: 毁灭重生模式 (删光账单项目 + 每账单建1提1 AS) ======${NC}"
+  echo -e "${YELLOW}⚠️ 喵酱警告：此操作将查找所有可用结算账户，解绑并彻底删除所有关联的项目！${NC}"
+  read -r -p "确认执行此毁灭性操作吗？[y/N]: " confirm_del < /dev/tty
+  if [[ ! "$confirm_del" =~ ^[Yy]$ ]]; then
+      log "INFO" "操作已取消喵"
+      return 0
+  fi
+
+  local billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || echo "")
+  if [ -z "$billing_raw" ]; then log "ERROR" "未找到开放的结算账户喵！"; return 1; fi
+
+  local b_ids=(); local b_names=()
+  while IFS=',' read -r bid bname; do
+      b_ids+=("${bid##*/}"); b_names+=("$bname")
+  done <<< "$billing_raw"
+  
+  log "INFO" "总共检测到 ${#b_ids[@]} 个活跃结算账户。开始执行清理..."
+
+  # 1. 删光所有带可用结算的项目
+  for b_idx in "${!b_ids[@]}"; do
+      local CURRENT_BILLING="${b_ids[$b_idx]}"
+      local CURRENT_BNAME="${b_names[$b_idx]}"
+      log "INFO" ">> 正在查找结算账户 [$CURRENT_BNAME] 下的所有项目..."
+      
+      local linked_projects=$(gcloud billing projects list --billing-account="$CURRENT_BILLING" --format='value(projectId)' 2>/dev/null || echo "")
+      for p in $linked_projects; do
+          [ -z "$p" ] && continue
+          log "INFO" "正在删除项目和结算: $p ..."
+          gcloud billing projects unlink "$p" --quiet >/dev/null 2>&1 || true
+          gcloud projects delete "$p" --quiet || true
+          sleep 2
+      done
+  done
+
+  # 2. 为每个结算账户创建 1 个项目并提取 AS
+  log "INFO" "====== 清理完毕！开始为每个结算账户创建 1 个新项目 ======"
+  local AS_KEYS_FORMATTED=()
+
+  for b_idx in "${!b_ids[@]}"; do
+      local CURRENT_BILLING="${b_ids[$b_idx]}"
+      local CURRENT_BNAME="${b_names[$b_idx]}"
+      
+      log "INFO" "----------------------------------------------------------"
+      log "INFO" "[账单 $((b_idx+1))/${#b_ids[@]}] $CURRENT_BNAME - 正在建站提取..."
+      AS_KEYS_FORMATTED+=("【账单: ${CURRENT_BNAME}】")
+      
+      local pid=$(new_project_id); local pname=$(new_project_name)
+      log "INFO" "创建新项目: ${pname} [${pid}]"
+      
+      if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
+          gcloud billing projects link "$pid" --billing-account="$CURRENT_BILLING" --quiet >/dev/null 2>&1 || true
+          log "INFO" "账单绑定成功，防风控潜伏 15 秒..."
+          sleep 15
+          
+          local a_key=$(_extract_single_project "$pid")
+          if [ -n "$a_key" ]; then 
+              log "SUCCESS" "AS 密钥提取成功！"
+              AS_KEYS_FORMATTED+=("$a_key")
+          else
+              log "WARN" "AS 密钥提取失败喵..."
+          fi
+      else
+          log "ERROR" "项目创建失败！"
+      fi
+  done
+
+  # 打印纯净 AS 密钥
+  local pure_a=0
+  for item in "${AS_KEYS_FORMATTED[@]}"; do if [[ ! "$item" =~ "【账单" ]]; then pure_a=$((pure_a+1)); fi; done
+
+  if [ "$pure_a" -gt 0 ]; then
+      echo -e "\n${GREEN}${BOLD}====== 纯净 AS 密钥列表 (共 ${pure_a} 个) ======${NC}"
+      for k in "${AS_KEYS_FORMATTED[@]}"; do 
+          if [[ "$k" =~ "【账单" ]]; then echo -e "\n${CYAN}${k}${NC}"
+          else echo -e "${GREEN}${k}${NC}"; fi
+      done
+      echo
+  fi
+}
+
 # ===== 主菜单 =====
 show_menu() {
   echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
@@ -711,6 +791,7 @@ show_menu() {
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3密钥"
   echo "6. [定制] 提取 vertex + AS 密钥 (智能嗅探 + 选项1防封创号 + 强迫症打印)"
+  echo "7. [重置] 删光所有带账单项目 -> 每账单建1提1 (纯提AS)"
   echo "0. 退出并摸摸喵酱"
   local choice
   read -r -p "请主人吩咐: " choice < /dev/tty
@@ -731,6 +812,7 @@ show_menu() {
     4) check_env && gemini_delete_projects ;;
     5) check_env && rebuild_and_transfer_billing ;;
     6) check_env && option6_handler ;;
+    7) check_env && option7_handler ;;
     0) exit 0 ;;
     *) log "ERROR" "指令无效喵！" ;; 
   esac
