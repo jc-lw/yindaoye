@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 新增选项 7: 毁灭重生模式 (删光带账单项目，每账单重建1项目提纯净AS)
-# 版本: 4.9.0
+# 修复选项 3: 漏调 v2.7 原生 Vertex API 权限开通函数的问题
+# 版本: 4.9.1
 
 set -Euo pipefail
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.9.0"
+VERSION="4.9.1"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -393,6 +393,7 @@ gemini_get_keys_from_existing() {
       log "INFO" "正在处理已绑账单项目: ${project_id}"
       
       if [ "$sub_choice" = "1" ] || [ "$sub_choice" = "3" ]; then
+          v27_enable_all_services "$project_id" # 【修复】: 必须先开启权限！
           local v_key=$(v27_setup_and_extract_aq_key "$project_id" || true)
           if [ -n "$v_key" ]; then
               log "SUCCESS" "Vertex 提取成功: $v_key"
@@ -720,7 +721,6 @@ option7_handler() {
   
   log "INFO" "总共检测到 ${#b_ids[@]} 个活跃结算账户。开始执行清理..."
 
-  # 1. 删光所有带可用结算的项目
   for b_idx in "${!b_ids[@]}"; do
       local CURRENT_BILLING="${b_ids[$b_idx]}"
       local CURRENT_BNAME="${b_names[$b_idx]}"
@@ -736,7 +736,6 @@ option7_handler() {
       done
   done
 
-  # 2. 为每个结算账户创建 1 个项目并提取 AS
   log "INFO" "====== 清理完毕！开始为每个结算账户创建 1 个新项目 ======"
   local AS_KEYS_FORMATTED=()
 
@@ -768,7 +767,6 @@ option7_handler() {
       fi
   done
 
-  # 打印纯净 AS 密钥
   local pure_a=0
   for item in "${AS_KEYS_FORMATTED[@]}"; do if [[ ! "$item" =~ "【账单" ]]; then pure_a=$((pure_a+1)); fi; done
 
