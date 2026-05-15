@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 修复: 全量补齐 Agent Registry, App Topology, Observability 等最新 API
-# 版本: 5.1.0
+# 修复: 精准修正 cloudapiregistry 与 iamconnectors，确保 Vertex 控制台 100% 全绿点亮
+# 版本: 5.2.0
 
 set -Euo pipefail
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="5.1.0"
+VERSION="5.2.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -141,10 +141,10 @@ _extract_single_project() {
   return 1
 }
 
-# ===== 5.1 升级版原生 Vertex 全量开通与提取 =====
+# ===== 5.2 终极版原生 Vertex 全量开通与提取 =====
 v27_enable_all_services() {
     local proj="$1"
-    # 彻底包揽 Agent Platform 所有生态 API
+    # 【极致修复】完美对齐 Google Agent Platform 最新的微服务名称
     local services=(
         "aiplatform.googleapis.com"
         "generativelanguage.googleapis.com"
@@ -154,21 +154,21 @@ v27_enable_all_services() {
         "cloudresourcemanager.googleapis.com"
         "apikeys.googleapis.com"
         "compute.googleapis.com"
-        "modelarmor.googleapis.com"
-        "notebooks.googleapis.com"
-        "texttospeech.googleapis.com"
-        "iap.googleapis.com"
-        "networksecurity.googleapis.com"
-        "networkservices.googleapis.com"
-        "apphub.googleapis.com"
-        "connectors.googleapis.com"
         "dialogflow.googleapis.com"
         "dataform.googleapis.com"
-        "agentregistry.googleapis.com"       # [最新] Agent Registry
-        "apptopology.googleapis.com"         # [最新] App Topology
-        "apiregistry.googleapis.com"         # [最新] Cloud API Registry
-        "observability.googleapis.com"       # [最新] Observability API
-        "serviceusage.googleapis.com"        # 用于保障UI面板正确鉴权
+        "serviceusage.googleapis.com"
+        "agentregistry.googleapis.com"       # Agent Registry API
+        "apphub.googleapis.com"              # App Hub API
+        "apptopology.googleapis.com"         # App Topology API
+        "cloudapiregistry.googleapis.com"    # [核心修复] Cloud API Registry API
+        "iamconnectors.googleapis.com"       # [核心修复] IAM Connectors API
+        "iap.googleapis.com"                 # Cloud Identity-Aware Proxy API
+        "modelarmor.googleapis.com"          # Model Armor API
+        "networksecurity.googleapis.com"     # Network Security API
+        "networkservices.googleapis.com"     # Network Services API
+        "notebooks.googleapis.com"           # Notebooks API
+        "observability.googleapis.com"       # Observability API
+        "texttospeech.googleapis.com"        # Cloud Text-to-Speech API
     )
     log "INFO" "正在为项目 ${proj} 强力开通全新 Agent Platform 大满贯 API 全家桶..."
     for svc in "${services[@]}"; do
