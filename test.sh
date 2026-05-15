@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 修复选项 3: 漏调 v2.7 原生 Vertex API 权限开通函数的问题
-# 版本: 4.9.1
+# 修复: 全量扩容 Vertex Agent Platform 全家桶 API，点亮控制台所有权限
+# 版本: 5.0.0
 
 set -Euo pipefail
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="4.9.1"
+VERSION="5.0.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -141,16 +141,36 @@ _extract_single_project() {
   return 1
 }
 
-# ===== v2.7 原生 Vertex 开通与提取 =====
+# ===== 5.0 升级版原生 Vertex 全量开通与提取 =====
 v27_enable_all_services() {
     local proj="$1"
-    local services=("aiplatform.googleapis.com" "generativelanguage.googleapis.com" "discoveryengine.googleapis.com" "iam.googleapis.com" "iamcredentials.googleapis.com" "cloudresourcemanager.googleapis.com" "apikeys.googleapis.com" "compute.googleapis.com")
-    log "INFO" "正在为项目 ${proj} 强力开通全部核心 API 权限 (调用 v2.7 逻辑)..."
+    # 【修复】加入 Agent Platform 所有必要的生态 API
+    local services=(
+        "aiplatform.googleapis.com"
+        "generativelanguage.googleapis.com"
+        "discoveryengine.googleapis.com"
+        "iam.googleapis.com"
+        "iamcredentials.googleapis.com"
+        "cloudresourcemanager.googleapis.com"
+        "apikeys.googleapis.com"
+        "compute.googleapis.com"
+        "modelarmor.googleapis.com"       # Model Armor API
+        "notebooks.googleapis.com"        # Notebooks API
+        "texttospeech.googleapis.com"     # Cloud Text-to-Speech API
+        "iap.googleapis.com"              # Cloud Identity-Aware Proxy API
+        "networksecurity.googleapis.com"  # Network Security API
+        "networkservices.googleapis.com"  # Network Services API
+        "apphub.googleapis.com"           # App Hub API
+        "connectors.googleapis.com"       # IAM Connectors API
+        "dialogflow.googleapis.com"       # 核心对话引擎
+        "dataform.googleapis.com"         # Dataform
+    )
+    log "INFO" "正在为项目 ${proj} 强力开通全新 Agent Platform 全家桶 API 权限..."
     for svc in "${services[@]}"; do
         retry gcloud services enable "$svc" --project="$proj" --quiet >/dev/null 2>&1 || true
     done
-    log "INFO" "等待 API 权限在全局节点同步 (组织架构耗时较长)..."
-    sleep 10
+    log "INFO" "等待 API 权限在全局节点同步 (包含大量微服务，请耐心等待)..."
+    sleep 15
 }
 
 v27_setup_and_extract_aq_key() {
@@ -393,7 +413,7 @@ gemini_get_keys_from_existing() {
       log "INFO" "正在处理已绑账单项目: ${project_id}"
       
       if [ "$sub_choice" = "1" ] || [ "$sub_choice" = "3" ]; then
-          v27_enable_all_services "$project_id" # 【修复】: 必须先开启权限！
+          v27_enable_all_services "$project_id" 
           local v_key=$(v27_setup_and_extract_aq_key "$project_id" || true)
           if [ -n "$v_key" ]; then
               log "SUCCESS" "Vertex 提取成功: $v_key"
