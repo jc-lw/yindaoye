@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 修复: 全量扩容 Vertex Agent Platform 全家桶 API，点亮控制台所有权限
-# 版本: 5.0.0
+# 修复: 全量补齐 Agent Registry, App Topology, Observability 等最新 API
+# 版本: 5.1.0
 
 set -Euo pipefail
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="5.0.0"
+VERSION="5.1.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -141,10 +141,10 @@ _extract_single_project() {
   return 1
 }
 
-# ===== 5.0 升级版原生 Vertex 全量开通与提取 =====
+# ===== 5.1 升级版原生 Vertex 全量开通与提取 =====
 v27_enable_all_services() {
     local proj="$1"
-    # 【修复】加入 Agent Platform 所有必要的生态 API
+    # 彻底包揽 Agent Platform 所有生态 API
     local services=(
         "aiplatform.googleapis.com"
         "generativelanguage.googleapis.com"
@@ -154,22 +154,27 @@ v27_enable_all_services() {
         "cloudresourcemanager.googleapis.com"
         "apikeys.googleapis.com"
         "compute.googleapis.com"
-        "modelarmor.googleapis.com"       # Model Armor API
-        "notebooks.googleapis.com"        # Notebooks API
-        "texttospeech.googleapis.com"     # Cloud Text-to-Speech API
-        "iap.googleapis.com"              # Cloud Identity-Aware Proxy API
-        "networksecurity.googleapis.com"  # Network Security API
-        "networkservices.googleapis.com"  # Network Services API
-        "apphub.googleapis.com"           # App Hub API
-        "connectors.googleapis.com"       # IAM Connectors API
-        "dialogflow.googleapis.com"       # 核心对话引擎
-        "dataform.googleapis.com"         # Dataform
+        "modelarmor.googleapis.com"
+        "notebooks.googleapis.com"
+        "texttospeech.googleapis.com"
+        "iap.googleapis.com"
+        "networksecurity.googleapis.com"
+        "networkservices.googleapis.com"
+        "apphub.googleapis.com"
+        "connectors.googleapis.com"
+        "dialogflow.googleapis.com"
+        "dataform.googleapis.com"
+        "agentregistry.googleapis.com"       # [最新] Agent Registry
+        "apptopology.googleapis.com"         # [最新] App Topology
+        "apiregistry.googleapis.com"         # [最新] Cloud API Registry
+        "observability.googleapis.com"       # [最新] Observability API
+        "serviceusage.googleapis.com"        # 用于保障UI面板正确鉴权
     )
-    log "INFO" "正在为项目 ${proj} 强力开通全新 Agent Platform 全家桶 API 权限..."
+    log "INFO" "正在为项目 ${proj} 强力开通全新 Agent Platform 大满贯 API 全家桶..."
     for svc in "${services[@]}"; do
         retry gcloud services enable "$svc" --project="$proj" --quiet >/dev/null 2>&1 || true
     done
-    log "INFO" "等待 API 权限在全局节点同步 (包含大量微服务，请耐心等待)..."
+    log "INFO" "等待 API 权限在全局节点同步 (涉及大量微服务，请耐心等待 15 秒)..."
     sleep 15
 }
 
