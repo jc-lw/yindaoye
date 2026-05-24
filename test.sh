@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 核心革命: 引入 --async 服务端异步引擎，根除本地 gcloud 进程死锁导致的开启失败
-# 版本: 5.7.0
+# 核心革命: 引入智能分片装箱机制，突破 Google Cloud 单次开启 max=20 的硬性限制
+# 版本: 5.8.0
 
 set -Euo pipefail
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="5.7.0"
+VERSION="5.8.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -140,7 +140,7 @@ _extract_single_project() {
   return 1
 }
 
-# ===== 5.7 严格地毯式核验 (彻底治愈强迫症) =====
+# ===== 5.8 严格地毯式核验 =====
 check_api_ready() {
     local pid="$1"
     local stage="$2"
@@ -149,7 +149,6 @@ check_api_ready() {
     local attempt=1
     local max_attempts=18  # 最长等待 3 分钟
     
-    # 严格死守控制台要求的所有 UI 权限
     local target_apis=("aiplatform" "generativelanguage" "agentregistry" "apphub" "apptopology" "cloudapiregistry" "iamconnectors" "iap" "modelarmor" "networksecurity" "networkservices" "notebooks" "observability" "texttospeech")
     
     while [ $attempt -le $max_attempts ]; do
@@ -176,30 +175,41 @@ check_api_ready() {
     return 1
 }
 
-# ===== 5.7 核心黑科技: 官方单包 + 服务端 --async 异步下发 =====
+# ===== 5.8 核心突破: 智能双包发送，完美绕过 20 限制 =====
 v27_enable_all_services() {
     local proj="$1"
-    # 完全对齐你抓取到的 15 个最新官方微服务 + 底层支撑服务
-    local services=(
-        "agentregistry.googleapis.com" "aiplatform.googleapis.com" "apphub.googleapis.com" 
-        "apptopology.googleapis.com" "cloudapiregistry.googleapis.com" "compute.googleapis.com" 
-        "iam.googleapis.com" "iamconnectors.googleapis.com" "iap.googleapis.com" 
+    
+    # 【一号包裹】核心 AI 与基础资源 (14 个)
+    local batch1=(
+        "aiplatform.googleapis.com" "generativelanguage.googleapis.com" "discoveryengine.googleapis.com"
+        "iam.googleapis.com" "iamcredentials.googleapis.com" "cloudresourcemanager.googleapis.com"
+        "apikeys.googleapis.com" "dialogflow.googleapis.com" "dataform.googleapis.com"
+        "serviceusage.googleapis.com" "compute.googleapis.com" "storage.googleapis.com"
+        "logging.googleapis.com" "monitoring.googleapis.com"
+    )
+
+    # 【二号包裹】Agent Platform 最新微服务生态 (14 个)
+    local batch2=(
+        "agentregistry.googleapis.com" "apphub.googleapis.com" "apptopology.googleapis.com" 
+        "cloudapiregistry.googleapis.com" "iamconnectors.googleapis.com" "iap.googleapis.com" 
         "modelarmor.googleapis.com" "networksecurity.googleapis.com" "networkservices.googleapis.com" 
         "notebooks.googleapis.com" "observability.googleapis.com" "texttospeech.googleapis.com"
-        "generativelanguage.googleapis.com" "discoveryengine.googleapis.com" "iamcredentials.googleapis.com" 
-        "cloudresourcemanager.googleapis.com" "apikeys.googleapis.com" "dialogflow.googleapis.com" 
-        "dataform.googleapis.com" "serviceusage.googleapis.com" "cloudtrace.googleapis.com" 
-        "logging.googleapis.com" "monitoring.googleapis.com" "telemetry.googleapis.com" "storage.googleapis.com"
+        "cloudtrace.googleapis.com" "telemetry.googleapis.com"
     )
     
-    log "INFO" "[$proj] 正在向 Google 服务器投递原生全量 API 大包指令..."
+    log "INFO" "[$proj] 正在向 Google 服务器投递 API 指令 (分片打包以突破 20 个的硬性限制)..."
     
-    # 彻底解决本地死锁：使用 --async 让 gcloud 瞬间返回，由 Google 强大的后端负责多项目并发开启
-    local out
-    if ! out=$(gcloud services enable "${services[@]}" --project="$proj" --async --quiet 2>&1); then
-        log "ERROR" "[$proj] API 指令投递被 Google 拒绝: $out"
+    local out1 out2
+    if ! out1=$(gcloud services enable "${batch1[@]}" --project="$proj" --async --quiet 2>&1); then
+        log "ERROR" "[$proj] 核心 API 包投递被拒: $out1"
     else
-        log "SUCCESS" "[$proj] 指令投递成功！云端已开启异步原子处理！"
+        log "SUCCESS" "[$proj] 核心 API 包投递成功！"
+    fi
+
+    if ! out2=$(gcloud services enable "${batch2[@]}" --project="$proj" --async --quiet 2>&1); then
+        log "ERROR" "[$proj] 生态 API 包投递被拒: $out2"
+    else
+        log "SUCCESS" "[$proj] 生态 API 包投递成功！云端已开启并发处理！"
     fi
 }
 
@@ -548,7 +558,7 @@ except Exception as e:
 option6_handler() {
   prompt_upgrade_billing
   
-  echo -e "\n${CYAN}${BOLD}====== 选项6: 提取 vertex+AS key密钥 (工业级大包并发 + 全量核验) ======${NC}"
+  echo -e "\n${CYAN}${BOLD}====== 选项6: 提取 vertex+AS key密钥 (工业级异步大包并发) ======${NC}"
   echo "1. 单账单自定义数量创建 (防风控创建，提 Vertex + AS)"
   echo "2. 多账单全自动榨干模式 (账单1:默认+2新项目; 账单2~N: 3新项目。保证每账单 2V+3AS)"
   local sub_choice
@@ -584,11 +594,10 @@ option6_handler() {
       log "INFO" "批量创建完毕，防风控潜伏 5 秒..."
       sleep 5
 
-      log "INFO" ">> 开始为 ${#created_pids[@]} 个项目串行下发异步 API 大包指令..."
       for pid in "${created_pids[@]}"; do
           v27_enable_all_services "$pid"
       done
-      log "INFO" "指令派发完毕，静默等待 10 秒供后端消化..."
+      log "INFO" "异步指令投递完毕，静默等待 10 秒缓冲..."
       sleep 10
 
       for pid in "${created_pids[@]}"; do
@@ -663,7 +672,6 @@ option6_handler() {
               log "INFO" "创建完毕，防风控潜伏 5 秒..."
               sleep 5
 
-              log "INFO" ">> 向 Google 后台批量投递 API 大包指令..."
               for pid in "${created_pids[@]}"; do v27_enable_all_services "$pid"; done
               log "INFO" "指令派发完毕，静默等待 10 秒缓冲..."
               sleep 10
@@ -695,7 +703,6 @@ option6_handler() {
               log "INFO" "创建完毕，防风控潜伏 5 秒..."
               sleep 5
 
-              log "INFO" ">> 向 Google 后台批量投递 API 大包指令..."
               for pid in "${created_pids[@]}"; do v27_enable_all_services "$pid"; done
               log "INFO" "指令派发完毕，静默等待 10 秒缓冲..."
               sleep 10
@@ -831,7 +838,7 @@ show_menu() {
   echo "3. 提取现有项目的纯净密钥 (彻底免疫 Vertex 钢印污染)"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3密钥"
-  echo "6. [定制] 提取 vertex + AS 密钥 (智能并发 + 官方单包开启)"
+  echo "6. [定制] 提取 vertex + AS 密钥 (智能双包并发分发机制)"
   echo "7. [重置] 删光所有带账单项目 -> 每账单建1提1 (纯提AS)"
   echo "0. 退出并摸摸喵酱"
   local choice
