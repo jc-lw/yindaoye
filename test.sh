@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 修复与优化: 引入批量并发开通 API 机制 + 提 Key 前后双重权限核验
-# 版本: 5.3.0
+# 优化: 延长 API 核验时间至 180 秒，消灭刷屏日志，开启静默从容等待模式
+# 版本: 5.4.0
 
 set -Euo pipefail
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="5.3.0"
+VERSION="5.4.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -133,34 +133,35 @@ _extract_single_project() {
   return 1
 }
 
-# ===== 新增：提 Key 前后双重权限核验引擎 =====
+# ===== 5.4 静默从容：提 Key 前后双重权限核验引擎 =====
 check_api_ready() {
     local pid="$1"
     local stage="$2"
-    log "INFO" "[$pid] 正在进行 API 权限 ${stage} 状态核验..."
+    log "INFO" "[$pid] ${stage} 状态核验 (全球节点同步通常需 1~3 分钟，喵酱静默等待中...)"
     
     local attempt=1
-    while [ $attempt -le 3 ]; do
+    local max_attempts=18  # 18次 x 10秒 = 180秒 (3分钟极限等待)
+    
+    while [ $attempt -le $max_attempts ]; do
         local enabled_list
         enabled_list=$(gcloud services list --project="$pid" --enabled --format="value(config.name)" 2>/dev/null || echo "")
         
-        # 重点抽查最容易漏掉或挂掉的核心 API
         if [[ "$enabled_list" == *"aiplatform.googleapis.com"* ]] && \
            [[ "$enabled_list" == *"generativelanguage.googleapis.com"* ]] && \
            [[ "$enabled_list" == *"cloudapiregistry.googleapis.com"* ]]; then
-            log "SUCCESS" "[$pid] ${stage}核验通过：全量 API 已成功同步亮起！"
+            log "SUCCESS" "[$pid] ${stage}核验通过：底层全量大满贯 API 已成功同步亮起！"
             return 0
         fi
         
-        log "WARN" "[$pid] API 尚未完全在 GCP 全局节点同步，静默等待 3 秒重试 ($attempt/3)..."
-        sleep 3
+        # 静默等待，不再刷屏输出 WARN
+        sleep 10
         attempt=$((attempt+1))
     done
-    log "WARN" "[$pid] ${stage}核验超时，可能有极个别微服务未点亮，但不影响强行提取。"
+    log "WARN" "[$pid] ${stage}核验超时 (已等待 3 分钟)，极个别微服务可能仍在排队，跳过核验强行提取喵。"
     return 1
 }
 
-# ===== 5.3 极速单行开启全家桶 API =====
+# ===== 极速单行开启全家桶 API =====
 v27_enable_all_services() {
     local proj="$1"
     local services=(
@@ -173,7 +174,6 @@ v27_enable_all_services() {
         "texttospeech.googleapis.com"
     )
     log "INFO" "[$proj] 正在强力发送一次性开通全家桶 API 并发指令..."
-    # 【极致提速】不再使用 for 循环，一次性批量发送所有服务开通指令
     retry gcloud services enable "${services[@]}" --project="$proj" --quiet >/dev/null 2>&1 || true
 }
 
@@ -491,7 +491,7 @@ rebuild_and_transfer_billing() {
   echo -e "\n${GREEN}任务圆满完成！${NC}"
 }
 
-# ===== 选项 6 全新多账单自动循环逻辑 (并发优化版) =====
+# ===== 选项 6 全新多账单自动循环逻辑 (并发优化静默版) =====
 option6_handler() {
   prompt_upgrade_billing
   
@@ -778,7 +778,7 @@ show_menu() {
   echo "3. 提取现有项目的纯净密钥 (彻底免疫 Vertex 钢印污染)"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3密钥"
-  echo "6. [定制] 提取 vertex + AS 密钥 (工业级并发 + 前后置核验)"
+  echo "6. [定制] 提取 vertex + AS 密钥 (智能并发 + 静默等待核验)"
   echo "7. [重置] 删光所有带账单项目 -> 每账单建1提1 (纯提AS)"
   echo "0. 退出并摸摸喵酱"
   local choice
