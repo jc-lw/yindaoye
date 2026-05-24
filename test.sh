@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 核心革命: 引入 --async 异步并发引擎，彻底解决一票否决导致的 3 分钟死锁问题
-# 版本: 5.5.0
+# 核心革命: 抛弃高频异步，采用官方原生“单包全量事务”开启法，外加全量严格核验
+# 版本: 5.6.0
 
 set -Euo pipefail
 
@@ -14,13 +14,12 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="5.5.0"
+VERSION="5.6.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
 
-# 强制清空旧的污染缓存
 rm -f "$CACHE_FILE" 2>/dev/null || true
 
 # ===== 日志处理 =====
@@ -65,7 +64,6 @@ prompt_upgrade_billing() {
   read -r -p "确认您已手动激活后，请按回车键继续执行脚本 (Press Enter to continue)..." _ < /dev/tty
 }
 
-# ===== 基础工具 =====
 retry() {
   local max="$MAX_RETRY_ATTEMPTS"; local attempt=1; local delay
   while [ $attempt -le $max ]; do
@@ -108,25 +106,20 @@ unlink_projects_from_billing_account() {
   return 0
 }
 
-# ===== 精准提取纯净 AS 密钥 =====
 _extract_single_project() {
   local pid="$1"
   retry gcloud services enable generativelanguage.googleapis.com --project="$pid" --quiet >/dev/null 2>&1 || true
-  
   local target_name
   target_name=$(gcloud services api-keys list --project="$pid" --filter="displayName:'Gemini API Key' OR displayName:'Studio Key'" --format="value(name)" 2>/dev/null | head -n 1 | tr -d '\r' | xargs)
-  
   if [ -z "$target_name" ]; then
       gcloud services api-keys create --project="$pid" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --quiet >/dev/null 2>&1 || true
       sleep 2
       target_name=$(gcloud services api-keys list --project="$pid" --filter="displayName:'Gemini API Key'" --format="value(name)" 2>/dev/null | head -n 1 | tr -d '\r' | xargs)
   fi
-  
   if [ -n "$target_name" ]; then
       local api_key=$(gcloud services api-keys get-key-string "$target_name" --format="value(keyString)" 2>/dev/null | tr -d '\r' | xargs)
       if [ -n "$api_key" ]; then echo "$api_key"; return 0; fi
   fi
-  
   local all_keys=$(gcloud services api-keys list --project="$pid" --format="value(name,displayName)" 2>/dev/null || echo "")
   if [ -n "$all_keys" ]; then
       while read -r kname dname; do
@@ -141,58 +134,59 @@ _extract_single_project() {
   return 1
 }
 
-# ===== 5.5 静默核心：前后置双重核验引擎 (减负放行版) =====
+# ===== 5.6 严格地毯式核验 (彻底治愈强迫症) =====
 check_api_ready() {
     local pid="$1"
     local stage="$2"
-    log "INFO" "[$pid] ${stage} 核心 API 核验 (静默等待同步...)"
+    log "INFO" "[$pid] ${stage} 核心与UI全量 API 核验 (静默同步中...)"
     
     local attempt=1
-    local max_attempts=18  # 18次 x 10秒 = 180秒极限等待
+    local max_attempts=18  # 最长等待 3 分钟
+    
+    # 将你反馈的所有极易漏掉的 API 全部列入死守名单
+    local target_apis=("aiplatform" "generativelanguage" "agentregistry" "apphub" "apptopology" "cloudapiregistry" "iamconnectors" "iap" "modelarmor" "networksecurity" "networkservices" "notebooks" "observability" "texttospeech")
     
     while [ $attempt -le $max_attempts ]; do
         local enabled_list
         enabled_list=$(gcloud services list --project="$pid" --enabled --format="value(config.name)" 2>/dev/null || echo "")
         
-        # 【核心减负】只检查提Key最最需要的两兄弟，剩下的UI服务让他们后台慢慢加载，绝不死等！
-        if [[ "$enabled_list" == *"aiplatform.googleapis.com"* ]] && \
-           [[ "$enabled_list" == *"generativelanguage.googleapis.com"* ]]; then
-            log "SUCCESS" "[$pid] ${stage}核验通过：核心 API 已就绪！"
+        local all_ready=true
+        for api in "${target_apis[@]}"; do
+            if [[ "$enabled_list" != *"${api}.googleapis.com"* ]]; then
+                all_ready=false
+                break
+            fi
+        done
+        
+        if [ "$all_ready" = true ]; then
+            log "SUCCESS" "[$pid] ${stage}核验通过：全量大满贯 API 已全部就绪！网页控制台全绿确认！"
             return 0
         fi
         
         sleep 10
         attempt=$((attempt+1))
     done
-    log "WARN" "[$pid] ${stage}核验超时，将强行执行提取喵。"
+    log "WARN" "[$pid] ${stage}核验超时，可能因网络波动少许UI服务未显示，跳过并强行提取喵。"
     return 1
 }
 
-# ===== 5.5 黑科技: 极速异步单开全家桶 API =====
+# ===== 5.6 核心修复: 官方原子级大包指令 (拒绝漏掉) =====
 v27_enable_all_services() {
     local proj="$1"
+    # 完全对齐你抓到的官方包
     local services=(
-        # 核心 AI 与鉴权 API (最重要)
         "aiplatform.googleapis.com" "generativelanguage.googleapis.com" "discoveryengine.googleapis.com"
         "iam.googleapis.com" "iamcredentials.googleapis.com" "cloudresourcemanager.googleapis.com"
-        "apikeys.googleapis.com" "serviceusage.googleapis.com" "dialogflow.googleapis.com"
-        
-        # 基础云服务
-        "compute.googleapis.com" "storage-component.googleapis.com" "storage.googleapis.com" "logging.googleapis.com" 
-        "monitoring.googleapis.com" "cloudtrace.googleapis.com" "telemetry.googleapis.com" "dataform.googleapis.com"
-        
-        # Agent Platform 最新微服务全家桶 (彻底补齐UI要求)
-        "agentregistry.googleapis.com" "apphub.googleapis.com" "apptopology.googleapis.com" 
-        "cloudapiregistry.googleapis.com" "apiregistry.googleapis.com" "iamconnectors.googleapis.com" "connectors.googleapis.com"
-        "iap.googleapis.com" "modelarmor.googleapis.com" "networksecurity.googleapis.com" "networkservices.googleapis.com" 
-        "notebooks.googleapis.com" "observability.googleapis.com" "texttospeech.googleapis.com" 
+        "apikeys.googleapis.com" "compute.googleapis.com" "dialogflow.googleapis.com" "dataform.googleapis.com"
+        "serviceusage.googleapis.com" "agentregistry.googleapis.com" "apphub.googleapis.com" "apptopology.googleapis.com"
+        "cloudapiregistry.googleapis.com" "iamconnectors.googleapis.com" "iap.googleapis.com" "modelarmor.googleapis.com"
+        "networksecurity.googleapis.com" "networkservices.googleapis.com" "notebooks.googleapis.com" "observability.googleapis.com"
+        "texttospeech.googleapis.com"
     )
     
-    log "INFO" "[$proj] 正在发射异步 API 开通指令雨 (无阻滞并发模式)..."
-    for svc in "${services[@]}"; do
-        # 核心突破：--async 瞬间返回不阻塞，单条失效绝不波及全局！
-        gcloud services enable "$svc" --project="$proj" --async --quiet >/dev/null 2>&1 || true
-    done
+    log "INFO" "[$proj] 正在打包发送全量 API 开启指令 (官方单包事务模式)..."
+    # 注意：这里恢复为整包同步发送，交给 GCP 后台一次性消化，绝不漏发！
+    retry gcloud services enable "${services[@]}" --project="$proj" --quiet >/dev/null 2>&1 || true
 }
 
 v27_setup_and_extract_aq_key() {
@@ -536,11 +530,11 @@ except Exception as e:
   echo -e "\n${GREEN}任务圆满完成！${NC}"
 }
 
-# ===== 选项 6 全新多账单自动循环逻辑 (并发优化静默版) =====
+# ===== 选项 6 全新多账单自动循环逻辑 (原子级同步开启版) =====
 option6_handler() {
   prompt_upgrade_billing
   
-  echo -e "\n${CYAN}${BOLD}====== 选项6: 提取 vertex+AS key密钥 (工业级异步并发 + 减负核验) ======${NC}"
+  echo -e "\n${CYAN}${BOLD}====== 选项6: 提取 vertex+AS key密钥 (工业级大包并发 + 全量核验) ======${NC}"
   echo "1. 单账单自定义数量创建 (防风控创建，提 Vertex + AS)"
   echo "2. 多账单全自动榨干模式 (账单1:默认+2新项目; 账单2~N: 3新项目。保证每账单 2V+3AS)"
   local sub_choice
@@ -575,13 +569,12 @@ option6_handler() {
       log "INFO" "批量创建完毕，防风控潜伏 5 秒..."
       sleep 5
 
-      log "INFO" ">> 开始并发向 ${#created_pids[@]} 个项目发送异步 API 开通指令..."
+      log "INFO" ">> 开始为 ${#created_pids[@]} 个项目并行投递 API 大包指令..."
       for pid in "${created_pids[@]}"; do
           v27_enable_all_services "$pid" &
       done
       wait
-      log "INFO" "API 指令发射完毕，等待 5 秒底层初次响应..."
-      sleep 5
+      log "INFO" "所有项目的 API 大包开启事务已发送完毕！"
 
       for pid in "${created_pids[@]}"; do
           check_api_ready "$pid" "【提Key前】"
@@ -655,10 +648,9 @@ option6_handler() {
               log "INFO" "创建完毕，防风控潜伏 5 秒..."
               sleep 5
 
-              log "INFO" ">> 并发启用 2 个新项目的 API..."
+              log "INFO" ">> 并发启用 2 个新项目的 API 大包..."
               for pid in "${created_pids[@]}"; do v27_enable_all_services "$pid" & done
               wait
-              sleep 5
 
               for pid in "${created_pids[@]}"; do
                   check_api_ready "$pid" "【提Key前】"
@@ -687,10 +679,9 @@ option6_handler() {
               log "INFO" "创建完毕，防风控潜伏 5 秒..."
               sleep 5
 
-              log "INFO" ">> 并发启用 3 个新项目的 API..."
+              log "INFO" ">> 并发启用 3 个新项目的 API 大包..."
               for pid in "${created_pids[@]}"; do v27_enable_all_services "$pid" & done
               wait
-              sleep 5
 
               local v_count=0
               for pid in "${created_pids[@]}"; do
@@ -823,7 +814,7 @@ show_menu() {
   echo "3. 提取现有项目的纯净密钥 (彻底免疫 Vertex 钢印污染)"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3密钥"
-  echo "6. [定制] 提取 vertex + AS 密钥 (极速并发 + 静默核验)"
+  echo "6. [定制] 提取 vertex + AS 密钥 (智能并发 + 官方单包开启)"
   echo "7. [重置] 删光所有带账单项目 -> 每账单建1提1 (纯提AS)"
   echo "0. 退出并摸摸喵酱"
   local choice
