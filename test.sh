@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具 - Vertex+AS完整源码
-# 核心革命: 引入智能分片装箱机制，突破 Google Cloud 单次开启 max=20 的硬性限制
-# 版本: 5.8.0
+# 核心革命: 引入 429 频率墙智能退避重试引擎 + 封包发送节流防阻滞
+# 版本: 5.9.0
 
 set -Euo pipefail
 
@@ -14,7 +14,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="5.8.0"
+VERSION="5.9.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -140,7 +140,7 @@ _extract_single_project() {
   return 1
 }
 
-# ===== 5.8 严格地毯式核验 =====
+# ===== 5.9 严格地毯式核验 =====
 check_api_ready() {
     local pid="$1"
     local stage="$2"
@@ -175,7 +175,40 @@ check_api_ready() {
     return 1
 }
 
-# ===== 5.8 核心突破: 智能双包发送，完美绕过 20 限制 =====
+# ===== 5.9 核心防线: 拦截 429 的智能退避重试函数 =====
+enable_api_with_retry() {
+    local proj="$1"
+    local batch_name="$2"
+    shift 2
+    local apis=("$@")
+    
+    local attempt=1
+    local max_attempts=4
+    
+    while [ $attempt -le $max_attempts ]; do
+        local out
+        # 发送异步包
+        if out=$(gcloud services enable "${apis[@]}" --project="$proj" --async --quiet 2>&1); then
+            log "SUCCESS" "[$proj] $batch_name 投递成功！云端已开启并发处理！"
+            return 0
+        else
+            # 强力拦截 429 频率墙警告
+            if echo "$out" | grep -q -E "429|RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|quota|Mutate requests"; then
+                local delay=$(( attempt * 15 + RANDOM % 10 ))
+                log "WARN" "[$proj] 触发 Google 接口频率墙 (429 Rate Limit)，强制避险休眠 ${delay} 秒后重试 ($attempt/$max_attempts)..."
+                sleep $delay
+            else
+                log "WARN" "[$proj] $batch_name 投递遇到未知波动，休眠 5 秒后重试 ($attempt/$max_attempts)... 报错信息: $out"
+                sleep 5
+            fi
+        fi
+        attempt=$((attempt+1))
+    done
+    log "ERROR" "[$proj] $batch_name 经 $max_attempts 次重试后仍投递失败！"
+    return 1
+}
+
+# ===== 5.9 核心突破: 智能双包发送 + 节流节拍器 =====
 v27_enable_all_services() {
     local proj="$1"
     
@@ -197,20 +230,19 @@ v27_enable_all_services() {
         "cloudtrace.googleapis.com" "telemetry.googleapis.com"
     )
     
-    log "INFO" "[$proj] 正在向 Google 服务器投递 API 指令 (分片打包以突破 20 个的硬性限制)..."
+    log "INFO" "[$proj] 正在向 Google 服务器投递 API 指令 (启用智能防 429 节流模式)..."
     
-    local out1 out2
-    if ! out1=$(gcloud services enable "${batch1[@]}" --project="$proj" --async --quiet 2>&1); then
-        log "ERROR" "[$proj] 核心 API 包投递被拒: $out1"
-    else
-        log "SUCCESS" "[$proj] 核心 API 包投递成功！"
-    fi
-
-    if ! out2=$(gcloud services enable "${batch2[@]}" --project="$proj" --async --quiet 2>&1); then
-        log "ERROR" "[$proj] 生态 API 包投递被拒: $out2"
-    else
-        log "SUCCESS" "[$proj] 生态 API 包投递成功！云端已开启并发处理！"
-    fi
+    # 发送一号核心包裹
+    enable_api_with_retry "$proj" "【核心包】" "${batch1[@]}"
+    
+    # 节流节拍器：强行降速，避免瞬间连续发包打穿 Google 的 Mutate Limit
+    sleep 3
+    
+    # 发送二号生态包裹
+    enable_api_with_retry "$proj" "【生态包】" "${batch2[@]}"
+    
+    # 包裹全部发送完毕，深呼吸一口气，交给 Google 后台慢慢消化
+    sleep 3
 }
 
 v27_setup_and_extract_aq_key() {
@@ -558,7 +590,7 @@ except Exception as e:
 option6_handler() {
   prompt_upgrade_billing
   
-  echo -e "\n${CYAN}${BOLD}====== 选项6: 提取 vertex+AS key密钥 (工业级异步大包并发) ======${NC}"
+  echo -e "\n${CYAN}${BOLD}====== 选项6: 提取 vertex+AS key密钥 (防 429 智能节流版) ======${NC}"
   echo "1. 单账单自定义数量创建 (防风控创建，提 Vertex + AS)"
   echo "2. 多账单全自动榨干模式 (账单1:默认+2新项目; 账单2~N: 3新项目。保证每账单 2V+3AS)"
   local sub_choice
@@ -597,7 +629,7 @@ option6_handler() {
       for pid in "${created_pids[@]}"; do
           v27_enable_all_services "$pid"
       done
-      log "INFO" "异步指令投递完毕，静默等待 10 秒缓冲..."
+      log "INFO" "异步包发送完毕，静默等待 10 秒缓冲..."
       sleep 10
 
       for pid in "${created_pids[@]}"; do
@@ -673,7 +705,7 @@ option6_handler() {
               sleep 5
 
               for pid in "${created_pids[@]}"; do v27_enable_all_services "$pid"; done
-              log "INFO" "指令派发完毕，静默等待 10 秒缓冲..."
+              log "INFO" "异步包裹发送完毕，静默等待 10 秒缓冲..."
               sleep 10
 
               for pid in "${created_pids[@]}"; do
@@ -704,7 +736,7 @@ option6_handler() {
               sleep 5
 
               for pid in "${created_pids[@]}"; do v27_enable_all_services "$pid"; done
-              log "INFO" "指令派发完毕，静默等待 10 秒缓冲..."
+              log "INFO" "异步包裹发送完毕，静默等待 10 秒缓冲..."
               sleep 10
 
               local v_count=0
@@ -838,7 +870,7 @@ show_menu() {
   echo "3. 提取现有项目的纯净密钥 (彻底免疫 Vertex 钢印污染)"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3密钥"
-  echo "6. [定制] 提取 vertex + AS 密钥 (智能双包并发分发机制)"
+  echo "6. [定制] 提取 vertex + AS 密钥 (智能节流防429死锁版)"
   echo "7. [重置] 删光所有带账单项目 -> 每账单建1提1 (纯提AS)"
   echo "0. 退出并摸摸喵酱"
   local choice
