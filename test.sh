@@ -1,6 +1,6 @@
 
 # GCP API Key Manager - Vertex AI + Gemini API + Gemini Enterprise Agent Platform
-# Version: 6.1.0 (2026-08-26)
+# Version: 6.2.0 (2026-08-26)
 # Changes:
 #   - Add GA Agent Identity API + Agent Identity Credentials API
 #   - Add Cloud DNS required by the current Agent Platform full-suite docs
@@ -8,8 +8,10 @@
 #   - Legacy iamconnectors is no longer required by default; optional compatibility switch remains
 #   - Exact API readiness verification and quota-aware exponential backoff
 #   - Authorization-key detection uses bound service account metadata first, prefix only as fallback
-#   - Add two-layer Billing Guard: API open-state check + console Paid/Free Trial confirmation
-#   - Free Trial path prints official Billing Overview and Welcome/Activate upgrade links
+#   - Replace the old two-layer Billing Guard with v6.2 three-layer detection
+#   - Layer 3 uses read-only Cloud Quotas quotaIncreaseEligibility as a strong Paid signal
+#   - UNKNOWN is never silently treated as Paid or Free; top-bar Activate confirmation is the fallback
+#   - Free Trial/Unknown path prints official Welcome/Activate + Billing + MFA links
 
 set -Euo pipefail
 
@@ -22,7 +24,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== Global config =====
-VERSION="6.1.0"
+VERSION="6.2.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-4}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -32,6 +34,8 @@ API_READY_SLEEP="${API_READY_SLEEP:-8}"
 API_BATCH_SIZE="${API_BATCH_SIZE:-8}"
 ENABLE_LEGACY_IAM_CONNECTORS="${ENABLE_LEGACY_IAM_CONNECTORS:-0}"
 BILLING_PAID_CACHE="${BILLING_PAID_CACHE:-$HOME/.miaojiang_paid_billing.cache}"
+BILLING_AUTO_ENABLE_QUOTAS_API="${BILLING_AUTO_ENABLE_QUOTAS_API:-1}"
+BILLING_PROBE_SERVICE="${BILLING_PROBE_SERVICE:-compute.googleapis.com}"
 
 rm -f "$CACHE_FILE" 2>/dev/null || true
 
@@ -39,6 +43,7 @@ rm -f "$CACHE_FILE" 2>/dev/null || true
 # Core admin + AI APIs used by this script and Vertex/Gemini.
 CORE_API_SERVICES=(
   "serviceusage.googleapis.com"
+  "cloudquotas.googleapis.com"
   "cloudresourcemanager.googleapis.com"
   "iam.googleapis.com"
   "iamcredentials.googleapis.com"
@@ -190,14 +195,25 @@ mask_key() {
   fi
 }
 
-# ===== Billing check: two-layer guard =====
-# Google Cloud Billing API exposes whether an account is open, but does not expose
-# the Console billable status ("Free trial account" vs "Paid account") as a public
-# BillingAccount field. Therefore:
-#   Layer 1: automatically verify the Billing Account exists and open=true.
-#   Layer 2: require Console confirmation of Paid/Free Trial status.
-# If Free Trial is selected, print the official upgrade page and block execution
-# until the user upgrades and confirms "Paid account" in Billing Overview.
+# ===== Billing check: v6.2 three-layer guard =====
+# Official Google Cloud public APIs do NOT expose a direct billableStatus field
+# that says "Free trial account" or "Paid account" on BillingAccount.
+#
+# v6.2 therefore uses three layers:
+#   Layer 1 - Cloud Billing CLI: account exists and open=true.
+#   Layer 2 - Cloud Billing REST + project BillingInfo: cross-check metadata and
+#             verify that at least one linked project has billingEnabled=true
+#             when a linked project is available.
+#   Layer 3 - Cloud Quotas read-only eligibility probe. Google documents that a
+#             non-billable Free Trial account cannot request quota increases.
+#             If an adjustable quota reports quotaIncreaseEligibility.isEligible=true,
+#             that is a strong PAID signal. If all quotas are ineligible, that does
+#             NOT prove Free Trial because Paid accounts can also be ineligible due
+#             to usage history or product-specific policy, so the result is UNKNOWN.
+#
+# No VM/GPU/Marketplace resource is created by this guard. The only optional state
+# change is enabling cloudquotas.googleapis.com on an already-linked probe project;
+# enabling an API itself does not create a billable resource.
 
 billing_cache_key() {
   local billing_id="$1"
@@ -238,88 +254,461 @@ billing_remove_paid_cache() {
 
 show_billing_upgrade_links() {
   local billing_id="$1"
-  echo -e "\n${YELLOW}${BOLD}⚠️ 当前账户仍是 Free Trial：必须先升级为 Paid account 才继续。${NC}" >&2
+  echo -e "\n${YELLOW}${BOLD}⚠️ 检测结果未能证明这是 Paid account。若页面顶部显示 Free trial status / 免费试用状态，请先激活完整账号。${NC}" >&2
   echo -e "${CYAN}Billing Account ID:${NC} ${billing_id}" >&2
   echo >&2
-  echo -e "${BOLD}① 查看当前 Free/Paid 状态：${NC}" >&2
-  echo -e "${CYAN}👉 https://console.cloud.google.com/billing/overview${NC}" >&2
-  echo -e "   打开后选择 Billing Account: ${billing_id}" >&2
-  echo >&2
-  echo -e "${BOLD}② 官方升级入口（Welcome 页面）：${NC}" >&2
+  echo -e "${BOLD}① Google 官方 Welcome / Activate 入口：${NC}" >&2
   echo -e "${CYAN}👉 https://console.cloud.google.com/welcome${NC}" >&2
-  echo -e "   在页面顶部点击 ${GREEN}${BOLD}Activate / Upgrade / 激活${NC}，并确认升级。" >&2
+  echo -e "   页面顶部如果看到 ${YELLOW}${BOLD}Free trial status / 免费试用状态${NC} 和 ${GREEN}${BOLD}Activate / 激活${NC}，直接点击。" >&2
   echo >&2
-  echo -e "${YELLOW}升级后，Billing Overview 应显示：${GREEN}${BOLD}Paid account${NC}" >&2
-  echo -e "${YELLOW}如果仍显示 ${BOLD}Free trial account${NC}，不要继续执行本脚本。" >&2
+  echo -e "${BOLD}② Google 官方 Billing 页面：${NC}" >&2
+  echo -e "${CYAN}👉 https://console.cloud.google.com/billing${NC}" >&2
+  echo -e "${CYAN}👉 https://console.cloud.google.com/billing/overview${NC}" >&2
+  echo >&2
+  echo -e "${BOLD}③ 如果 Cloud Console 被 MFA 页面拦截：${NC}" >&2
+  echo -e "${CYAN}👉 https://myaccount.google.com/signinoptions/two-step-verification${NC}" >&2
+  echo -e "   你截图里的 enable-mfa 页面顶部仍可能显示 Free trial 状态和 Activate；看到时可直接点击 Activate。" >&2
+  echo >&2
+  echo -e "${YELLOW}注意：升级 Paid 后，未过期的 Welcome Credit 会继续保留到原到期日。${NC}" >&2
 }
 
-verify_paid_status_in_console() {
+billing_layer2_rest_probe() {
   local billing_name="$1"
-  local billing_id="${billing_name#billingAccounts/}"
-  local display_name="$2"
+  local expected_id="${billing_name#billingAccounts/}"
+  local token=""
+  local body_file=""
+  local http_code=""
 
-  # A previous manual Paid confirmation is accepted only while Layer 1 still
-  # confirms that the same Billing Account remains open.
-  if billing_paid_is_cached "$billing_id"; then
-    log "SUCCESS" "[$billing_id] 第二层：已有 Paid account 人工确认缓存，继续执行。"
+  if ! command -v curl >/dev/null 2>&1; then
+    log "WARN" "[$expected_id] 第二层：系统缺少 curl，跳过 REST 交叉核验。"
+    return 2
+  fi
+
+  token=$(gcloud auth print-access-token 2>/dev/null || true)
+  if [ -z "$token" ]; then
+    log "WARN" "[$expected_id] 第二层：无法获取 gcloud access token，跳过 REST 交叉核验。"
+    return 2
+  fi
+
+  body_file=$(mktemp 2>/dev/null || echo "/tmp/miao-billing-${expected_id}-$$.json")
+  http_code=$(curl -sS -o "$body_file" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    "https://cloudbilling.googleapis.com/v1/billingAccounts/${expected_id}" 2>/dev/null || echo "000")
+
+  if [ "$http_code" != "200" ]; then
+    local brief
+    brief=$(tr '\n' ' ' < "$body_file" 2>/dev/null | cut -c1-350 || true)
+    rm -f "$body_file" 2>/dev/null || true
+    log "WARN" "[$expected_id] 第二层 REST 返回 HTTP ${http_code}，暂不能交叉核验。${brief:+ $brief}"
+    return 2
+  fi
+
+  local parsed=""
+  if command -v python3 >/dev/null 2>&1; then
+    parsed=$(python3 - "$body_file" <<'PY' 2>/dev/null || true
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p, 'r', encoding='utf-8') as f:
+        d = json.load(f)
+    print("\t".join([
+        str(d.get("name", "")),
+        "true" if d.get("open") is True else "false",
+        str(d.get("displayName", "")),
+        str(d.get("currencyCode", "")),
+        str(d.get("masterBillingAccount", "")),
+        str(d.get("parent", "")),
+    ]))
+except Exception:
+    pass
+PY
+)
+  fi
+
+  rm -f "$body_file" 2>/dev/null || true
+
+  if [ -z "$parsed" ]; then
+    log "SUCCESS" "[$expected_id] 第二层：Cloud Billing REST HTTP 200，官方 API 可读取该 Billing Account。"
     return 0
   fi
 
+  local api_name api_open api_display api_currency api_master api_parent
+  IFS=$'\t' read -r api_name api_open api_display api_currency api_master api_parent <<< "$parsed"
+
+  if [ "$api_name" != "billingAccounts/${expected_id}" ]; then
+    log "WARN" "[$expected_id] 第二层：REST 返回的 Billing Account 名称不匹配: ${api_name:-empty}"
+    return 2
+  fi
+
+  if [ "$api_open" != "true" ]; then
+    log "ERROR" "[$expected_id] 第二层：REST 交叉核验显示 open=false。"
+    return 1
+  fi
+
+  log "SUCCESS" "[$expected_id] 第二层 REST 通过: open=true | ${api_display:-Unknown} | ${api_currency:-Unknown}"
+  return 0
+}
+
+billing_find_probe_project() {
+  local billing_id="$1"
+  local projects=""
+  projects=$(gcloud billing projects list \
+    --billing-account="$billing_id" \
+    --format='value(projectId)' 2>/dev/null || true)
+
+  local pid
+  for pid in $projects; do
+    [ -z "$pid" ] && continue
+    local info=""
+    info=$(gcloud billing projects describe "$pid" \
+      --format='value(billingEnabled,billingAccountName)' 2>/dev/null || true)
+    [ -z "$info" ] && continue
+
+    local enabled account_name
+    read -r enabled account_name <<< "$info"
+    if { [ "$enabled" = "True" ] || [ "$enabled" = "true" ]; } && \
+       [ "$account_name" = "billingAccounts/${billing_id}" ]; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+billing_layer2_project_binding_probe() {
+  local billing_id="$1"
+  local project=""
+  project=$(billing_find_probe_project "$billing_id" || true)
+
+  if [ -z "$project" ]; then
+    log "WARN" "[$billing_id] 第二层项目绑定检查：未找到可见且 billingEnabled=true 的关联项目；第三层可能无法自动探测。"
+    return 2
+  fi
+
+  log "SUCCESS" "[$billing_id] 第二层项目绑定通过: ${project} -> billingEnabled=true"
+  printf '%s\n' "$project"
+  return 0
+}
+
+billing_parse_quota_json() {
+  local json_file="$1"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+
+  python3 - "$json_file" <<'PY'
+import json, sys, collections
+p = sys.argv[1]
+try:
+    with open(p, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception:
+    print("0\t0\t0\tPARSE_ERROR\t")
+    raise SystemExit(0)
+
+# gcloud --format=json returns an array. Direct REST returns {quotaInfos:[...]};
+# accept both so this parser can survive future implementation changes.
+if isinstance(data, list):
+    infos = data
+elif isinstance(data, dict):
+    infos = data.get("quotaInfos", [])
+else:
+    infos = []
+
+observed = 0
+adjustable = 0
+eligible = 0
+reasons = collections.Counter()
+samples = []
+
+for q in infos:
+    if not isinstance(q, dict):
+        continue
+    observed += 1
+    # A fixed quota can't be adjusted and does not help distinguish Paid/Trial.
+    if q.get("isFixed") is True:
+        continue
+    elig = q.get("quotaIncreaseEligibility")
+    if not isinstance(elig, dict):
+        continue
+    adjustable += 1
+    if elig.get("isEligible") is True:
+        eligible += 1
+        if len(samples) < 5:
+            samples.append(str(q.get("quotaId", q.get("name", "unknown"))))
+    else:
+        reason = str(elig.get("ineligibilityReason", "UNSPECIFIED"))
+        reasons[reason] += 1
+
+reason_text = ",".join(f"{k}:{v}" for k, v in sorted(reasons.items())) or "NONE"
+sample_text = ",".join(samples)
+print(f"{observed}\t{adjustable}\t{eligible}\t{reason_text}\t{sample_text}")
+PY
+}
+
+billing_layer3_quota_probe() {
+  local billing_id="$1"
+  local project="$2"
+
+  BILLING_LAYER3_STATE="UNKNOWN"
+  BILLING_LAYER3_DETAIL=""
+
+  if [ -z "$project" ]; then
+    BILLING_LAYER3_DETAIL="没有可用于 Cloud Quotas 探针的 billingEnabled 项目"
+    BILLING_LAYER3_STATE="UNKNOWN"
+    return 0
+  fi
+
+  if billing_paid_is_cached "$billing_id"; then
+    BILLING_LAYER3_DETAIL="本机已有该 Google 账号 + Billing ID 的 Paid 确认缓存，且第一层仍为 open=true"
+    BILLING_LAYER3_STATE="PAID"
+    return 0
+  fi
+
+  # Cloud Quotas QuotaInfo is read-only. Enable only the Cloud Quotas API if needed.
+  if ! gcloud services list --project="$project" --enabled \
+      --filter='config.name:cloudquotas.googleapis.com' \
+      --format='value(config.name)' 2>/dev/null | grep -Fqx 'cloudquotas.googleapis.com'; then
+    if [ "$BILLING_AUTO_ENABLE_QUOTAS_API" = "1" ]; then
+      log "INFO" "[$billing_id] 第三层：为只读 QuotaInfo 探针启用 cloudquotas.googleapis.com（不创建资源）。"
+      if ! gcloud services enable cloudquotas.googleapis.com --project="$project" --quiet >/dev/null 2>&1; then
+        BILLING_LAYER3_DETAIL="cloudquotas.googleapis.com 无法启用，可能是 IAM/组织策略限制"
+        BILLING_LAYER3_STATE="UNKNOWN"
+        return 0
+      fi
+      sleep 4
+    else
+      BILLING_LAYER3_DETAIL="Cloud Quotas API 未启用；BILLING_AUTO_ENABLE_QUOTAS_API=0"
+      BILLING_LAYER3_STATE="UNKNOWN"
+      return 0
+    fi
+  fi
+
+  local quota_file=""
+  quota_file=$(mktemp 2>/dev/null || echo "/tmp/miao-quota-${project}-$$.json")
+  local quota_err="${quota_file}.err"
+
+  if ! gcloud beta quotas info list \
+      --project="$project" \
+      --service="$BILLING_PROBE_SERVICE" \
+      --format=json \
+      --quiet >"$quota_file" 2>"$quota_err"; then
+    local err_text
+    err_text=$(tr '\n' ' ' < "$quota_err" 2>/dev/null | cut -c1-650 || true)
+
+    # If Google ever exposes an explicit Free Trial restriction in this read-only
+    # path, recognize it. We deliberately do not infer FREE from generic 403/429.
+    if echo "$err_text" | grep -qiE 'free[ -]?trial|trial billing|non[- ]?billable free'; then
+      BILLING_LAYER3_DETAIL="Cloud Quotas 明确返回 Free Trial 限制: ${err_text}"
+      rm -f "$quota_file" "$quota_err" 2>/dev/null || true
+      BILLING_LAYER3_STATE="FREE_TRIAL"
+      return 0
+    fi
+
+    BILLING_LAYER3_DETAIL="Cloud Quotas 读取失败: ${err_text:-unknown error}"
+    rm -f "$quota_file" "$quota_err" 2>/dev/null || true
+    BILLING_LAYER3_STATE="UNKNOWN"
+    return 0
+  fi
+
+  rm -f "$quota_err" 2>/dev/null || true
+
+  local stats=""
+  stats=$(billing_parse_quota_json "$quota_file" 2>/dev/null || true)
+  rm -f "$quota_file" 2>/dev/null || true
+
+  if [ -z "$stats" ]; then
+    BILLING_LAYER3_DETAIL="无法解析 QuotaInfo JSON"
+    BILLING_LAYER3_STATE="UNKNOWN"
+    return 0
+  fi
+
+  local observed adjustable eligible reasons samples
+  IFS=$'\t' read -r observed adjustable eligible reasons samples <<< "$stats"
+  observed=${observed:-0}
+  adjustable=${adjustable:-0}
+  eligible=${eligible:-0}
+  reasons=${reasons:-NONE}
+
+  BILLING_LAYER3_DETAIL="service=${BILLING_PROBE_SERVICE}; observed=${observed}; adjustable=${adjustable}; eligible=${eligible}; ineligible=${reasons}${samples:+; eligible_samples=${samples}}"
+
+  # Official Free Trial documentation says a non-billable Free Trial account
+  # cannot request a quota increase. Therefore seeing at least one quota with
+  # isEligible=true is a strong automatic PAID signal.
+  if [[ "$eligible" =~ ^[0-9]+$ ]] && [ "$eligible" -gt 0 ]; then
+    billing_mark_paid_cached "$billing_id"
+    BILLING_LAYER3_STATE="PAID"
+    return 0
+  fi
+
+  # Important: no eligible quota is NOT enough to call the account Free Trial.
+  # Paid accounts can return NOT_ENOUGH_USAGE_HISTORY / NOT_SUPPORTED / OTHER.
+  BILLING_LAYER3_STATE="UNKNOWN"
+  return 0
+}
+
+billing_manual_unknown_gate() {
+  local billing_id="$1"
+  local display_name="$2"
+  local detail="$3"
+
   while true; do
-    echo -e "\n${CYAN}${BOLD}====== Billing 第二层：Free Trial / Paid 核验 ======${NC}" >&2
+    echo -e "\n${CYAN}${BOLD}====== Billing 第三层：自动结果 UNKNOWN ======${NC}" >&2
     echo -e "结算账户 : ${GREEN}${display_name}${NC}" >&2
     echo -e "Billing ID : ${billing_id}" >&2
+    echo -e "探针详情   : ${detail:-无}" >&2
     echo >&2
-    echo -e "Cloud Billing API 只能确认 open=true，不能可靠返回 Free Trial / Paid。" >&2
-    echo -e "请打开 Google 官方 Billing Overview：" >&2
-    echo -e "${CYAN}👉 https://console.cloud.google.com/billing/overview${NC}" >&2
-    echo -e "然后选择 Billing Account: ${billing_id}" >&2
+    echo -e "Google 的公开 BillingAccount API 没有 Free Trial/Paid 字段；" >&2
+    echo -e "QuotaInfo 只有在出现 isEligible=true 时才能可靠证明 Paid。" >&2
     echo >&2
-    echo -e "页面会明确显示：" >&2
-    echo -e "  ${GREEN}1.${NC} Paid account        - 已升级，可继续" >&2
-    echo -e "  ${YELLOW}2.${NC} Free trial account  - 免费试用，需要升级" >&2
-    echo -e "  ${RED}0.${NC} 取消执行" >&2
+    echo -e "你不必进入 Billing Overview。打开任意 Google Cloud Console 页面看顶部即可：" >&2
+    echo -e "${CYAN}👉 https://console.cloud.google.com/welcome${NC}" >&2
+    echo >&2
+    echo -e "  ${YELLOW}1.${NC} 顶部显示 ${BOLD}Free trial status / 免费试用状态${NC}，并有 ${BOLD}Activate / 激活${NC}" >&2
+    echo -e "     → 明确按 FREE_TRIAL 处理，脚本给升级入口并停止后续创建。" >&2
+    echo -e "  ${GREEN}2.${NC} 我已经点击 Activate，或已确认当前是 Paid account" >&2
+    echo -e "     → 记录 Paid 确认缓存并继续。" >&2
+    echo -e "  ${CYAN}3.${NC} 重新运行三层自动探针" >&2
+    echo -e "  ${RED}0.${NC} 无法判断，安全退出本次操作" >&2
 
-    local status_choice
-    read -r -p "请输入页面实际显示的状态 [1/2/0]: " status_choice < /dev/tty
+    local choice
+    read -r -p "请选择 [1/2/3/0]: " choice < /dev/tty
 
-    case "$status_choice" in
+    case "$choice" in
       1)
-        billing_mark_paid_cached "$billing_id"
-        log "SUCCESS" "[$billing_id] 已确认 Billing Overview 显示 Paid account。"
-        return 0
-        ;;
-      2)
         billing_remove_paid_cache "$billing_id"
         show_billing_upgrade_links "$billing_id"
         echo >&2
-        read -r -p "请在浏览器完成升级。升级完成后按回车重新核验；输入 q 取消: " upgrade_done < /dev/tty
-        if [[ "$upgrade_done" =~ ^[Qq]$ ]]; then
-          log "WARN" "用户取消：Billing 尚未确认升级为 Paid account。"
+        local done_choice
+        read -r -p "完成 Activate 后按回车继续复检；输入 q 取消: " done_choice < /dev/tty
+        if [[ "$done_choice" =~ ^[Qq]$ ]]; then
           return 1
         fi
-        # Layer 1 is rechecked after the user returns from the upgrade page.
-        local is_open
-        is_open=$(gcloud billing accounts describe "$billing_id" --format='value(open)' 2>/dev/null || echo "False")
-        if [ "$is_open" != "True" ] && [ "$is_open" != "true" ]; then
-          log "ERROR" "[$billing_id] 升级后 Billing Account 当前不是 open=true，请检查 Billing 控制台。"
+
+        local open_after
+        open_after=$(gcloud billing accounts describe "$billing_id" --format='value(open)' 2>/dev/null || echo "False")
+        if [ "$open_after" != "True" ] && [ "$open_after" != "true" ]; then
+          log "ERROR" "[$billing_id] Activate 后第一层复检不是 open=true。"
           return 1
         fi
-        log "INFO" "[$billing_id] 第一层复检仍为 open=true；请再次查看 Billing Overview 的 Free/Paid 状态。"
+
+        echo -e "\n${CYAN}请看同一个 Cloud Console 页面顶部：${NC}" >&2
+        echo -e "若 ${YELLOW}Free trial status + Activate${NC} 已消失，并且刚才确认弹窗已成功激活，" >&2
+        echo -e "即可把该 Billing Account 记录为 Paid。" >&2
+        local activated
+        read -r -p "确认刚才 Activate 已成功完成？[y/N]: " activated < /dev/tty
+        if [[ "$activated" =~ ^[Yy]$ ]]; then
+          billing_mark_paid_cached "$billing_id"
+          log "SUCCESS" "[$billing_id] 已记录人工 Activate 成功确认。"
+          return 0
+        fi
+        ;;
+      2)
+        billing_mark_paid_cached "$billing_id"
+        log "SUCCESS" "[$billing_id] 已记录 Paid/Activate 人工确认。"
+        return 0
+        ;;
+      3)
+        return 2
         ;;
       0|q|Q)
-        log "WARN" "已取消 Billing Paid 核验。"
+        log "WARN" "[$billing_id] 无法确认 Paid，为避免误操作已停止。"
         return 1
         ;;
       *)
-        log "WARN" "无效选择，请输入 1、2 或 0。"
+        log "WARN" "无效选择，请输入 1、2、3 或 0。"
         ;;
     esac
   done
 }
 
+verify_billing_three_layers() {
+  local billing_name="$1"
+  local display_name="$2"
+  local currency_code="$3"
+  local billing_id="${billing_name#billingAccounts/}"
+
+  # ---------- Layer 1 ----------
+  local cli_open
+  cli_open=$(gcloud billing accounts describe "$billing_id" --format='value(open)' 2>/dev/null || echo "False")
+  if [ "$cli_open" != "True" ] && [ "$cli_open" != "true" ]; then
+    billing_remove_paid_cache "$billing_id"
+    log "ERROR" "[$billing_id] 第一层失败: open=false"
+    return 1
+  fi
+  log "SUCCESS" "[$billing_id] 第一层通过: open=true | ${display_name:-Unknown} | ${currency_code:-Unknown}"
+
+  # ---------- Layer 2 ----------
+  local rest_rc=0
+  billing_layer2_rest_probe "$billing_name" || rest_rc=$?
+  if [ "$rest_rc" -eq 1 ]; then
+    billing_remove_paid_cache "$billing_id"
+    return 1
+  fi
+
+  local probe_project=""
+  probe_project=$(billing_find_probe_project "$billing_id" || true)
+  if [ -n "$probe_project" ]; then
+    log "SUCCESS" "[$billing_id] 第二层项目绑定通过: ${probe_project} -> billingEnabled=true"
+  else
+    log "WARN" "[$billing_id] 第二层：没有找到可见的 billingEnabled 项目，无法使用项目级 QuotaInfo 自动证明 Paid。"
+  fi
+
+  # A previously confirmed Paid account can't become a Free Trial account again;
+  # it can only later become closed/suspended, which Layer 1 catches.
+  if billing_paid_is_cached "$billing_id"; then
+    log "SUCCESS" "[$billing_id] 第三层：命中 Paid 确认缓存，三层 Guard 通过。"
+    return 0
+  fi
+
+  # ---------- Layer 3 ----------
+  local loop_guard=0
+  while [ "$loop_guard" -lt 3 ]; do
+    loop_guard=$((loop_guard + 1))
+    local state
+    BILLING_LAYER3_STATE="UNKNOWN"
+    BILLING_LAYER3_DETAIL=""
+    billing_layer3_quota_probe "$billing_id" "$probe_project"
+    state="$BILLING_LAYER3_STATE"
+
+    case "$state" in
+      PAID)
+        log "SUCCESS" "[$billing_id] 第三层自动判定: PAID"
+        log "INFO" "[$billing_id] 第三层依据: ${BILLING_LAYER3_DETAIL}"
+        return 0
+        ;;
+      FREE_TRIAL)
+        billing_remove_paid_cache "$billing_id"
+        log "WARN" "[$billing_id] 第三层明确命中 Free Trial 限制。"
+        log "INFO" "[$billing_id] 第三层依据: ${BILLING_LAYER3_DETAIL}"
+        show_billing_upgrade_links "$billing_id"
+        return 1
+        ;;
+      UNKNOWN|*)
+        log "WARN" "[$billing_id] 第三层自动判定: UNKNOWN"
+        log "INFO" "[$billing_id] 第三层依据: ${BILLING_LAYER3_DETAIL}"
+        local gate_rc=0
+        billing_manual_unknown_gate "$billing_id" "$display_name" "$BILLING_LAYER3_DETAIL" || gate_rc=$?
+        if [ "$gate_rc" -eq 0 ]; then
+          return 0
+        elif [ "$gate_rc" -eq 2 ]; then
+          # Re-run the automatic Layer 3 probe.
+          continue
+        else
+          return 1
+        fi
+        ;;
+    esac
+  done
+
+  log "WARN" "[$billing_id] 三层自动复检多次仍无法确认 Paid，安全停止。"
+  return 1
+}
+
 prompt_upgrade_billing() {
-  log "INFO" "Billing 第一层：正在检查当前账号可见的结算账户和 open 状态..."
+  log "INFO" "Billing v6.2 三层检测：正在扫描当前账号可见的结算账户..."
 
   local billing_raw
   billing_raw=$(gcloud billing accounts list \
@@ -328,12 +717,13 @@ prompt_upgrade_billing() {
 
   if [ -z "$billing_raw" ]; then
     echo -e "\n${RED}${BOLD}❌ 没有检测到当前账号可见的 Cloud Billing Account。${NC}" >&2
-    echo -e "请先打开：${CYAN}https://console.cloud.google.com/billing${NC}" >&2
+    echo -e "${CYAN}👉 https://console.cloud.google.com/billing${NC}" >&2
     return 1
   fi
 
   local open_names=()
   local open_displays=()
+  local open_currencies=()
   local open_count=0
   local closed_count=0
 
@@ -348,36 +738,50 @@ prompt_upgrade_billing() {
     if [ "$is_open" = "True" ] || [ "$is_open" = "true" ]; then
       open_names+=("$billing_name")
       open_displays+=("${display_name:-Unknown}")
+      open_currencies+=("${currency_code:-Unknown}")
       open_count=$((open_count + 1))
-      log "SUCCESS" "[$billing_id] 第一层通过: open=true | ${display_name:-Unknown} | ${currency_code:-Unknown}"
+      log "SUCCESS" "[$billing_id] 扫描结果: open=true | ${display_name:-Unknown} | ${currency_code:-Unknown}"
     else
       closed_count=$((closed_count + 1))
       billing_remove_paid_cache "$billing_id"
-      log "WARN" "[$billing_id] 第一层失败: open=false | ${display_name:-Unknown}"
+      log "WARN" "[$billing_id] 扫描结果: open=false | ${display_name:-Unknown}"
     fi
   done <<< "$billing_raw"
 
   if [ "$open_count" -eq 0 ]; then
     echo -e "\n${RED}${BOLD}❌ 找到了 Billing Account，但没有任何账户是 open=true。${NC}" >&2
-    echo -e "请检查 Billing 页面：${CYAN}https://console.cloud.google.com/billing${NC}" >&2
+    echo -e "${CYAN}👉 https://console.cloud.google.com/billing${NC}" >&2
     return 1
   fi
 
-  echo -e "\n${GREEN}${BOLD}✅ Billing 第一层通过：${open_count} 个 open=true${NC}" >&2
+  echo -e "\n${GREEN}${BOLD}✅ 第一层扫描：${open_count} 个 Billing Account 为 open=true${NC}" >&2
   if [ "$closed_count" -gt 0 ]; then
     echo -e "${YELLOW}另外发现 ${closed_count} 个 closed Billing Account，已忽略。${NC}" >&2
   fi
 
-  # Layer 2: verify every open billing account visible to this script. This is
-  # intentional because several menu modes can later select/process any of them.
   local idx
   for idx in "${!open_names[@]}"; do
-    verify_paid_status_in_console "${open_names[$idx]}" "${open_displays[$idx]}" || return 1
+    echo -e "\n${CYAN}${BOLD}──── 三层检测 $((idx + 1))/${#open_names[@]} ────${NC}" >&2
+    verify_billing_three_layers \
+      "${open_names[$idx]}" \
+      "${open_displays[$idx]}" \
+      "${open_currencies[$idx]}" || return 1
   done
 
-  echo -e "\n${GREEN}${BOLD}✅ 双层 Billing Guard 已通过：所有 open Billing Account 均已确认 Paid。${NC}\n" >&2
+  echo -e "\n${GREEN}${BOLD}✅ v6.2 三层 Billing Guard 通过：所有待使用的 open Billing Account 均已确认/高可信判定 Paid。${NC}\n" >&2
   return 0
 }
+
+billing_diagnostics_only() {
+  echo -e "\n${CYAN}${BOLD}====== v${VERSION} Billing 三层诊断（不会创建项目/VM/Key） ======${NC}" >&2
+  if prompt_upgrade_billing; then
+    echo -e "${GREEN}${BOLD}诊断结果：PASS / PAID${NC}" >&2
+    return 0
+  fi
+  echo -e "${YELLOW}${BOLD}诊断结果：未通过 Paid Guard（Free Trial / Unknown / Closed / 无 Billing）。${NC}" >&2
+  return 1
+}
+
 
 # ===== Project name/id =====
 new_project_name() {
@@ -1714,6 +2118,7 @@ show_menu() {
   echo "7. [重置] 删光账单关联项目 -> 每账单建1提1 Gemini key"
   echo "8. [新增] 给现有项目补齐 2026-08 最新 Agent Platform API"
   echo "9. 查看本版默认启用的 API 清单"
+  echo "10. [诊断] 只运行 Billing v6.2 三层检测"
   echo "0. 退出"
 
   local choice
@@ -1757,6 +2162,9 @@ show_menu() {
       ;;
     9)
       show_api_catalog
+      ;;
+    10)
+      check_env && billing_diagnostics_only
       ;;
     0)
       exit 0
