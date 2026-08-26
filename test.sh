@@ -1,6 +1,6 @@
 
 # GCP API Key Manager - Vertex AI + Gemini API + Gemini Enterprise Agent Platform
-# Version: 6.0.0 (2026-08-26)
+# Version: 6.1.0 (2026-08-26)
 # Changes:
 #   - Add GA Agent Identity API + Agent Identity Credentials API
 #   - Add Cloud DNS required by the current Agent Platform full-suite docs
@@ -8,6 +8,8 @@
 #   - Legacy iamconnectors is no longer required by default; optional compatibility switch remains
 #   - Exact API readiness verification and quota-aware exponential backoff
 #   - Authorization-key detection uses bound service account metadata first, prefix only as fallback
+#   - Add two-layer Billing Guard: API open-state check + console Paid/Free Trial confirmation
+#   - Free Trial path prints official Billing Overview and Welcome/Activate upgrade links
 
 set -Euo pipefail
 
@@ -20,7 +22,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== Global config =====
-VERSION="6.0.0"
+VERSION="6.1.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-4}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -29,6 +31,7 @@ API_READY_MAX_ATTEMPTS="${API_READY_MAX_ATTEMPTS:-30}"
 API_READY_SLEEP="${API_READY_SLEEP:-8}"
 API_BATCH_SIZE="${API_BATCH_SIZE:-8}"
 ENABLE_LEGACY_IAM_CONNECTORS="${ENABLE_LEGACY_IAM_CONNECTORS:-0}"
+BILLING_PAID_CACHE="${BILLING_PAID_CACHE:-$HOME/.miaojiang_paid_billing.cache}"
 
 rm -f "$CACHE_FILE" 2>/dev/null || true
 
@@ -187,25 +190,193 @@ mask_key() {
   fi
 }
 
-# ===== Billing check =====
-prompt_upgrade_billing() {
-  log "INFO" "正在调用 Cloud Billing，检查当前账号可见的活动结算账户..."
-  local active_billing
-  active_billing=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1 || true)
+# ===== Billing check: two-layer guard =====
+# Google Cloud Billing API exposes whether an account is open, but does not expose
+# the Console billable status ("Free trial account" vs "Paid account") as a public
+# BillingAccount field. Therefore:
+#   Layer 1: automatically verify the Billing Account exists and open=true.
+#   Layer 2: require Console confirmation of Paid/Free Trial status.
+# If Free Trial is selected, print the official upgrade page and block execution
+# until the user upgrades and confirms "Paid account" in Billing Overview.
 
-  if [ -n "$active_billing" ]; then
-    local is_open
-    is_open=$(gcloud billing accounts describe "$active_billing" --format='value(open)' 2>/dev/null || echo "False")
-    if [ "$is_open" = "True" ] || [ "$is_open" = "true" ]; then
-      echo -e "\n${GREEN}${BOLD}✅ 检测到活动结算账户，可继续执行。${NC}\n" >&2
-      return 0
-    fi
+billing_cache_key() {
+  local billing_id="$1"
+  local account
+  account=$(gcloud config get-value account 2>/dev/null || echo "unknown")
+  printf '%s|%s\n' "$account" "$billing_id"
+}
+
+billing_paid_is_cached() {
+  local billing_id="$1"
+  local key
+  key=$(billing_cache_key "$billing_id")
+  [ -f "$BILLING_PAID_CACHE" ] && grep -Fqx -- "$key" "$BILLING_PAID_CACHE" 2>/dev/null
+}
+
+billing_mark_paid_cached() {
+  local billing_id="$1"
+  local key
+  key=$(billing_cache_key "$billing_id")
+  mkdir -p "$(dirname "$BILLING_PAID_CACHE")" 2>/dev/null || true
+  touch "$BILLING_PAID_CACHE" 2>/dev/null || true
+  if ! grep -Fqx -- "$key" "$BILLING_PAID_CACHE" 2>/dev/null; then
+    printf '%s\n' "$key" >> "$BILLING_PAID_CACHE"
+  fi
+  chmod 600 "$BILLING_PAID_CACHE" 2>/dev/null || true
+}
+
+billing_remove_paid_cache() {
+  local billing_id="$1"
+  local key tmp
+  key=$(billing_cache_key "$billing_id")
+  [ -f "$BILLING_PAID_CACHE" ] || return 0
+  tmp="${BILLING_PAID_CACHE}.tmp.$$"
+  grep -Fvx -- "$key" "$BILLING_PAID_CACHE" > "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$BILLING_PAID_CACHE" 2>/dev/null || true
+  chmod 600 "$BILLING_PAID_CACHE" 2>/dev/null || true
+}
+
+show_billing_upgrade_links() {
+  local billing_id="$1"
+  echo -e "\n${YELLOW}${BOLD}⚠️ 当前账户仍是 Free Trial：必须先升级为 Paid account 才继续。${NC}" >&2
+  echo -e "${CYAN}Billing Account ID:${NC} ${billing_id}" >&2
+  echo >&2
+  echo -e "${BOLD}① 查看当前 Free/Paid 状态：${NC}" >&2
+  echo -e "${CYAN}👉 https://console.cloud.google.com/billing/overview${NC}" >&2
+  echo -e "   打开后选择 Billing Account: ${billing_id}" >&2
+  echo >&2
+  echo -e "${BOLD}② 官方升级入口（Welcome 页面）：${NC}" >&2
+  echo -e "${CYAN}👉 https://console.cloud.google.com/welcome${NC}" >&2
+  echo -e "   在页面顶部点击 ${GREEN}${BOLD}Activate / Upgrade / 激活${NC}，并确认升级。" >&2
+  echo >&2
+  echo -e "${YELLOW}升级后，Billing Overview 应显示：${GREEN}${BOLD}Paid account${NC}" >&2
+  echo -e "${YELLOW}如果仍显示 ${BOLD}Free trial account${NC}，不要继续执行本脚本。" >&2
+}
+
+verify_paid_status_in_console() {
+  local billing_name="$1"
+  local billing_id="${billing_name#billingAccounts/}"
+  local display_name="$2"
+
+  # A previous manual Paid confirmation is accepted only while Layer 1 still
+  # confirms that the same Billing Account remains open.
+  if billing_paid_is_cached "$billing_id"; then
+    log "SUCCESS" "[$billing_id] 第二层：已有 Paid account 人工确认缓存，继续执行。"
+    return 0
   fi
 
-  echo -e "\n${YELLOW}${BOLD}⚠️ 未检测到当前账号可用的活动结算账户。${NC}" >&2
-  echo -e "请先在 Google Cloud Billing 页面确认结算账户已激活并且当前账号有权限。" >&2
-  echo -e "${CYAN}👉 https://console.cloud.google.com/billing${NC}" >&2
-  read -r -p "确认后按回车继续..." _ < /dev/tty
+  while true; do
+    echo -e "\n${CYAN}${BOLD}====== Billing 第二层：Free Trial / Paid 核验 ======${NC}" >&2
+    echo -e "结算账户 : ${GREEN}${display_name}${NC}" >&2
+    echo -e "Billing ID : ${billing_id}" >&2
+    echo >&2
+    echo -e "Cloud Billing API 只能确认 open=true，不能可靠返回 Free Trial / Paid。" >&2
+    echo -e "请打开 Google 官方 Billing Overview：" >&2
+    echo -e "${CYAN}👉 https://console.cloud.google.com/billing/overview${NC}" >&2
+    echo -e "然后选择 Billing Account: ${billing_id}" >&2
+    echo >&2
+    echo -e "页面会明确显示：" >&2
+    echo -e "  ${GREEN}1.${NC} Paid account        - 已升级，可继续" >&2
+    echo -e "  ${YELLOW}2.${NC} Free trial account  - 免费试用，需要升级" >&2
+    echo -e "  ${RED}0.${NC} 取消执行" >&2
+
+    local status_choice
+    read -r -p "请输入页面实际显示的状态 [1/2/0]: " status_choice < /dev/tty
+
+    case "$status_choice" in
+      1)
+        billing_mark_paid_cached "$billing_id"
+        log "SUCCESS" "[$billing_id] 已确认 Billing Overview 显示 Paid account。"
+        return 0
+        ;;
+      2)
+        billing_remove_paid_cache "$billing_id"
+        show_billing_upgrade_links "$billing_id"
+        echo >&2
+        read -r -p "请在浏览器完成升级。升级完成后按回车重新核验；输入 q 取消: " upgrade_done < /dev/tty
+        if [[ "$upgrade_done" =~ ^[Qq]$ ]]; then
+          log "WARN" "用户取消：Billing 尚未确认升级为 Paid account。"
+          return 1
+        fi
+        # Layer 1 is rechecked after the user returns from the upgrade page.
+        local is_open
+        is_open=$(gcloud billing accounts describe "$billing_id" --format='value(open)' 2>/dev/null || echo "False")
+        if [ "$is_open" != "True" ] && [ "$is_open" != "true" ]; then
+          log "ERROR" "[$billing_id] 升级后 Billing Account 当前不是 open=true，请检查 Billing 控制台。"
+          return 1
+        fi
+        log "INFO" "[$billing_id] 第一层复检仍为 open=true；请再次查看 Billing Overview 的 Free/Paid 状态。"
+        ;;
+      0|q|Q)
+        log "WARN" "已取消 Billing Paid 核验。"
+        return 1
+        ;;
+      *)
+        log "WARN" "无效选择，请输入 1、2 或 0。"
+        ;;
+    esac
+  done
+}
+
+prompt_upgrade_billing() {
+  log "INFO" "Billing 第一层：正在检查当前账号可见的结算账户和 open 状态..."
+
+  local billing_raw
+  billing_raw=$(gcloud billing accounts list \
+    --format='value(name,displayName,open,currencyCode)' \
+    2>/dev/null || true)
+
+  if [ -z "$billing_raw" ]; then
+    echo -e "\n${RED}${BOLD}❌ 没有检测到当前账号可见的 Cloud Billing Account。${NC}" >&2
+    echo -e "请先打开：${CYAN}https://console.cloud.google.com/billing${NC}" >&2
+    return 1
+  fi
+
+  local open_names=()
+  local open_displays=()
+  local open_count=0
+  local closed_count=0
+
+  while IFS=$'\t' read -r billing_name display_name is_open currency_code; do
+    [ -z "$billing_name" ] && continue
+    billing_name=$(echo "$billing_name" | tr -d '\r')
+    display_name=$(echo "$display_name" | tr -d '\r')
+    is_open=$(echo "$is_open" | tr -d '\r')
+    currency_code=$(echo "$currency_code" | tr -d '\r')
+
+    local billing_id="${billing_name#billingAccounts/}"
+    if [ "$is_open" = "True" ] || [ "$is_open" = "true" ]; then
+      open_names+=("$billing_name")
+      open_displays+=("${display_name:-Unknown}")
+      open_count=$((open_count + 1))
+      log "SUCCESS" "[$billing_id] 第一层通过: open=true | ${display_name:-Unknown} | ${currency_code:-Unknown}"
+    else
+      closed_count=$((closed_count + 1))
+      billing_remove_paid_cache "$billing_id"
+      log "WARN" "[$billing_id] 第一层失败: open=false | ${display_name:-Unknown}"
+    fi
+  done <<< "$billing_raw"
+
+  if [ "$open_count" -eq 0 ]; then
+    echo -e "\n${RED}${BOLD}❌ 找到了 Billing Account，但没有任何账户是 open=true。${NC}" >&2
+    echo -e "请检查 Billing 页面：${CYAN}https://console.cloud.google.com/billing${NC}" >&2
+    return 1
+  fi
+
+  echo -e "\n${GREEN}${BOLD}✅ Billing 第一层通过：${open_count} 个 open=true${NC}" >&2
+  if [ "$closed_count" -gt 0 ]; then
+    echo -e "${YELLOW}另外发现 ${closed_count} 个 closed Billing Account，已忽略。${NC}" >&2
+  fi
+
+  # Layer 2: verify every open billing account visible to this script. This is
+  # intentional because several menu modes can later select/process any of them.
+  local idx
+  for idx in "${!open_names[@]}"; do
+    verify_paid_status_in_console "${open_names[$idx]}" "${open_displays[$idx]}" || return 1
+  done
+
+  echo -e "\n${GREEN}${BOLD}✅ 双层 Billing Guard 已通过：所有 open Billing Account 均已确认 Paid。${NC}\n" >&2
+  return 0
 }
 
 # ===== Project name/id =====
@@ -755,7 +926,7 @@ _select_billing_for_opt6() {
 
 # ===== Options 1/2: Gemini standard keys =====
 gemini_create_projects() {
-  prompt_upgrade_billing
+  prompt_upgrade_billing || return 1
   local keep_billing="${1:-false}"
   local auto_mode="${2:-false}"
 
@@ -871,7 +1042,7 @@ gemini_create_projects() {
 
 # ===== Option 3 =====
 gemini_get_keys_from_existing() {
-  prompt_upgrade_billing
+  prompt_upgrade_billing || return 1
 
   echo -e "\n${CYAN}${BOLD}====== 选项3: 从现有已绑账单项目提取密钥 ======${NC}"
   echo "1. 只提 Vertex Authorization key"
@@ -966,7 +1137,7 @@ gemini_delete_projects() {
 
 # ===== Option 5 =====
 rebuild_and_transfer_billing() {
-  prompt_upgrade_billing
+  prompt_upgrade_billing || return 1
   log "INFO" "====== 选项5: 保护原项目 -> 转移结算 -> 新建2个项目 ======"
 
   local default_project
@@ -1093,7 +1264,7 @@ except Exception:
 
 # ===== Option 6 =====
 option6_handler() {
-  prompt_upgrade_billing
+  prompt_upgrade_billing || return 1
 
   echo -e "\n${CYAN}${BOLD}====== 选项6: 创建项目 + 开全套 API + 提 Vertex/Gemini key ======${NC}"
   echo "1. 单账单自定义数量"
@@ -1360,7 +1531,7 @@ option6_handler() {
 
 # ===== Option 7 =====
 option7_handler() {
-  prompt_upgrade_billing
+  prompt_upgrade_billing || return 1
 
   echo -e "\n${CYAN}${BOLD}====== 选项7: 删除所有账单关联项目 -> 每账单新建1个并提 Gemini key ======${NC}"
   echo -e "${YELLOW}⚠️ 此操作会解绑并删除所有可见活动结算账户下关联的项目。${NC}"
@@ -1458,7 +1629,7 @@ option7_handler() {
 
 # ===== Option 8: New - patch existing projects with the latest API set =====
 option8_enable_latest_apis_existing() {
-  prompt_upgrade_billing
+  prompt_upgrade_billing || return 1
 
   echo -e "\n${CYAN}${BOLD}====== 选项8: 给现有已绑账单项目补齐 2026-08 最新 API ======${NC}"
   echo "1. 当前 gcloud project"
