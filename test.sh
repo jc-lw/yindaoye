@@ -1,17 +1,17 @@
 
-# GCP API Key Manager - Vertex AI + Gemini API + Gemini Enterprise Agent Platform
-# Version: 6.2.0 (2026-08-26)
+# GCP API Key Manager - Agent Platform + Vertex/Gemini + Agent Studio APIs
+# Version: 6.3.0 (2026-08-27)
 # Changes:
-#   - Add GA Agent Identity API + Agent Identity Credentials API
-#   - Add Cloud DNS required by the current Agent Platform full-suite docs
-#   - Add Agent Runtime deployment APIs (Artifact Registry / Cloud Build / Cloud Run / Eventarc / Secret Manager)
-#   - Legacy iamconnectors is no longer required by default; optional compatibility switch remains
-#   - Exact API readiness verification and quota-aware exponential backoff
-#   - Authorization-key detection uses bound service account metadata first, prefix only as fallback
-#   - Replace the old two-layer Billing Guard with v6.2 three-layer detection
-#   - Layer 3 uses read-only Cloud Quotas quotaIncreaseEligibility as a strong Paid signal
-#   - UNKNOWN is never silently treated as Paid or Free; top-bar Activate confirmation is the fallback
-#   - Free Trial/Unknown path prints official Welcome/Activate + Billing + MFA links
+#   - Remove the previous experimental Billing status diagnostic flow
+#   - Keep only a lightweight billing-account open=true precheck; it never guesses Free/Paid
+#   - Enable IAM Connectors API by default because Agent Studio still displays/checks it
+#   - Add App Lifecycle Manager API (saasservicemgmt.googleapis.com)
+#   - Add current App Lifecycle Manager dependency APIs from Google documentation
+#   - Add Security Command Center API (securitycenter.googleapis.com)
+#   - Verify EVERY API requested by this script, not only a 22-API subset
+#   - Automatically re-submit any API that is still missing after the first async submission
+#   - Two-phase multi-project flow: submit project A -> wait 5s -> project B -> ... -> verify/repair -> extract keys
+#   - Exact per-project API summary includes names of any APIs still not enabled
 
 set -Euo pipefail
 
@@ -24,26 +24,23 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== Global config =====
-VERSION="6.2.0"
+VERSION="6.3.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-4}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
-API_READY_MAX_ATTEMPTS="${API_READY_MAX_ATTEMPTS:-30}"
-API_READY_SLEEP="${API_READY_SLEEP:-8}"
 API_BATCH_SIZE="${API_BATCH_SIZE:-8}"
-ENABLE_LEGACY_IAM_CONNECTORS="${ENABLE_LEGACY_IAM_CONNECTORS:-0}"
-BILLING_PAID_CACHE="${BILLING_PAID_CACHE:-$HOME/.miaojiang_paid_billing.cache}"
-BILLING_AUTO_ENABLE_QUOTAS_API="${BILLING_AUTO_ENABLE_QUOTAS_API:-1}"
-BILLING_PROBE_SERVICE="${BILLING_PROBE_SERVICE:-compute.googleapis.com}"
+API_BATCH_GAP="${API_BATCH_GAP:-1}"
+PROJECT_SUBMIT_GAP="${PROJECT_SUBMIT_GAP:-5}"
+API_REPAIR_ROUNDS="${API_REPAIR_ROUNDS:-4}"
+API_REPAIR_SLEEP="${API_REPAIR_SLEEP:-5}"
 
 rm -f "$CACHE_FILE" 2>/dev/null || true
 
 # ===== Current Google Cloud service sets =====
-# Core admin + AI APIs used by this script and Vertex/Gemini.
+# Core admin + AI services.
 CORE_API_SERVICES=(
   "serviceusage.googleapis.com"
-  "cloudquotas.googleapis.com"
   "cloudresourcemanager.googleapis.com"
   "iam.googleapis.com"
   "iamcredentials.googleapis.com"
@@ -57,7 +54,9 @@ CORE_API_SERVICES=(
   "monitoring.googleapis.com"
 )
 
-# Gemini Enterprise Agent Platform full-suite / governance APIs.
+# APIs shown/used by the current Agent Studio / Agent Platform experience.
+# IAM Connectors is legacy for new auth integrations, but Agent Studio can still
+# display it in the "Enable APIs" dialog, so v6.3 enables it by default.
 AGENT_PLATFORM_API_SERVICES=(
   "agentregistry.googleapis.com"
   "agentidentity.googleapis.com"
@@ -65,23 +64,37 @@ AGENT_PLATFORM_API_SERVICES=(
   "apphub.googleapis.com"
   "apptopology.googleapis.com"
   "cloudapiregistry.googleapis.com"
+  "iamconnectors.googleapis.com"
+  "iap.googleapis.com"
   "modelarmor.googleapis.com"
   "networksecurity.googleapis.com"
   "networkservices.googleapis.com"
-  "dns.googleapis.com"
-  "iap.googleapis.com"
+  "notebooks.googleapis.com"
   "observability.googleapis.com"
+  "securitycenter.googleapis.com"
   "telemetry.googleapis.com"
   "cloudtrace.googleapis.com"
-  "notebooks.googleapis.com"
   "texttospeech.googleapis.com"
   "dataform.googleapis.com"
+  "dns.googleapis.com"
+  "saasservicemgmt.googleapis.com"
 )
 
-# Agent Runtime / container deployment and common integration APIs.
-RUNTIME_API_SERVICES=(
+# App Lifecycle Manager dependencies documented by Google.
+# Duplicates already present in CORE/AGENT (storage/apphub/resource-manager/IAM/
+# monitoring/logging) are intentionally not repeated here.
+APP_LIFECYCLE_DEPENDENCY_SERVICES=(
   "artifactregistry.googleapis.com"
   "cloudbuild.googleapis.com"
+  "developerconnect.googleapis.com"
+  "config.googleapis.com"
+  "designcenter.googleapis.com"
+  "cloudasset.googleapis.com"
+  "servicehealth.googleapis.com"
+)
+
+# Agent Runtime / common deployment integrations not already listed above.
+RUNTIME_API_SERVICES=(
   "run.googleapis.com"
   "eventarc.googleapis.com"
   "pubsub.googleapis.com"
@@ -91,48 +104,22 @@ RUNTIME_API_SERVICES=(
   "servicedirectory.googleapis.com"
 )
 
-# Kept because the old script enabled it and some existing projects may still use it.
 COMPAT_API_SERVICES=(
   "dialogflow.googleapis.com"
-)
-
-# Legacy service replaced by Agent Identity. Disabled by default.
-LEGACY_API_SERVICES=(
-  "iamconnectors.googleapis.com"
 )
 
 FULL_API_SERVICES=(
   "${CORE_API_SERVICES[@]}"
   "${AGENT_PLATFORM_API_SERVICES[@]}"
+  "${APP_LIFECYCLE_DEPENDENCY_SERVICES[@]}"
   "${RUNTIME_API_SERVICES[@]}"
   "${COMPAT_API_SERVICES[@]}"
 )
 
-# Critical list used for readiness gating. This intentionally includes the new 2026 APIs.
-VERIFY_API_SERVICES=(
-  "aiplatform.googleapis.com"
-  "generativelanguage.googleapis.com"
-  "discoveryengine.googleapis.com"
-  "agentregistry.googleapis.com"
-  "agentidentity.googleapis.com"
-  "agentidentitycredentials.googleapis.com"
-  "apphub.googleapis.com"
-  "apptopology.googleapis.com"
-  "cloudapiregistry.googleapis.com"
-  "modelarmor.googleapis.com"
-  "networksecurity.googleapis.com"
-  "networkservices.googleapis.com"
-  "dns.googleapis.com"
-  "observability.googleapis.com"
-  "telemetry.googleapis.com"
-  "cloudtrace.googleapis.com"
-  "logging.googleapis.com"
-  "monitoring.googleapis.com"
-  "storage.googleapis.com"
-  "compute.googleapis.com"
-  "artifactregistry.googleapis.com"
-  "cloudbuild.googleapis.com"
-)
+# v6.3 verifies the entire requested set. This is deliberately not a smaller
+# "critical" subset: a project only passes after every requested API is visible
+# in `gcloud services list --enabled`.
+VERIFY_API_SERVICES=("${FULL_API_SERVICES[@]}")
 
 # ===== Logging =====
 log() {
@@ -195,593 +182,40 @@ mask_key() {
   fi
 }
 
-# ===== Billing check: v6.2 three-layer guard =====
-# Official Google Cloud public APIs do NOT expose a direct billableStatus field
-# that says "Free trial account" or "Paid account" on BillingAccount.
-#
-# v6.2 therefore uses three layers:
-#   Layer 1 - Cloud Billing CLI: account exists and open=true.
-#   Layer 2 - Cloud Billing REST + project BillingInfo: cross-check metadata and
-#             verify that at least one linked project has billingEnabled=true
-#             when a linked project is available.
-#   Layer 3 - Cloud Quotas read-only eligibility probe. Google documents that a
-#             non-billable Free Trial account cannot request quota increases.
-#             If an adjustable quota reports quotaIncreaseEligibility.isEligible=true,
-#             that is a strong PAID signal. If all quotas are ineligible, that does
-#             NOT prove Free Trial because Paid accounts can also be ineligible due
-#             to usage history or product-specific policy, so the result is UNKNOWN.
-#
-# No VM/GPU/Marketplace resource is created by this guard. The only optional state
-# change is enabling cloudquotas.googleapis.com on an already-linked probe project;
-# enabling an API itself does not create a billable resource.
-
-billing_cache_key() {
-  local billing_id="$1"
-  local account
-  account=$(gcloud config get-value account 2>/dev/null || echo "unknown")
-  printf '%s|%s\n' "$account" "$billing_id"
-}
-
-billing_paid_is_cached() {
-  local billing_id="$1"
-  local key
-  key=$(billing_cache_key "$billing_id")
-  [ -f "$BILLING_PAID_CACHE" ] && grep -Fqx -- "$key" "$BILLING_PAID_CACHE" 2>/dev/null
-}
-
-billing_mark_paid_cached() {
-  local billing_id="$1"
-  local key
-  key=$(billing_cache_key "$billing_id")
-  mkdir -p "$(dirname "$BILLING_PAID_CACHE")" 2>/dev/null || true
-  touch "$BILLING_PAID_CACHE" 2>/dev/null || true
-  if ! grep -Fqx -- "$key" "$BILLING_PAID_CACHE" 2>/dev/null; then
-    printf '%s\n' "$key" >> "$BILLING_PAID_CACHE"
-  fi
-  chmod 600 "$BILLING_PAID_CACHE" 2>/dev/null || true
-}
-
-billing_remove_paid_cache() {
-  local billing_id="$1"
-  local key tmp
-  key=$(billing_cache_key "$billing_id")
-  [ -f "$BILLING_PAID_CACHE" ] || return 0
-  tmp="${BILLING_PAID_CACHE}.tmp.$$"
-  grep -Fvx -- "$key" "$BILLING_PAID_CACHE" > "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$BILLING_PAID_CACHE" 2>/dev/null || true
-  chmod 600 "$BILLING_PAID_CACHE" 2>/dev/null || true
-}
-
-show_billing_upgrade_links() {
-  local billing_id="$1"
-  echo -e "\n${YELLOW}${BOLD}⚠️ 检测结果未能证明这是 Paid account。若页面顶部显示 Free trial status / 免费试用状态，请先激活完整账号。${NC}" >&2
-  echo -e "${CYAN}Billing Account ID:${NC} ${billing_id}" >&2
-  echo >&2
-  echo -e "${BOLD}① Google 官方 Welcome / Activate 入口：${NC}" >&2
-  echo -e "${CYAN}👉 https://console.cloud.google.com/welcome${NC}" >&2
-  echo -e "   页面顶部如果看到 ${YELLOW}${BOLD}Free trial status / 免费试用状态${NC} 和 ${GREEN}${BOLD}Activate / 激活${NC}，直接点击。" >&2
-  echo >&2
-  echo -e "${BOLD}② Google 官方 Billing 页面：${NC}" >&2
-  echo -e "${CYAN}👉 https://console.cloud.google.com/billing${NC}" >&2
-  echo -e "${CYAN}👉 https://console.cloud.google.com/billing/overview${NC}" >&2
-  echo >&2
-  echo -e "${BOLD}③ 如果 Cloud Console 被 MFA 页面拦截：${NC}" >&2
-  echo -e "${CYAN}👉 https://myaccount.google.com/signinoptions/two-step-verification${NC}" >&2
-  echo -e "   你截图里的 enable-mfa 页面顶部仍可能显示 Free trial 状态和 Activate；看到时可直接点击 Activate。" >&2
-  echo >&2
-  echo -e "${YELLOW}注意：升级 Paid 后，未过期的 Welcome Credit 会继续保留到原到期日。${NC}" >&2
-}
-
-billing_layer2_rest_probe() {
-  local billing_name="$1"
-  local expected_id="${billing_name#billingAccounts/}"
-  local token=""
-  local body_file=""
-  local http_code=""
-
-  if ! command -v curl >/dev/null 2>&1; then
-    log "WARN" "[$expected_id] 第二层：系统缺少 curl，跳过 REST 交叉核验。"
-    return 2
-  fi
-
-  token=$(gcloud auth print-access-token 2>/dev/null || true)
-  if [ -z "$token" ]; then
-    log "WARN" "[$expected_id] 第二层：无法获取 gcloud access token，跳过 REST 交叉核验。"
-    return 2
-  fi
-
-  body_file=$(mktemp 2>/dev/null || echo "/tmp/miao-billing-${expected_id}-$$.json")
-  http_code=$(curl -sS -o "$body_file" -w '%{http_code}' \
-    -H "Authorization: Bearer ${token}" \
-    "https://cloudbilling.googleapis.com/v1/billingAccounts/${expected_id}" 2>/dev/null || echo "000")
-
-  if [ "$http_code" != "200" ]; then
-    local brief
-    brief=$(tr '\n' ' ' < "$body_file" 2>/dev/null | cut -c1-350 || true)
-    rm -f "$body_file" 2>/dev/null || true
-    log "WARN" "[$expected_id] 第二层 REST 返回 HTTP ${http_code}，暂不能交叉核验。${brief:+ $brief}"
-    return 2
-  fi
-
-  local parsed=""
-  if command -v python3 >/dev/null 2>&1; then
-    parsed=$(python3 - "$body_file" <<'PY' 2>/dev/null || true
-import json, sys
-p = sys.argv[1]
-try:
-    with open(p, 'r', encoding='utf-8') as f:
-        d = json.load(f)
-    print("\t".join([
-        str(d.get("name", "")),
-        "true" if d.get("open") is True else "false",
-        str(d.get("displayName", "")),
-        str(d.get("currencyCode", "")),
-        str(d.get("masterBillingAccount", "")),
-        str(d.get("parent", "")),
-    ]))
-except Exception:
-    pass
-PY
-)
-  fi
-
-  rm -f "$body_file" 2>/dev/null || true
-
-  if [ -z "$parsed" ]; then
-    log "SUCCESS" "[$expected_id] 第二层：Cloud Billing REST HTTP 200，官方 API 可读取该 Billing Account。"
-    return 0
-  fi
-
-  local api_name api_open api_display api_currency api_master api_parent
-  IFS=$'\t' read -r api_name api_open api_display api_currency api_master api_parent <<< "$parsed"
-
-  if [ "$api_name" != "billingAccounts/${expected_id}" ]; then
-    log "WARN" "[$expected_id] 第二层：REST 返回的 Billing Account 名称不匹配: ${api_name:-empty}"
-    return 2
-  fi
-
-  if [ "$api_open" != "true" ]; then
-    log "ERROR" "[$expected_id] 第二层：REST 交叉核验显示 open=false。"
-    return 1
-  fi
-
-  log "SUCCESS" "[$expected_id] 第二层 REST 通过: open=true | ${api_display:-Unknown} | ${api_currency:-Unknown}"
-  return 0
-}
-
-billing_find_probe_project() {
-  local billing_id="$1"
-  local projects=""
-  projects=$(gcloud billing projects list \
-    --billing-account="$billing_id" \
-    --format='value(projectId)' 2>/dev/null || true)
-
-  local pid
-  for pid in $projects; do
-    [ -z "$pid" ] && continue
-    local info=""
-    info=$(gcloud billing projects describe "$pid" \
-      --format='value(billingEnabled,billingAccountName)' 2>/dev/null || true)
-    [ -z "$info" ] && continue
-
-    local enabled account_name
-    read -r enabled account_name <<< "$info"
-    if { [ "$enabled" = "True" ] || [ "$enabled" = "true" ]; } && \
-       [ "$account_name" = "billingAccounts/${billing_id}" ]; then
-      printf '%s\n' "$pid"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-billing_layer2_project_binding_probe() {
-  local billing_id="$1"
-  local project=""
-  project=$(billing_find_probe_project "$billing_id" || true)
-
-  if [ -z "$project" ]; then
-    log "WARN" "[$billing_id] 第二层项目绑定检查：未找到可见且 billingEnabled=true 的关联项目；第三层可能无法自动探测。"
-    return 2
-  fi
-
-  log "SUCCESS" "[$billing_id] 第二层项目绑定通过: ${project} -> billingEnabled=true"
-  printf '%s\n' "$project"
-  return 0
-}
-
-billing_parse_quota_json() {
-  local json_file="$1"
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    return 1
-  fi
-
-  python3 - "$json_file" <<'PY'
-import json, sys, collections
-p = sys.argv[1]
-try:
-    with open(p, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-except Exception:
-    print("0\t0\t0\tPARSE_ERROR\t")
-    raise SystemExit(0)
-
-# gcloud --format=json returns an array. Direct REST returns {quotaInfos:[...]};
-# accept both so this parser can survive future implementation changes.
-if isinstance(data, list):
-    infos = data
-elif isinstance(data, dict):
-    infos = data.get("quotaInfos", [])
-else:
-    infos = []
-
-observed = 0
-adjustable = 0
-eligible = 0
-reasons = collections.Counter()
-samples = []
-
-for q in infos:
-    if not isinstance(q, dict):
-        continue
-    observed += 1
-    # A fixed quota can't be adjusted and does not help distinguish Paid/Trial.
-    if q.get("isFixed") is True:
-        continue
-    elig = q.get("quotaIncreaseEligibility")
-    if not isinstance(elig, dict):
-        continue
-    adjustable += 1
-    if elig.get("isEligible") is True:
-        eligible += 1
-        if len(samples) < 5:
-            samples.append(str(q.get("quotaId", q.get("name", "unknown"))))
-    else:
-        reason = str(elig.get("ineligibilityReason", "UNSPECIFIED"))
-        reasons[reason] += 1
-
-reason_text = ",".join(f"{k}:{v}" for k, v in sorted(reasons.items())) or "NONE"
-sample_text = ",".join(samples)
-print(f"{observed}\t{adjustable}\t{eligible}\t{reason_text}\t{sample_text}")
-PY
-}
-
-billing_layer3_quota_probe() {
-  local billing_id="$1"
-  local project="$2"
-
-  BILLING_LAYER3_STATE="UNKNOWN"
-  BILLING_LAYER3_DETAIL=""
-
-  if [ -z "$project" ]; then
-    BILLING_LAYER3_DETAIL="没有可用于 Cloud Quotas 探针的 billingEnabled 项目"
-    BILLING_LAYER3_STATE="UNKNOWN"
-    return 0
-  fi
-
-  if billing_paid_is_cached "$billing_id"; then
-    BILLING_LAYER3_DETAIL="本机已有该 Google 账号 + Billing ID 的 Paid 确认缓存，且第一层仍为 open=true"
-    BILLING_LAYER3_STATE="PAID"
-    return 0
-  fi
-
-  # Cloud Quotas QuotaInfo is read-only. Enable only the Cloud Quotas API if needed.
-  if ! gcloud services list --project="$project" --enabled \
-      --filter='config.name:cloudquotas.googleapis.com' \
-      --format='value(config.name)' 2>/dev/null | grep -Fqx 'cloudquotas.googleapis.com'; then
-    if [ "$BILLING_AUTO_ENABLE_QUOTAS_API" = "1" ]; then
-      log "INFO" "[$billing_id] 第三层：为只读 QuotaInfo 探针启用 cloudquotas.googleapis.com（不创建资源）。"
-      if ! gcloud services enable cloudquotas.googleapis.com --project="$project" --quiet >/dev/null 2>&1; then
-        BILLING_LAYER3_DETAIL="cloudquotas.googleapis.com 无法启用，可能是 IAM/组织策略限制"
-        BILLING_LAYER3_STATE="UNKNOWN"
-        return 0
-      fi
-      sleep 4
-    else
-      BILLING_LAYER3_DETAIL="Cloud Quotas API 未启用；BILLING_AUTO_ENABLE_QUOTAS_API=0"
-      BILLING_LAYER3_STATE="UNKNOWN"
-      return 0
-    fi
-  fi
-
-  local quota_file=""
-  quota_file=$(mktemp 2>/dev/null || echo "/tmp/miao-quota-${project}-$$.json")
-  local quota_err="${quota_file}.err"
-
-  if ! gcloud beta quotas info list \
-      --project="$project" \
-      --service="$BILLING_PROBE_SERVICE" \
-      --format=json \
-      --quiet >"$quota_file" 2>"$quota_err"; then
-    local err_text
-    err_text=$(tr '\n' ' ' < "$quota_err" 2>/dev/null | cut -c1-650 || true)
-
-    # If Google ever exposes an explicit Free Trial restriction in this read-only
-    # path, recognize it. We deliberately do not infer FREE from generic 403/429.
-    if echo "$err_text" | grep -qiE 'free[ -]?trial|trial billing|non[- ]?billable free'; then
-      BILLING_LAYER3_DETAIL="Cloud Quotas 明确返回 Free Trial 限制: ${err_text}"
-      rm -f "$quota_file" "$quota_err" 2>/dev/null || true
-      BILLING_LAYER3_STATE="FREE_TRIAL"
-      return 0
-    fi
-
-    BILLING_LAYER3_DETAIL="Cloud Quotas 读取失败: ${err_text:-unknown error}"
-    rm -f "$quota_file" "$quota_err" 2>/dev/null || true
-    BILLING_LAYER3_STATE="UNKNOWN"
-    return 0
-  fi
-
-  rm -f "$quota_err" 2>/dev/null || true
-
-  local stats=""
-  stats=$(billing_parse_quota_json "$quota_file" 2>/dev/null || true)
-  rm -f "$quota_file" 2>/dev/null || true
-
-  if [ -z "$stats" ]; then
-    BILLING_LAYER3_DETAIL="无法解析 QuotaInfo JSON"
-    BILLING_LAYER3_STATE="UNKNOWN"
-    return 0
-  fi
-
-  local observed adjustable eligible reasons samples
-  IFS=$'\t' read -r observed adjustable eligible reasons samples <<< "$stats"
-  observed=${observed:-0}
-  adjustable=${adjustable:-0}
-  eligible=${eligible:-0}
-  reasons=${reasons:-NONE}
-
-  BILLING_LAYER3_DETAIL="service=${BILLING_PROBE_SERVICE}; observed=${observed}; adjustable=${adjustable}; eligible=${eligible}; ineligible=${reasons}${samples:+; eligible_samples=${samples}}"
-
-  # Official Free Trial documentation says a non-billable Free Trial account
-  # cannot request a quota increase. Therefore seeing at least one quota with
-  # isEligible=true is a strong automatic PAID signal.
-  if [[ "$eligible" =~ ^[0-9]+$ ]] && [ "$eligible" -gt 0 ]; then
-    billing_mark_paid_cached "$billing_id"
-    BILLING_LAYER3_STATE="PAID"
-    return 0
-  fi
-
-  # Important: no eligible quota is NOT enough to call the account Free Trial.
-  # Paid accounts can return NOT_ENOUGH_USAGE_HISTORY / NOT_SUPPORTED / OTHER.
-  BILLING_LAYER3_STATE="UNKNOWN"
-  return 0
-}
-
-billing_manual_unknown_gate() {
-  local billing_id="$1"
-  local display_name="$2"
-  local detail="$3"
-
-  while true; do
-    echo -e "\n${CYAN}${BOLD}====== Billing 第三层：自动结果 UNKNOWN ======${NC}" >&2
-    echo -e "结算账户 : ${GREEN}${display_name}${NC}" >&2
-    echo -e "Billing ID : ${billing_id}" >&2
-    echo -e "探针详情   : ${detail:-无}" >&2
-    echo >&2
-    echo -e "Google 的公开 BillingAccount API 没有 Free Trial/Paid 字段；" >&2
-    echo -e "QuotaInfo 只有在出现 isEligible=true 时才能可靠证明 Paid。" >&2
-    echo >&2
-    echo -e "你不必进入 Billing Overview。打开任意 Google Cloud Console 页面看顶部即可：" >&2
-    echo -e "${CYAN}👉 https://console.cloud.google.com/welcome${NC}" >&2
-    echo >&2
-    echo -e "  ${YELLOW}1.${NC} 顶部显示 ${BOLD}Free trial status / 免费试用状态${NC}，并有 ${BOLD}Activate / 激活${NC}" >&2
-    echo -e "     → 明确按 FREE_TRIAL 处理，脚本给升级入口并停止后续创建。" >&2
-    echo -e "  ${GREEN}2.${NC} 我已经点击 Activate，或已确认当前是 Paid account" >&2
-    echo -e "     → 记录 Paid 确认缓存并继续。" >&2
-    echo -e "  ${CYAN}3.${NC} 重新运行三层自动探针" >&2
-    echo -e "  ${RED}0.${NC} 无法判断，安全退出本次操作" >&2
-
-    local choice
-    read -r -p "请选择 [1/2/3/0]: " choice < /dev/tty
-
-    case "$choice" in
-      1)
-        billing_remove_paid_cache "$billing_id"
-        show_billing_upgrade_links "$billing_id"
-        echo >&2
-        local done_choice
-        read -r -p "完成 Activate 后按回车继续复检；输入 q 取消: " done_choice < /dev/tty
-        if [[ "$done_choice" =~ ^[Qq]$ ]]; then
-          return 1
-        fi
-
-        local open_after
-        open_after=$(gcloud billing accounts describe "$billing_id" --format='value(open)' 2>/dev/null || echo "False")
-        if [ "$open_after" != "True" ] && [ "$open_after" != "true" ]; then
-          log "ERROR" "[$billing_id] Activate 后第一层复检不是 open=true。"
-          return 1
-        fi
-
-        echo -e "\n${CYAN}请看同一个 Cloud Console 页面顶部：${NC}" >&2
-        echo -e "若 ${YELLOW}Free trial status + Activate${NC} 已消失，并且刚才确认弹窗已成功激活，" >&2
-        echo -e "即可把该 Billing Account 记录为 Paid。" >&2
-        local activated
-        read -r -p "确认刚才 Activate 已成功完成？[y/N]: " activated < /dev/tty
-        if [[ "$activated" =~ ^[Yy]$ ]]; then
-          billing_mark_paid_cached "$billing_id"
-          log "SUCCESS" "[$billing_id] 已记录人工 Activate 成功确认。"
-          return 0
-        fi
-        ;;
-      2)
-        billing_mark_paid_cached "$billing_id"
-        log "SUCCESS" "[$billing_id] 已记录 Paid/Activate 人工确认。"
-        return 0
-        ;;
-      3)
-        return 2
-        ;;
-      0|q|Q)
-        log "WARN" "[$billing_id] 无法确认 Paid，为避免误操作已停止。"
-        return 1
-        ;;
-      *)
-        log "WARN" "无效选择，请输入 1、2、3 或 0。"
-        ;;
-    esac
-  done
-}
-
-verify_billing_three_layers() {
-  local billing_name="$1"
-  local display_name="$2"
-  local currency_code="$3"
-  local billing_id="${billing_name#billingAccounts/}"
-
-  # ---------- Layer 1 ----------
-  local cli_open
-  cli_open=$(gcloud billing accounts describe "$billing_id" --format='value(open)' 2>/dev/null || echo "False")
-  if [ "$cli_open" != "True" ] && [ "$cli_open" != "true" ]; then
-    billing_remove_paid_cache "$billing_id"
-    log "ERROR" "[$billing_id] 第一层失败: open=false"
-    return 1
-  fi
-  log "SUCCESS" "[$billing_id] 第一层通过: open=true | ${display_name:-Unknown} | ${currency_code:-Unknown}"
-
-  # ---------- Layer 2 ----------
-  local rest_rc=0
-  billing_layer2_rest_probe "$billing_name" || rest_rc=$?
-  if [ "$rest_rc" -eq 1 ]; then
-    billing_remove_paid_cache "$billing_id"
-    return 1
-  fi
-
-  local probe_project=""
-  probe_project=$(billing_find_probe_project "$billing_id" || true)
-  if [ -n "$probe_project" ]; then
-    log "SUCCESS" "[$billing_id] 第二层项目绑定通过: ${probe_project} -> billingEnabled=true"
-  else
-    log "WARN" "[$billing_id] 第二层：没有找到可见的 billingEnabled 项目，无法使用项目级 QuotaInfo 自动证明 Paid。"
-  fi
-
-  # A previously confirmed Paid account can't become a Free Trial account again;
-  # it can only later become closed/suspended, which Layer 1 catches.
-  if billing_paid_is_cached "$billing_id"; then
-    log "SUCCESS" "[$billing_id] 第三层：命中 Paid 确认缓存，三层 Guard 通过。"
-    return 0
-  fi
-
-  # ---------- Layer 3 ----------
-  local loop_guard=0
-  while [ "$loop_guard" -lt 3 ]; do
-    loop_guard=$((loop_guard + 1))
-    local state
-    BILLING_LAYER3_STATE="UNKNOWN"
-    BILLING_LAYER3_DETAIL=""
-    billing_layer3_quota_probe "$billing_id" "$probe_project"
-    state="$BILLING_LAYER3_STATE"
-
-    case "$state" in
-      PAID)
-        log "SUCCESS" "[$billing_id] 第三层自动判定: PAID"
-        log "INFO" "[$billing_id] 第三层依据: ${BILLING_LAYER3_DETAIL}"
-        return 0
-        ;;
-      FREE_TRIAL)
-        billing_remove_paid_cache "$billing_id"
-        log "WARN" "[$billing_id] 第三层明确命中 Free Trial 限制。"
-        log "INFO" "[$billing_id] 第三层依据: ${BILLING_LAYER3_DETAIL}"
-        show_billing_upgrade_links "$billing_id"
-        return 1
-        ;;
-      UNKNOWN|*)
-        log "WARN" "[$billing_id] 第三层自动判定: UNKNOWN"
-        log "INFO" "[$billing_id] 第三层依据: ${BILLING_LAYER3_DETAIL}"
-        local gate_rc=0
-        billing_manual_unknown_gate "$billing_id" "$display_name" "$BILLING_LAYER3_DETAIL" || gate_rc=$?
-        if [ "$gate_rc" -eq 0 ]; then
-          return 0
-        elif [ "$gate_rc" -eq 2 ]; then
-          # Re-run the automatic Layer 3 probe.
-          continue
-        else
-          return 1
-        fi
-        ;;
-    esac
-  done
-
-  log "WARN" "[$billing_id] 三层自动复检多次仍无法确认 Paid，安全停止。"
-  return 1
-}
-
+# ===== Billing precheck =====
+# v6.3 uses only a lightweight billing-account availability precheck.
+# Google Cloud's public BillingAccount object does not expose a reliable
+# Free-Trial/Paid field, so this script only verifies that at least one billing
+# account visible to the current gcloud identity is open=true. It does not block
+# execution based on a guessed Free/Paid state.
 prompt_upgrade_billing() {
-  log "INFO" "Billing v6.2 三层检测：正在扫描当前账号可见的结算账户..."
+  log "INFO" "正在检查当前账号是否存在 open=true 的 Cloud Billing Account..."
 
   local billing_raw
   billing_raw=$(gcloud billing accounts list \
-    --format='value(name,displayName,open,currencyCode)' \
+    --filter='open=true' \
+    --format='value(name,displayName,currencyCode)' \
     2>/dev/null || true)
 
   if [ -z "$billing_raw" ]; then
-    echo -e "\n${RED}${BOLD}❌ 没有检测到当前账号可见的 Cloud Billing Account。${NC}" >&2
-    echo -e "${CYAN}👉 https://console.cloud.google.com/billing${NC}" >&2
+    echo -e "
+${RED}${BOLD}❌ 未检测到 open=true 的 Cloud Billing Account。${NC}" >&2
+    echo -e "${CYAN}Billing:${NC} https://console.cloud.google.com/billing" >&2
+    echo -e "${CYAN}Welcome / Activate:${NC} https://console.cloud.google.com/welcome" >&2
     return 1
   fi
 
-  local open_names=()
-  local open_displays=()
-  local open_currencies=()
-  local open_count=0
-  local closed_count=0
-
-  while IFS=$'\t' read -r billing_name display_name is_open currency_code; do
+  local count=0
+  local billing_name display_name currency_code
+  while IFS=$'	' read -r billing_name display_name currency_code; do
     [ -z "$billing_name" ] && continue
-    billing_name=$(echo "$billing_name" | tr -d '\r')
-    display_name=$(echo "$display_name" | tr -d '\r')
-    is_open=$(echo "$is_open" | tr -d '\r')
-    currency_code=$(echo "$currency_code" | tr -d '\r')
-
-    local billing_id="${billing_name#billingAccounts/}"
-    if [ "$is_open" = "True" ] || [ "$is_open" = "true" ]; then
-      open_names+=("$billing_name")
-      open_displays+=("${display_name:-Unknown}")
-      open_currencies+=("${currency_code:-Unknown}")
-      open_count=$((open_count + 1))
-      log "SUCCESS" "[$billing_id] 扫描结果: open=true | ${display_name:-Unknown} | ${currency_code:-Unknown}"
-    else
-      closed_count=$((closed_count + 1))
-      billing_remove_paid_cache "$billing_id"
-      log "WARN" "[$billing_id] 扫描结果: open=false | ${display_name:-Unknown}"
-    fi
+    count=$((count + 1))
+    log "SUCCESS" "[${billing_name#billingAccounts/}] Billing open=true | ${display_name:-Unknown} | ${currency_code:-Unknown}"
   done <<< "$billing_raw"
 
-  if [ "$open_count" -eq 0 ]; then
-    echo -e "\n${RED}${BOLD}❌ 找到了 Billing Account，但没有任何账户是 open=true。${NC}" >&2
-    echo -e "${CYAN}👉 https://console.cloud.google.com/billing${NC}" >&2
-    return 1
-  fi
-
-  echo -e "\n${GREEN}${BOLD}✅ 第一层扫描：${open_count} 个 Billing Account 为 open=true${NC}" >&2
-  if [ "$closed_count" -gt 0 ]; then
-    echo -e "${YELLOW}另外发现 ${closed_count} 个 closed Billing Account，已忽略。${NC}" >&2
-  fi
-
-  local idx
-  for idx in "${!open_names[@]}"; do
-    echo -e "\n${CYAN}${BOLD}──── 三层检测 $((idx + 1))/${#open_names[@]} ────${NC}" >&2
-    verify_billing_three_layers \
-      "${open_names[$idx]}" \
-      "${open_displays[$idx]}" \
-      "${open_currencies[$idx]}" || return 1
-  done
-
-  echo -e "\n${GREEN}${BOLD}✅ v6.2 三层 Billing Guard 通过：所有待使用的 open Billing Account 均已确认/高可信判定 Paid。${NC}\n" >&2
+  log "SUCCESS" "Billing 预检通过：${count} 个 open=true。"
   return 0
 }
-
-billing_diagnostics_only() {
-  echo -e "\n${CYAN}${BOLD}====== v${VERSION} Billing 三层诊断（不会创建项目/VM/Key） ======${NC}" >&2
-  if prompt_upgrade_billing; then
-    echo -e "${GREEN}${BOLD}诊断结果：PASS / PAID${NC}" >&2
-    return 0
-  fi
-  echo -e "${YELLOW}${BOLD}诊断结果：未通过 Paid Guard（Free Trial / Unknown / Closed / 无 Billing）。${NC}" >&2
-  return 1
-}
-
 
 # ===== Project name/id =====
 new_project_name() {
@@ -832,12 +266,10 @@ unlink_projects_from_billing_account() {
   done
 }
 
-# ===== API enable engine =====
+# ===== API enable + full verification/repair engine =====
 get_requested_api_services() {
-  printf '%s\n' "${FULL_API_SERVICES[@]}"
-  if [ "$ENABLE_LEGACY_IAM_CONNECTORS" = "1" ]; then
-    printf '%s\n' "${LEGACY_API_SERVICES[@]}"
-  fi
+  printf '%s
+' "${FULL_API_SERVICES[@]}"
 }
 
 enable_api_with_retry() {
@@ -866,7 +298,8 @@ enable_api_with_retry() {
       sleep "$delay"
     else
       local short_out
-      short_out=$(echo "$out" | tail -n 3 | tr '\n' ' ' | cut -c1-500)
+      short_out=$(echo "$out" | tail -n 3 | tr '
+' ' ' | cut -c1-500)
       log "WARN" "[$proj] ${batch_name} 提交失败 (${attempt}/${max_attempts}): ${short_out}"
       sleep $((5 + attempt * 2))
     fi
@@ -886,7 +319,7 @@ enable_single_api_with_retry() {
 
   while [ "$attempt" -le "$max_attempts" ]; do
     if out=$(gcloud services enable "$api" --project="$proj" --async --quiet 2>&1); then
-      log "SUCCESS" "[$proj] 已提交: $api"
+      log "SUCCESS" "[$proj] 已补发: $api"
       return 0
     fi
 
@@ -896,7 +329,8 @@ enable_single_api_with_retry() {
       sleep "$delay"
     else
       local short_out
-      short_out=$(echo "$out" | tail -n 2 | tr '\n' ' ' | cut -c1-400)
+      short_out=$(echo "$out" | tail -n 2 | tr '
+' ' ' | cut -c1-400)
       log "WARN" "[$proj] $api 暂未成功: $short_out"
       sleep $((4 + attempt * 2))
     fi
@@ -906,107 +340,155 @@ enable_single_api_with_retry() {
   return 1
 }
 
-v60_enable_all_services() {
+submit_api_list_batched() {
   local proj="$1"
-  local requested=()
-  local api
+  local label="$2"
+  shift 2
+  local requested=("$@")
 
-  while IFS= read -r api; do
-    [ -n "$api" ] && requested+=("$api")
-  done < <(get_requested_api_services)
-
-  log "INFO" "[$proj] 准备启用 Vertex/Gemini/Agent Platform 全套 API，共 ${#requested[@]} 个"
-  if [ "$ENABLE_LEGACY_IAM_CONNECTORS" = "1" ]; then
-    log "WARN" "[$proj] 已开启兼容模式：同时启用 legacy iamconnectors.googleapis.com"
-  fi
+  [ "${#requested[@]}" -eq 0 ] && return 0
 
   local start=0
   local batch_num=1
   local total=${#requested[@]}
+  local api
+
   while [ "$start" -lt "$total" ]; do
     local batch=("${requested[@]:start:API_BATCH_SIZE}")
-    if ! enable_api_with_retry "$proj" "API批次${batch_num}" "${batch[@]}"; then
-      log "WARN" "[$proj] 批次 ${batch_num} 未整体成功，改为逐个补开，避免单个服务影响整批"
+    if ! enable_api_with_retry "$proj" "${label}-批次${batch_num}" "${batch[@]}"; then
+      log "WARN" "[$proj] ${label}-批次${batch_num} 整包失败，改为逐个补发"
       for api in "${batch[@]}"; do
-        enable_single_api_with_retry "$proj" "$api" || log "ERROR" "[$proj] 最终未能启用: $api"
+        enable_single_api_with_retry "$proj" "$api" || log "ERROR" "[$proj] 最终未能提交: $api"
         sleep 1
       done
     fi
     start=$((start + API_BATCH_SIZE))
     batch_num=$((batch_num + 1))
-    sleep 3
+    if [ "$start" -lt "$total" ]; then
+      sleep "$API_BATCH_GAP"
+    fi
   done
-
-  log "INFO" "[$proj] 所有 API 启用请求已提交，等待后台生效..."
 }
 
-# Backward-compatible function name used by the old script.
+v60_enable_all_services() {
+  local proj="$1"
+  local requested=()
+  local api
+  while IFS= read -r api; do
+    [ -n "$api" ] && requested+=("$api")
+  done < <(get_requested_api_services)
+
+  log "INFO" "[$proj] 准备提交 Agent Studio / Agent Platform 全套 API，共 ${#requested[@]} 个"
+  submit_api_list_batched "$proj" "API" "${requested[@]}"
+  log "INFO" "[$proj] ${#requested[@]} 个 API 的首轮启用请求已全部提交"
+}
+
+# Backward-compatible names used by older branches of this script.
 v27_enable_all_services() {
   v60_enable_all_services "$@"
 }
 
-check_api_ready() {
-  local pid="$1"
-  local stage="$2"
-  log "INFO" "[$pid] ${stage} 正在核验关键 API（包含 Agent Identity / DNS / Runtime）..."
-
-  local attempt=1
-  while [ "$attempt" -le "$API_READY_MAX_ATTEMPTS" ]; do
-    local enabled_list
-    enabled_list=$(gcloud services list --project="$pid" --enabled --format='value(config.name)' 2>/dev/null || true)
-
-    declare -A enabled_map=()
-    local svc
-    while IFS= read -r svc; do
-      [ -n "$svc" ] && enabled_map["$svc"]=1
-    done <<< "$enabled_list"
-
-    local missing=()
-    for svc in "${VERIFY_API_SERVICES[@]}"; do
-      if [ -z "${enabled_map[$svc]+x}" ]; then
-        missing+=("$svc")
-      fi
-    done
-
-    if [ "${#missing[@]}" -eq 0 ]; then
-      log "SUCCESS" "[$pid] ${stage} 核验通过：${#VERIFY_API_SERVICES[@]} 个关键 API 已全部生效"
-      return 0
-    fi
-
-    if [ "$attempt" -eq 1 ] || [ $((attempt % 5)) -eq 0 ]; then
-      log "INFO" "[$pid] 仍有 ${#missing[@]} 个关键 API 等待生效: ${missing[*]}"
-    fi
-
-    sleep "$API_READY_SLEEP"
-    attempt=$((attempt + 1))
-  done
-
-  log "WARN" "[$pid] ${stage} 核验超时。部分 API 可能仍在后台传播，后续流程继续执行。"
-  return 1
-}
-
-show_enabled_api_summary() {
+get_missing_requested_apis() {
   local pid="$1"
   local enabled_list
   enabled_list=$(gcloud services list --project="$pid" --enabled --format='value(config.name)' 2>/dev/null || true)
+
   declare -A enabled_map=()
   local svc
   while IFS= read -r svc; do
     [ -n "$svc" ] && enabled_map["$svc"]=1
   done <<< "$enabled_list"
 
-  local ok=0
-  local miss=0
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
-    if [ -n "${enabled_map[$svc]+x}" ]; then
-      ok=$((ok + 1))
-    else
-      miss=$((miss + 1))
+    if [ -z "${enabled_map[$svc]+x}" ]; then
+      printf '%s
+' "$svc"
     fi
   done < <(get_requested_api_services)
+}
 
-  log "INFO" "[$pid] API 汇总: 已启用 ${ok} | 未确认 ${miss}"
+check_api_ready() {
+  local pid="$1"
+  local stage="$2"
+  local round=1
+  local total
+  total=$(get_requested_api_services | grep -c . || true)
+
+  log "INFO" "[$pid] ${stage} 开始全量核验 ${total} 个 API；缺失项会自动再次发送启用请求"
+
+  while [ "$round" -le "$API_REPAIR_ROUNDS" ]; do
+    local missing=()
+    mapfile -t missing < <(get_missing_requested_apis "$pid")
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+      log "SUCCESS" "[$pid] ${stage} 全量核验通过：${total}/${total} 个 API 已启用"
+      return 0
+    fi
+
+    log "WARN" "[$pid] ${stage} 第 ${round}/${API_REPAIR_ROUNDS} 轮发现 ${#missing[@]} 个未启用 API"
+    local svc
+    for svc in "${missing[@]}"; do
+      echo -e "${YELLOW}  - ${svc}${NC}" >&2
+    done
+
+    submit_api_list_batched "$pid" "补发${round}" "${missing[@]}"
+    log "INFO" "[$pid] 补发完成，等待 ${API_REPAIR_SLEEP}s 后重新核验"
+    sleep "$API_REPAIR_SLEEP"
+    round=$((round + 1))
+  done
+
+  local final_missing=()
+  mapfile -t final_missing < <(get_missing_requested_apis "$pid")
+  if [ "${#final_missing[@]}" -eq 0 ]; then
+    log "SUCCESS" "[$pid] ${stage} 全量核验通过：${total}/${total} 个 API 已启用"
+    return 0
+  fi
+
+  log "ERROR" "[$pid] ${stage} 完成 ${API_REPAIR_ROUNDS} 轮补发后仍有 ${#final_missing[@]} 个 API 未启用"
+  local svc
+  for svc in "${final_missing[@]}"; do
+    echo -e "${RED}  - ${svc}${NC}" >&2
+  done
+  return 1
+}
+
+show_enabled_api_summary() {
+  local pid="$1"
+  local total
+  total=$(get_requested_api_services | grep -c . || true)
+  local missing=()
+  mapfile -t missing < <(get_missing_requested_apis "$pid")
+  local ok=$((total - ${#missing[@]}))
+
+  log "INFO" "[$pid] API 汇总: 已启用 ${ok}/${total} | 未启用 ${#missing[@]}"
+  if [ "${#missing[@]}" -gt 0 ]; then
+    local svc
+    for svc in "${missing[@]}"; do
+      echo -e "${YELLOW}  [MISSING] ${svc}${NC}" >&2
+    done
+  fi
+}
+
+submit_projects_api_phase() {
+  local projects=("$@")
+  local total=${#projects[@]}
+  local idx=0
+  local pid
+
+  [ "$total" -eq 0 ] && return 0
+
+  log "INFO" "====== API 第一阶段：逐项目提交全套 API ======"
+  for pid in "${projects[@]}"; do
+    idx=$((idx + 1))
+    log "INFO" "[提交 ${idx}/${total}] $pid"
+    v60_enable_all_services "$pid"
+    if [ "$idx" -lt "$total" ]; then
+      log "INFO" "[$pid] 本项目提交完成，等待 ${PROJECT_SUBMIT_GAP}s 后提交下一个项目"
+      sleep "$PROJECT_SUBMIT_GAP"
+    fi
+  done
+  log "SUCCESS" "API 第一阶段完成：${total} 个项目均已完成首轮提交"
 }
 
 # ===== Gemini API / AI Studio standard key =====
@@ -1448,7 +930,7 @@ gemini_create_projects() {
 gemini_get_keys_from_existing() {
   prompt_upgrade_billing || return 1
 
-  echo -e "\n${CYAN}${BOLD}====== 选项3: 从现有已绑账单项目提取密钥 ======${NC}"
+  echo -e "\n${CYAN}${BOLD}====== 选项3: 现有项目 -> 全套 API -> 全量复检/补发 -> 提取密钥 ======${NC}"
   echo "1. 只提 Vertex Authorization key"
   echo "2. 只提 Gemini / AI Studio 标准 key"
   echo "3. Vertex + Gemini 双端 key"
@@ -1473,16 +955,20 @@ gemini_get_keys_from_existing() {
     return 1
   fi
 
+  log "INFO" "检测到 ${#valid_projects[@]} 个已绑账单项目。先全部提交 API，再统一核验/补发/提 Key。"
+  submit_projects_api_phase "${valid_projects[@]}"
+
   local VERTEX_KEYS=()
   local AS_KEYS=()
-
   local project_id
+
+  log "INFO" "====== API 第二阶段：全量核验、缺失补发，然后提取 Key ======"
   for project_id in "${valid_projects[@]}"; do
-    log "INFO" "正在处理: $project_id"
+    log "INFO" "正在复检并处理: $project_id"
+
+    check_api_ready "$project_id" "【提Key前】" || true
 
     if [ "$sub_choice" = "1" ] || [ "$sub_choice" = "3" ]; then
-      v60_enable_all_services "$project_id"
-      check_api_ready "$project_id" "【提Key前】" || true
       local v_key
       v_key=$(v27_setup_and_extract_aq_key "$project_id" || true)
       if [ -n "$v_key" ]; then
@@ -1491,7 +977,6 @@ gemini_get_keys_from_existing() {
       else
         log "WARN" "[$project_id] Vertex Authorization key 提取失败"
       fi
-      show_enabled_api_summary "$project_id"
     fi
 
     if [ "$sub_choice" = "2" ] || [ "$sub_choice" = "3" ]; then
@@ -1504,6 +989,10 @@ gemini_get_keys_from_existing() {
         log "WARN" "[$project_id] Gemini key 提取失败"
       fi
     fi
+
+    # Key creation may itself cause service state propagation. Final exact recheck.
+    check_api_ready "$project_id" "【提Key后】" || true
+    show_enabled_api_summary "$project_id"
   done
 
   if [ "${#VERTEX_KEYS[@]}" -gt 0 ]; then
@@ -1712,11 +1201,7 @@ option6_handler() {
 
     sleep 5
     local pid
-    for pid in "${created_pids[@]}"; do
-      v60_enable_all_services "$pid"
-    done
-
-    sleep 12
+    submit_projects_api_phase "${created_pids[@]}"
     for pid in "${created_pids[@]}"; do
       check_api_ready "$pid" "【提Key前】" || true
 
@@ -1734,6 +1219,7 @@ option6_handler() {
         log "SUCCESS" "[$pid] Gemini key: $(mask_key "$a_key")"
       fi
 
+      check_api_ready "$pid" "【提Key后】" || true
       show_enabled_api_summary "$pid"
     done
 
@@ -1747,7 +1233,7 @@ option6_handler() {
     fi
 
   elif [ "$sub_choice" = "2" ]; then
-    log "INFO" "====== 执行 6.2 多账单自动模式 ======"
+    log "INFO" "====== 执行 6.3 多账单自动模式 ======"
 
     local billing_raw
     billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || true)
@@ -1813,10 +1299,7 @@ option6_handler() {
 
         sleep 5
         local pid
-        for pid in "${created_pids[@]}"; do
-          v60_enable_all_services "$pid"
-        done
-        sleep 12
+        submit_projects_api_phase "${created_pids[@]}"
 
         for pid in "${created_pids[@]}"; do
           check_api_ready "$pid" "【提Key前】" || true
@@ -1826,6 +1309,7 @@ option6_handler() {
             VERTEX_KEYS+=("$v_key")
             log "SUCCESS" "[$pid] Vertex key: $(mask_key "$v_key")"
           fi
+          check_api_ready "$pid" "【提Key后】" || true
           show_enabled_api_summary "$pid"
         done
 
@@ -1855,10 +1339,7 @@ option6_handler() {
 
         sleep 5
         local pid
-        for pid in "${created_pids[@]}"; do
-          v60_enable_all_services "$pid"
-        done
-        sleep 12
+        submit_projects_api_phase "${created_pids[@]}"
 
         local v_count=0
         for pid in "${created_pids[@]}"; do
@@ -1874,6 +1355,7 @@ option6_handler() {
             v_count=$((v_count + 1))
             log "SUCCESS" "[$pid] Vertex key: $(mask_key "$v_key")"
           fi
+          check_api_ready "$pid" "【提Key后】" || true
           show_enabled_api_summary "$pid"
         done
 
@@ -2031,11 +1513,12 @@ option7_handler() {
   fi
 }
 
-# ===== Option 8: New - patch existing projects with the latest API set =====
+# ===== Option 8: patch existing projects with the full current API set =====
 option8_enable_latest_apis_existing() {
   prompt_upgrade_billing || return 1
 
-  echo -e "\n${CYAN}${BOLD}====== 选项8: 给现有已绑账单项目补齐 2026-08 最新 API ======${NC}"
+  echo -e "
+${CYAN}${BOLD}====== 选项8: 给现有项目补齐 Agent Studio / Agent Platform 全套 API ======${NC}"
   echo "1. 当前 gcloud project"
   echo "2. 所有已绑定账单的可见项目"
   echo "3. 手动输入 project ID"
@@ -2082,11 +1565,12 @@ option8_enable_latest_apis_existing() {
     return 1
   fi
 
-  log "INFO" "将处理 ${#targets[@]} 个项目"
+  log "INFO" "将处理 ${#targets[@]} 个项目：第一阶段逐项目提交，每个项目之间间隔 ${PROJECT_SUBMIT_GAP}s"
+  submit_projects_api_phase "${targets[@]}"
+
+  log "INFO" "====== 第二阶段：逐项目全量核验，并自动补发缺失 API ======"
   local pid
   for pid in "${targets[@]}"; do
-    log "INFO" "========== 补齐 API: $pid =========="
-    v60_enable_all_services "$pid"
     check_api_ready "$pid" "【补齐API】" || true
     show_enabled_api_summary "$pid"
   done
@@ -2095,15 +1579,15 @@ option8_enable_latest_apis_existing() {
 }
 
 show_api_catalog() {
-  echo -e "\n${CYAN}${BOLD}====== v${VERSION} 默认启用 API (${#FULL_API_SERVICES[@]} 个) ======${NC}"
+  echo -e "\n${CYAN}${BOLD}====== v${VERSION} 默认启用并全量核验的 API (${#FULL_API_SERVICES[@]} 个) ======${NC}"
   local svc
-  for svc in "${CORE_API_SERVICES[@]}"; do echo "[CORE]    $svc"; done
-  for svc in "${AGENT_PLATFORM_API_SERVICES[@]}"; do echo "[AGENT]   $svc"; done
-  for svc in "${RUNTIME_API_SERVICES[@]}"; do echo "[RUNTIME] $svc"; done
-  for svc in "${COMPAT_API_SERVICES[@]}"; do echo "[COMPAT]  $svc"; done
+  for svc in "${CORE_API_SERVICES[@]}"; do echo "[CORE]      $svc"; done
+  for svc in "${AGENT_PLATFORM_API_SERVICES[@]}"; do echo "[AGENT]     $svc"; done
+  for svc in "${APP_LIFECYCLE_DEPENDENCY_SERVICES[@]}"; do echo "[LIFECYCLE] $svc"; done
+  for svc in "${RUNTIME_API_SERVICES[@]}"; do echo "[RUNTIME]   $svc"; done
+  for svc in "${COMPAT_API_SERVICES[@]}"; do echo "[COMPAT]    $svc"; done
   echo
-  echo "Legacy IAM Connectors 默认不开启。需要兼容旧项目时运行："
-  echo "ENABLE_LEGACY_IAM_CONNECTORS=1 bash test.sh"
+  echo "v6.3 会对以上全部 API 做精确核验；发现缺失会自动再次发送 enable 请求。"
 }
 
 # ===== Main menu =====
@@ -2116,9 +1600,8 @@ show_menu() {
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3个 Gemini key"
   echo "6. [完整] 创建项目 -> 开全套最新 API -> 提 Vertex + Gemini key"
   echo "7. [重置] 删光账单关联项目 -> 每账单建1提1 Gemini key"
-  echo "8. [新增] 给现有项目补齐 2026-08 最新 Agent Platform API"
+  echo "8. [补齐] 给现有项目补齐并全量复检 Agent Studio / Agent Platform API"
   echo "9. 查看本版默认启用的 API 清单"
-  echo "10. [诊断] 只运行 Billing v6.2 三层检测"
   echo "0. 退出"
 
   local choice
@@ -2162,9 +1645,6 @@ show_menu() {
       ;;
     9)
       show_api_catalog
-      ;;
-    10)
-      check_env && billing_diagnostics_only
       ;;
     0)
       exit 0
