@@ -1,6 +1,6 @@
 
 # GCP API Key Manager - Agent Platform + Vertex/Gemini + Agent Studio APIs
-# Version: 6.3.2 (2026-08-27)
+# Version: 6.4.2 (2026-08-27)
 # Changes:
 #   - Remove the previous experimental Billing status diagnostic flow
 #   - Billing discovery no longer filters open=true and never blocks on Free/Paid tier
@@ -19,6 +19,11 @@
 #   - Track APIs blocked by closed/non-open Cloud Billing and never resend them in repair loops
 #   - Continue enabling free/available APIs and continue key extraction even when some Cloud APIs are billing-blocked
 #   - Final API summary separates ENABLED / BILLING_BLOCKED / ordinary MISSING
+#   - Fix project-count bug: requested count now means successful project creations, not attempts
+#   - Project-create failures are no longer hidden; Google errors are printed and transient failures retry with a new project ID
+#   - Synchronize exact-count creation engine across options 1/2/5/6/7
+#   - Add option 10: create exactly 2 new projects -> one full API pass -> repair Vertex-required APIs -> extract Vertex keys
+#   - Vertex option reuses exact-count project creation and does not require non-Vertex APIs to pass before key extraction
 
 set -Euo pipefail
 
@@ -31,7 +36,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== Global config =====
-VERSION="6.3.2"
+VERSION="6.4.2"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-4}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -41,6 +46,9 @@ API_BATCH_GAP="${API_BATCH_GAP:-1}"
 PROJECT_SUBMIT_GAP="${PROJECT_SUBMIT_GAP:-5}"
 API_REPAIR_ROUNDS="${API_REPAIR_ROUNDS:-4}"
 API_REPAIR_SLEEP="${API_REPAIR_SLEEP:-5}"
+PROJECT_CREATE_GAP="${PROJECT_CREATE_GAP:-3}"
+PROJECT_CREATE_EXTRA_ATTEMPTS="${PROJECT_CREATE_EXTRA_ATTEMPTS:-6}"
+PROJECT_CREATE_RETRY_BASE="${PROJECT_CREATE_RETRY_BASE:-4}"
 
 rm -f "$CACHE_FILE" 2>/dev/null || true
 
@@ -129,9 +137,38 @@ FULL_API_SERVICES=(
   "${COMPAT_API_SERVICES[@]}"
 )
 
-# v6.3.2 verifies the entire requested set. This is deliberately not a smaller
-# "critical" subset: a project only passes after every requested API is visible
-# in `gcloud services list --enabled`.
+# ===== Key-specific API prerequisites =====
+# Vertex Authorization key workflow used by this script:
+# - Service Usage: scan/enable services
+# - Cloud Resource Manager: project IAM binding used by this script
+# - IAM: create/manage the bound service account
+# - API Keys API: create/manage authorization keys
+# - Vertex AI API: target service for the Vertex authorization key
+VERTEX_KEY_REQUIRED_SERVICES=(
+  "serviceusage.googleapis.com"
+  "cloudresourcemanager.googleapis.com"
+  "iam.googleapis.com"
+  "apikeys.googleapis.com"
+  "aiplatform.googleapis.com"
+)
+
+GEMINI_KEY_REQUIRED_SERVICES=(
+  "serviceusage.googleapis.com"
+  "apikeys.googleapis.com"
+  "generativelanguage.googleapis.com"
+)
+
+BOTH_KEY_REQUIRED_SERVICES=(
+  "serviceusage.googleapis.com"
+  "cloudresourcemanager.googleapis.com"
+  "iam.googleapis.com"
+  "apikeys.googleapis.com"
+  "aiplatform.googleapis.com"
+  "generativelanguage.googleapis.com"
+)
+
+# Full verification remains for option 8 only. Key extraction uses the smaller
+# key-specific prerequisite sets above.
 VERIFY_API_SERVICES=("${FULL_API_SERVICES[@]}")
 
 # ===== Logging =====
@@ -409,6 +446,105 @@ new_project_id() {
   echo "${adj}-${noun}-${num}${suffix}"
 }
 
+# ===== Project creation engine =====
+# Requested project counts are SUCCESS targets, not attempt counts.
+# A failed create does not consume one requested slot. The helper keeps generating
+# a fresh project ID and retries until the target is reached or a hard Google
+# permission/quota/org-policy error makes further attempts pointless.
+is_project_create_hard_error() {
+  local text="${1:-}"
+  echo "$text" | grep -qiE \
+    'PERMISSION_DENIED|permission[[:space:]]+denied|does not have permission|not authorized|organization policy|ORG_POLICY|project creation[^[:alnum:]]*(is )?(disabled|not allowed)|project creation[^[:alnum:]]+.*quota|quota[^[:alnum:]]+.*project creation|project quota[^[:alnum:]]*(has been )?exceeded|quota[^[:alnum:]]+.*projects[^[:alnum:]]+.*exceeded|maximum number of projects|reached[^[:alnum:]]+.*project[^[:alnum:]]+quota|limit[^[:alnum:]]+.*projects[^[:alnum:]]+.*exceeded'
+}
+
+is_project_create_rate_error() {
+  local text="${1:-}"
+  echo "$text" | grep -qiE \
+    '429|RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|rate.?limit|too many requests|operation.*in progress|try again|temporar|backend error|internal error|deadline exceeded|unavailable'
+}
+
+create_projects_exact() {
+  local target="$1"
+  local billing_id="$2"
+  local out_array_name="$3"
+  local context="${4:-项目创建}"
+
+  if ! [[ "$target" =~ ^[0-9]+$ ]] || [ "$target" -lt 1 ]; then
+    log "ERROR" "[$context] 无效项目目标数量: $target"
+    return 1
+  fi
+
+  # Bash 4.3+ (Cloud Shell is newer) nameref lets all menu paths share one engine.
+  local -n out_ref="$out_array_name"
+  out_ref=()
+
+  local success_count=0
+  local attempt_count=0
+  local max_attempts=$((target + PROJECT_CREATE_EXTRA_ATTEMPTS))
+
+  log "INFO" "[$context] 项目成功目标=${target}；最多尝试 ${max_attempts} 次。失败尝试不占用目标数量。"
+
+  while [ "$success_count" -lt "$target" ] && [ "$attempt_count" -lt "$max_attempts" ]; do
+    attempt_count=$((attempt_count + 1))
+
+    local slot=$((success_count + 1))
+    local project_id
+    project_id=$(new_project_id)
+    local project_name
+    project_name=$(new_project_name)
+
+    log "INFO" "[$context] [目标 ${slot}/${target}] 创建尝试 ${attempt_count}/${max_attempts}: ${project_name} [${project_id}]"
+
+    local out=""
+    if out=$(gcloud projects create "$project_id" --name="$project_name" --quiet 2>&1); then
+      success_count=$((success_count + 1))
+      out_ref+=("$project_id")
+      log "SUCCESS" "[$project_id] 项目创建成功 (${success_count}/${target})"
+
+      # The Resource Manager object can need a moment before Billing sees it.
+      if [ -n "$billing_id" ]; then
+        sleep 2
+        link_project_to_billing "$project_id" "$billing_id" || true
+      fi
+
+      if [ "$success_count" -lt "$target" ]; then
+        sleep "$PROJECT_CREATE_GAP"
+      fi
+      continue
+    fi
+
+    local short_out
+    short_out=$(echo "$out" | tail -n 8 | tr '\n' ' ' | cut -c1-1400)
+    log "WARN" "[$project_id] 项目创建失败；本次不会计入 ${target} 个成功目标。Google 返回: ${short_out:-unknown error}"
+
+    if is_project_create_hard_error "$out"; then
+      log "ERROR" "[$context] 检测到项目创建硬限制（权限/组织策略/项目数量配额）。继续换 ID 也无法解决，停止创建。"
+      break
+    fi
+
+    local delay="$PROJECT_CREATE_GAP"
+    if echo "$out" | grep -qiE 'ALREADY_EXISTS|already exists|project ID.*in use'; then
+      delay=1
+      log "INFO" "[$context] Project ID 冲突；立即生成新 ID 重试。"
+    elif is_project_create_rate_error "$out"; then
+      delay=$((PROJECT_CREATE_RETRY_BASE * attempt_count + RANDOM % 4))
+      [ "$delay" -gt 30 ] && delay=30
+      log "WARN" "[$context] Google 暂时性/频率错误，等待 ${delay}s 后补建同一个成功名额。"
+    else
+      log "WARN" "[$context] 未知创建错误，等待 ${delay}s 后使用新 Project ID 重试。"
+    fi
+    sleep "$delay"
+  done
+
+  if [ "$success_count" -eq "$target" ]; then
+    log "SUCCESS" "[$context] 项目创建目标完成：${success_count}/${target}"
+    return 0
+  fi
+
+  log "ERROR" "[$context] 项目创建目标未完成：成功 ${success_count}/${target}，总尝试 ${attempt_count}/${max_attempts}。"
+  return 1
+}
+
 check_env() {
   require_cmd gcloud
 
@@ -581,6 +717,139 @@ submit_api_list_batched() {
       sleep "$API_BATCH_GAP"
     fi
   done
+}
+
+# ===== Key prerequisite scanner / repair engine =====
+get_missing_api_subset() {
+  local pid="$1"
+  shift
+  local services=("$@")
+  local enabled_list
+  enabled_list=$(gcloud services list --project="$pid" --enabled --format='value(config.name)' 2>/dev/null || true)
+
+  declare -A enabled_map=()
+  local svc
+  while IFS= read -r svc; do
+    [ -n "$svc" ] && enabled_map["$svc"]=1
+  done <<< "$enabled_list"
+
+  for svc in "${services[@]}"; do
+    if [ -z "${enabled_map[$svc]+x}" ]; then
+      printf '%s\n' "$svc"
+    fi
+  done
+}
+
+show_api_subset_scan() {
+  local pid="$1"
+  local label="$2"
+  shift 2
+  local services=("$@")
+  local enabled_list
+  enabled_list=$(gcloud services list --project="$pid" --enabled --format='value(config.name)' 2>/dev/null || true)
+
+  declare -A enabled_map=()
+  local svc
+  while IFS= read -r svc; do
+    [ -n "$svc" ] && enabled_map["$svc"]=1
+  done <<< "$enabled_list"
+
+  log "INFO" "[$pid] ${label} 扫描 ${#services[@]} 个必需 API"
+  for svc in "${services[@]}"; do
+    if [ -n "${enabled_map[$svc]+x}" ]; then
+      echo -e "${GREEN}  [ENABLED] ${svc}${NC}" >&2
+    elif is_billing_blocked_api "$pid" "$svc"; then
+      echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
+    else
+      echo -e "${RED}  [MISSING] ${svc}${NC}" >&2
+    fi
+  done
+}
+
+ensure_api_subset() {
+  local pid="$1"
+  local label="$2"
+  shift 2
+  local services=("$@")
+  local round=1
+
+  if project_billing_enabled "$pid"; then
+    clear_billing_blocked_for_project "$pid"
+  fi
+
+  # Scan first, then submit only the missing required APIs.
+  show_api_subset_scan "$pid" "$label" "${services[@]}"
+
+  while [ "$round" -le "$API_REPAIR_ROUNDS" ]; do
+    local missing=()
+    mapfile -t missing < <(get_missing_api_subset "$pid" "${services[@]}")
+    if [ "${#missing[@]}" -eq 0 ]; then
+      log "SUCCESS" "[$pid] ${label} 必需 API 已全部就绪：${#services[@]}/${#services[@]}"
+      return 0
+    fi
+
+    local repairable=()
+    local blocked=()
+    local svc
+    for svc in "${missing[@]}"; do
+      if is_billing_blocked_api "$pid" "$svc"; then
+        blocked+=("$svc")
+      else
+        repairable+=("$svc")
+      fi
+    done
+
+    log "WARN" "[$pid] ${label} 第 ${round}/${API_REPAIR_ROUNDS} 轮：缺失 ${#missing[@]} | 补发 ${#repairable[@]} | Billing阻止 ${#blocked[@]}"
+    for svc in "${blocked[@]}"; do
+      echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
+    done
+    for svc in "${repairable[@]}"; do
+      echo -e "${CYAN}  [REPAIR] ${svc}${NC}" >&2
+    done
+
+    if [ "${#repairable[@]}" -eq 0 ]; then
+      log "ERROR" "[$pid] ${label} 存在必需 API 被 Billing 状态阻止，无法继续该 Key 流程。"
+      return 2
+    fi
+
+    submit_api_list_batched "$pid" "${label}-补发${round}" "${repairable[@]}"
+    sleep "$API_REPAIR_SLEEP"
+    if project_billing_enabled "$pid"; then
+      clear_billing_blocked_for_project "$pid"
+    fi
+    round=$((round + 1))
+  done
+
+  local final_missing=()
+  mapfile -t final_missing < <(get_missing_api_subset "$pid" "${services[@]}")
+  if [ "${#final_missing[@]}" -eq 0 ]; then
+    log "SUCCESS" "[$pid] ${label} 必需 API 已全部就绪：${#services[@]}/${#services[@]}"
+    return 0
+  fi
+  log "ERROR" "[$pid] ${label} 仍有 ${#final_missing[@]} 个必需 API 未启用：${final_missing[*]}"
+  return 1
+}
+
+ensure_vertex_key_apis() {
+  local pid="$1"
+  local label="${2:-Vertex Key}"
+  ensure_api_subset "$pid" "$label" "${VERTEX_KEY_REQUIRED_SERVICES[@]}"
+}
+
+ensure_gemini_key_apis() {
+  local pid="$1"
+  local label="${2:-Gemini Key}"
+  ensure_api_subset "$pid" "$label" "${GEMINI_KEY_REQUIRED_SERVICES[@]}"
+}
+
+show_key_api_summary() {
+  local pid="$1"
+  local mode="${2:-both}"
+  case "$mode" in
+    vertex) show_api_subset_scan "$pid" "Vertex Key 最终状态" "${VERTEX_KEY_REQUIRED_SERVICES[@]}" ;;
+    gemini) show_api_subset_scan "$pid" "Gemini Key 最终状态" "${GEMINI_KEY_REQUIRED_SERVICES[@]}" ;;
+    *) show_api_subset_scan "$pid" "Vertex + Gemini Key 最终状态" "${BOTH_KEY_REQUIRED_SERVICES[@]}" ;;
+  esac
 }
 
 v60_enable_all_services() {
@@ -790,7 +1059,7 @@ submit_projects_api_phase() {
 # ===== Gemini API / AI Studio standard key =====
 _extract_single_project() {
   local pid="$1"
-  retry gcloud services enable generativelanguage.googleapis.com apikeys.googleapis.com --project="$pid" --quiet >/dev/null 2>&1 || true
+  ensure_gemini_key_apis "$pid" "Gemini Key 提取前" || return 1
 
   local target_name
   target_name=$(gcloud services api-keys list --project="$pid" \
@@ -847,6 +1116,31 @@ key_bound_service_account() {
     --format='value(serviceAccountEmail)' 2>/dev/null | tr -d '\r' | xargs || true
 }
 
+key_targets_service() {
+  local project_id="$1"
+  local key_name="$2"
+  local service="$3"
+  local desc
+  desc=$(gcloud services api-keys describe "$key_name" --project="$project_id" --format=json 2>/dev/null || true)
+  [ -z "$desc" ] && return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    KEY_DESC_JSON="$desc" python3 - "$service" <<'PYKEY'
+import json, os, sys
+service = sys.argv[1]
+try:
+    d = json.loads(os.environ.get("KEY_DESC_JSON", ""))
+except Exception:
+    raise SystemExit(1)
+targets = ((d.get("restrictions") or {}).get("apiTargets") or [])
+raise SystemExit(0 if any(isinstance(t, dict) and t.get("service") == service for t in targets) else 1)
+PYKEY
+    return $?
+  fi
+
+  echo "$desc" | grep -Fq "\"service\": \"${service}\""
+}
+
 find_authorization_key_string() {
   local project_id="$1"
   local sa_email="$2"
@@ -867,13 +1161,14 @@ find_authorization_key_string() {
     api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null | tr -d '\r' | xargs || true)
     [ -z "$api_key" ] && continue
 
-    if [ -n "$bound_sa" ] && [ "$bound_sa" = "$sa_email" ]; then
+    if [ -n "$bound_sa" ] && [ "$bound_sa" = "$sa_email" ] && \
+       key_targets_service "$project_id" "$key_name" "aiplatform.googleapis.com"; then
       echo "$api_key"
       return 0
     fi
 
-    # Prefix is kept only as a fallback for older gcloud output formats.
-    if [[ "$api_key" == AQ.* ]]; then
+    # Prefix alone is not enough. It must explicitly target Vertex AI.
+    if [[ "$api_key" == AQ.* ]] && key_targets_service "$project_id" "$key_name" "aiplatform.googleapis.com"; then
       fallback_prefix_key="$api_key"
     fi
   done
@@ -888,45 +1183,46 @@ find_authorization_key_string() {
 
 v27_setup_and_extract_aq_key() {
   local project_id="$1"
+  local api_prechecked="${2:-0}"
   local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
 
-  # Ensure the APIs needed to create/manage authorization keys are ready.
-  retry gcloud services enable \
-    iam.googleapis.com \
-    iamcredentials.googleapis.com \
-    apikeys.googleapis.com \
-    aiplatform.googleapis.com \
-    generativelanguage.googleapis.com \
-    --project="$project_id" --quiet >/dev/null 2>&1 || true
+  # Existing callers keep the built-in prerequisite scan. Dedicated workflows can
+  # pass 1 after they have already run ensure_vertex_key_apis, avoiding a duplicate scan.
+  if [ "$api_prechecked" != "1" ]; then
+    if ! ensure_vertex_key_apis "$project_id" "Vertex Authorization Key 提取前"; then
+      log "ERROR" "[$project_id] Vertex 必需 API 未就绪，跳过 Authorization key 创建。"
+      return 1
+    fi
+  else
+    log "INFO" "[$project_id] Vertex 必需 API 已由外层流程扫描/补齐，直接进入 Authorization key 创建。"
+  fi
 
   if ! gcloud iam service-accounts describe "$sa_email" --project="$project_id" >/dev/null 2>&1; then
-    retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" \
-      --display-name="Vertex Agent SA" \
-      --project="$project_id" \
-      --quiet >/dev/null 2>&1 || true
+    if ! retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" \
+      --display-name="Vertex Authorization Key SA" \
+      --project="$project_id" --quiet >/dev/null 2>&1; then
+      log "ERROR" "[$project_id] 服务账号创建失败: $sa_email"
+      return 1
+    fi
     log "INFO" "[$project_id] 等待服务账号生效..."
     sleep 6
   fi
 
-  # Preserve the old permissions and add the new Agent Identity usage role.
   local roles=(
-    "roles/editor"
-    "roles/aiplatform.admin"
-    "roles/iam.serviceAccountUser"
-    "roles/agentidentity.user"
+    "roles/aiplatform.user"
     "roles/serviceusage.serviceUsageConsumer"
   )
-
   local role
   for role in "${roles[@]}"; do
-    retry gcloud projects add-iam-policy-binding "$project_id" \
-      --member="serviceAccount:${sa_email}" \
-      --role="$role" \
-      --quiet >/dev/null 2>&1 || true
+    if retry gcloud projects add-iam-policy-binding "$project_id" \
+      --member="serviceAccount:${sa_email}" --role="$role" --quiet >/dev/null 2>&1; then
+      log "SUCCESS" "[$project_id] SA 权限确认: $role"
+    else
+      log "WARN" "[$project_id] SA 权限授予失败: $role"
+    fi
   done
 
   sleep 4
-
   local existing_key
   existing_key=$(find_authorization_key_string "$project_id" "$sa_email" || true)
   if [ -n "$existing_key" ]; then
@@ -934,35 +1230,34 @@ v27_setup_and_extract_aq_key() {
     return 0
   fi
 
-  log "INFO" "[$project_id] 正在创建绑定服务账号的 Vertex/Gemini Authorization key..."
+  log "INFO" "[$project_id] 正在创建 Vertex-only Authorization key (aiplatform.googleapis.com)..."
   local attempt=1
   local max_attempts=6
   local create_success=false
   local last_error=""
-
   while [ "$attempt" -le "$max_attempts" ]; do
     if last_error=$(gcloud beta services api-keys create \
       --project="$project_id" \
-      --display-name="Agent Platform Authorization Key" \
+      --display-name="Vertex Authorization Key" \
       --api-target=service=aiplatform.googleapis.com \
-      --api-target=service=generativelanguage.googleapis.com \
-      --service-account="$sa_email" \
-      --quiet 2>&1); then
+      --service-account="$sa_email" --quiet 2>&1); then
       create_success=true
       break
     fi
 
     if echo "$last_error" | grep -qiE '429|RESOURCE_EXHAUSTED|quota|rate.?limit|Mutate requests'; then
       local delay=$((attempt * 12 + RANDOM % 8))
-      log "WARN" "[$project_id] Authorization key 创建遇到配额限制，等待 ${delay}s (${attempt}/${max_attempts})"
+      log "WARN" "[$project_id] Vertex Authorization key 创建遇到配额限制，等待 ${delay}s (${attempt}/${max_attempts})"
       sleep "$delay"
     elif echo "$last_error" | grep -qiE 'disableServiceAccountApiKeyCreation|organization policy|ORG_POLICY|Policy|FAILED_PRECONDITION'; then
-      log "WARN" "[$project_id] 组织策略阻止创建绑定服务账号的 Authorization key。不会自动修改组织安全策略。"
+      log "WARN" "[$project_id] Organization Policy 阻止 Vertex Authorization key 服务账号绑定。"
+      log "WARN" "[$project_id] 约束: constraints/iam.managed.disableServiceAccountApiKeyCreation"
       break
     else
       local short_err
-      short_err=$(echo "$last_error" | tail -n 3 | tr '\n' ' ' | cut -c1-500)
-      log "WARN" "[$project_id] Authorization key 创建暂未成功: $short_err"
+      short_err=$(echo "$last_error" | tail -n 3 | tr '
+' ' ' | cut -c1-600)
+      log "WARN" "[$project_id] Vertex Authorization key 创建暂未成功: $short_err"
       sleep 10
     fi
     attempt=$((attempt + 1))
@@ -978,27 +1273,7 @@ v27_setup_and_extract_aq_key() {
     fi
   fi
 
-  # Compatibility fallback: create a standard API key. It is not equivalent to a bound authorization key.
-  log "WARN" "[$project_id] 无法取得 Authorization key，尝试创建标准 API key 作为兼容回退。"
-  gcloud services api-keys create \
-    --project="$project_id" \
-    --display-name="Fallback API Key" \
-    --api-target=service=generativelanguage.googleapis.com \
-    --quiet >/dev/null 2>&1 || true
-  sleep 3
-
-  local keys_list
-  keys_list=$(gcloud services api-keys list --project="$project_id" --filter="displayName:'Fallback API Key'" --format='value(name)' 2>/dev/null || true)
-  local key_name
-  for key_name in $keys_list; do
-    local api_key
-    api_key=$(gcloud services api-keys get-key-string "$key_name" --format='value(keyString)' 2>/dev/null | tr -d '\r' | xargs || true)
-    if [ -n "$api_key" ]; then
-      echo "$api_key"
-      return 0
-    fi
-  done
-
+  log "ERROR" "[$project_id] 未能创建/取得 Vertex Authorization key；不会用 Gemini 标准 key 冒充 Vertex key。"
   return 1
 }
 
@@ -1190,29 +1465,22 @@ gemini_create_projects() {
     local success=0
     local failed=0
     local skipped=0
-    local i=1
-    while [ "$i" -le "$num_per_billing" ]; do
-      local global_idx=$((billing_idx * num_per_billing + i))
-      local project_id
-      project_id=$(new_project_id)
-      local project_name
-      project_name=$(new_project_name)
+    local created_pids=()
 
-      log "INFO" "[${global_idx}/${total_projects}] 创建项目: ${project_name} [${project_id}]"
-      if ! gcloud projects create "$project_id" --name="$project_name" --quiet >/dev/null 2>&1; then
-        failed=$((failed + 1))
-        i=$((i + 1))
-        continue
-      fi
+    create_projects_exact "$num_per_billing" "$billing_account" created_pids "选项$([ "$keep_billing" = "true" ] && echo 2 || echo 1)-${billing_name}" || true
 
-      link_project_to_billing "$project_id" "$billing_account" || true
+    local created_count=${#created_pids[@]}
+    if [ "$created_count" -lt "$num_per_billing" ]; then
+      failed=$((failed + num_per_billing - created_count))
+    fi
 
+    local project_id
+    for project_id in "${created_pids[@]}"; do
       local billing_info
       billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || true)
       if [ -z "$billing_info" ]; then
-        log "WARN" "[$project_id] 未确认账单绑定，跳过"
+        log "WARN" "[$project_id] 未确认账单绑定；项目已创建，但本轮跳过 Key 提取。"
         skipped=$((skipped + 1))
-        i=$((i + 1))
         continue
       fi
 
@@ -1226,10 +1494,9 @@ gemini_create_projects() {
         log "WARN" "[$project_id] Gemini key 提取失败"
         failed=$((failed + 1))
       fi
-      i=$((i + 1))
     done
 
-    echo -e "${CYAN}  ${billing_name} 小结: 成功 ${success} | 失败 ${failed} | 跳过 ${skipped}${NC}"
+    echo -e "${CYAN}  ${billing_name} 小结: 请求创建 ${num_per_billing} | 实际创建 ${created_count} | Key成功 ${success} | 失败 ${failed} | 跳过 ${skipped}${NC}"
   done
 
   if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
@@ -1246,7 +1513,8 @@ gemini_create_projects() {
 gemini_get_keys_from_existing() {
   prompt_upgrade_billing || return 1
 
-  echo -e "\n${CYAN}${BOLD}====== 选项3: 现有项目 -> 全套 API -> 全量复检/补发 -> 提取密钥 ======${NC}"
+  echo -e "
+${CYAN}${BOLD}====== 选项3: 扫描 Key 必需 API -> 缺失补发 -> 提取密钥 ======${NC}"
   echo "1. 只提 Vertex Authorization key"
   echo "2. 只提 Gemini / AI Studio 标准 key"
   echo "3. Vertex + Gemini 双端 key"
@@ -1271,20 +1539,24 @@ gemini_get_keys_from_existing() {
     return 1
   fi
 
-  log "INFO" "检测到 ${#valid_projects[@]} 个已绑账单项目。先全部提交 API，再统一核验/补发/提 Key。"
-  submit_projects_api_phase "${valid_projects[@]}"
-
+  log "INFO" "检测到 ${#valid_projects[@]} 个项目。提 Key 时只核验所选 Key 的必需 API，其他 Agent/Runtime API 不参与阻断。"
   local VERTEX_KEYS=()
   local AS_KEYS=()
   local project_id
 
-  log "INFO" "====== API 第二阶段：全量核验、缺失补发，然后提取 Key ======"
   for project_id in "${valid_projects[@]}"; do
-    log "INFO" "正在复检并处理: $project_id"
-
-    check_api_ready "$project_id" "【提Key前】" || true
+    log "INFO" "========== Key 前置扫描: $project_id =========="
+    local vertex_ready=0
+    local gemini_ready=0
 
     if [ "$sub_choice" = "1" ] || [ "$sub_choice" = "3" ]; then
+      ensure_vertex_key_apis "$project_id" "Vertex Key" || vertex_ready=$?
+    fi
+    if [ "$sub_choice" = "2" ] || [ "$sub_choice" = "3" ]; then
+      ensure_gemini_key_apis "$project_id" "Gemini Key" || gemini_ready=$?
+    fi
+
+    if { [ "$sub_choice" = "1" ] || [ "$sub_choice" = "3" ]; } && [ "$vertex_ready" -eq 0 ]; then
       local v_key
       v_key=$(v27_setup_and_extract_aq_key "$project_id" || true)
       if [ -n "$v_key" ]; then
@@ -1293,9 +1565,11 @@ gemini_get_keys_from_existing() {
       else
         log "WARN" "[$project_id] Vertex Authorization key 提取失败"
       fi
+    elif [ "$sub_choice" = "1" ] || [ "$sub_choice" = "3" ]; then
+      log "WARN" "[$project_id] Vertex 必需 API 未全部就绪，本项目跳过 Vertex key。"
     fi
 
-    if [ "$sub_choice" = "2" ] || [ "$sub_choice" = "3" ]; then
+    if { [ "$sub_choice" = "2" ] || [ "$sub_choice" = "3" ]; } && [ "$gemini_ready" -eq 0 ]; then
       local a_key
       a_key=$(_extract_single_project "$project_id" || true)
       if [ -n "$a_key" ]; then
@@ -1304,27 +1578,28 @@ gemini_get_keys_from_existing() {
       else
         log "WARN" "[$project_id] Gemini key 提取失败"
       fi
+    elif [ "$sub_choice" = "2" ] || [ "$sub_choice" = "3" ]; then
+      log "WARN" "[$project_id] Gemini 必需 API 未全部就绪，本项目跳过 Gemini key。"
     fi
 
-    # Key creation may itself cause service state propagation. Final exact recheck.
-    check_api_ready "$project_id" "【提Key后】" || true
-    show_enabled_api_summary "$project_id"
+    case "$sub_choice" in
+      1) show_key_api_summary "$project_id" vertex ;;
+      2) show_key_api_summary "$project_id" gemini ;;
+      *) show_key_api_summary "$project_id" both ;;
+    esac
   done
 
   if [ "${#VERTEX_KEYS[@]}" -gt 0 ]; then
-    echo -e "\n${YELLOW}${BOLD}====== Vertex Authorization key 列表 (共 ${#VERTEX_KEYS[@]} 个) ======${NC}"
+    echo -e "
+${YELLOW}${BOLD}====== Vertex Authorization key 列表 (共 ${#VERTEX_KEYS[@]} 个) ======${NC}"
     local k
-    for k in "${VERTEX_KEYS[@]}"; do
-      echo -e "${GREEN}$k${NC}"
-    done
+    for k in "${VERTEX_KEYS[@]}"; do echo -e "${GREEN}$k${NC}"; done
   fi
-
   if [ "${#AS_KEYS[@]}" -gt 0 ]; then
-    echo -e "\n${GREEN}${BOLD}====== Gemini / AI Studio 标准 key 列表 (共 ${#AS_KEYS[@]} 个) ======${NC}"
+    echo -e "
+${GREEN}${BOLD}====== Gemini / AI Studio 标准 key 列表 (共 ${#AS_KEYS[@]} 个) ======${NC}"
     local k
-    for k in "${AS_KEYS[@]}"; do
-      echo -e "${GREEN}$k${NC}"
-    done
+    for k in "${AS_KEYS[@]}"; do echo -e "${GREEN}$k${NC}"; done
     echo
   fi
 }
@@ -1440,24 +1715,19 @@ except Exception:
   fi
 
   log "INFO" "创建 2 个新项目..."
-  local i
-  for i in 1 2; do
-    local pid
-    pid=$(new_project_id)
-    local pname
-    pname=$(new_project_name)
-    log "INFO" "创建: $pname [$pid]"
-    if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-      sleep 3
-      link_project_to_billing "$pid" "$TARGET_BILLING_ID" || true
-      local new_key
-      new_key=$(_extract_single_project "$pid" || true)
-      if [ -n "$new_key" ]; then
-        AS_KEYS+=("$new_key")
-        log "SUCCESS" "[$pid] key 提取成功"
-      fi
+  local created_pids=()
+  create_projects_exact 2 "$TARGET_BILLING_ID" created_pids "选项5" || true
+
+  local pid
+  for pid in "${created_pids[@]}"; do
+    local new_key
+    new_key=$(_extract_single_project "$pid" || true)
+    if [ -n "$new_key" ]; then
+      AS_KEYS+=("$new_key")
+      log "SUCCESS" "[$pid] key 提取成功"
+    else
+      log "WARN" "[$pid] key 提取失败"
     fi
-    sleep 3
   done
 
   if [ "${#AS_KEYS[@]}" -gt 0 ]; then
@@ -1500,41 +1770,40 @@ option6_handler() {
     sleep 5
 
     local created_pids=()
-    local i
-    for ((i = 1; i <= num_projects; i++)); do
-      local pid
-      pid=$(new_project_id)
-      local pname
-      pname=$(new_project_name)
-      log "INFO" "[$i/$num_projects] 创建: ${pname} [${pid}]"
-      if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-        link_project_to_billing "$pid" "$BILLING_ACCOUNT" || true
-        created_pids+=("$pid")
-      fi
-    done
+    create_projects_exact "$num_projects" "$BILLING_ACCOUNT" created_pids "选项6-单账单" || true
 
     sleep 5
     local pid
     submit_projects_api_phase "${created_pids[@]}"
     for pid in "${created_pids[@]}"; do
-      check_api_ready "$pid" "【提Key前】" || true
+      local vertex_ready=0
+      local gemini_ready=0
+      ensure_vertex_key_apis "$pid" "Vertex Key" || vertex_ready=$?
+      ensure_gemini_key_apis "$pid" "Gemini Key" || gemini_ready=$?
 
       local v_key
-      v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+      if [ "$vertex_ready" -eq 0 ]; then
+        v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+      else
+        v_key=""
+      fi
       if [ -n "$v_key" ]; then
         VERTEX_KEYS+=("$v_key")
         log "SUCCESS" "[$pid] Vertex key: $(mask_key "$v_key")"
       fi
 
       local a_key
-      a_key=$(_extract_single_project "$pid" || true)
+      if [ "$gemini_ready" -eq 0 ]; then
+        a_key=$(_extract_single_project "$pid" || true)
+      else
+        a_key=""
+      fi
       if [ -n "$a_key" ]; then
         AS_KEYS_FORMATTED+=("$a_key")
         log "SUCCESS" "[$pid] Gemini key: $(mask_key "$a_key")"
       fi
 
-      check_api_ready "$pid" "【提Key后】" || true
-      show_enabled_api_summary "$pid"
+      show_key_api_summary "$pid" both
     done
 
     if [ "${#AS_KEYS_FORMATTED[@]}" -gt 0 ]; then
@@ -1547,7 +1816,7 @@ option6_handler() {
     fi
 
   elif [ "$sub_choice" = "2" ]; then
-    log "INFO" "====== 执行 6.3.2 多账单自动模式 ======"
+    log "INFO" "====== 执行 6.4.1 多账单自动模式 ======"
 
     local billing_raw
     billing_raw=$(billing_accounts_tsv || true)
@@ -1599,57 +1868,48 @@ option6_handler() {
 
         local created_pids=()
         log "INFO" ">> [账单1] 创建 2 个新项目..."
-        local i
-        for i in 1 2; do
-          local pid
-          pid=$(new_project_id)
-          local pname
-          pname=$(new_project_name)
-          if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-            link_project_to_billing "$pid" "$CURRENT_BILLING" || true
-            created_pids+=("$pid")
-          fi
-        done
+        create_projects_exact 2 "$CURRENT_BILLING" created_pids "选项6-账单1" || true
 
         sleep 5
         local pid
         submit_projects_api_phase "${created_pids[@]}"
 
         for pid in "${created_pids[@]}"; do
-          check_api_ready "$pid" "【提Key前】" || true
+          local vertex_ready=0
+          ensure_vertex_key_apis "$pid" "Vertex Key" || vertex_ready=$?
           local v_key
-          v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+          if [ "$vertex_ready" -eq 0 ]; then
+            v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+          else
+            v_key=""
+          fi
           if [ -n "$v_key" ]; then
             VERTEX_KEYS+=("$v_key")
             log "SUCCESS" "[$pid] Vertex key: $(mask_key "$v_key")"
           fi
-          check_api_ready "$pid" "【提Key后】" || true
-          show_enabled_api_summary "$pid"
+          show_key_api_summary "$pid" vertex
         done
 
         if [ "${#created_pids[@]}" -gt 0 ]; then
           AS_KEYS_FORMATTED+=("新创建项目的key")
           for pid in "${created_pids[@]}"; do
+            local gemini_ready=0
+            ensure_gemini_key_apis "$pid" "Gemini Key" || gemini_ready=$?
             local a_key
-            a_key=$(_extract_single_project "$pid" || true)
+            if [ "$gemini_ready" -eq 0 ]; then
+              a_key=$(_extract_single_project "$pid" || true)
+            else
+              a_key=""
+            fi
             [ -n "$a_key" ] && AS_KEYS_FORMATTED+=("$a_key")
+            show_key_api_summary "$pid" gemini
           done
         fi
 
       else
         local created_pids=()
         log "INFO" ">> [账单$((b_idx + 1))] 创建 3 个新项目..."
-        local i
-        for i in 1 2 3; do
-          local pid
-          pid=$(new_project_id)
-          local pname
-          pname=$(new_project_name)
-          if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-            link_project_to_billing "$pid" "$CURRENT_BILLING" || true
-            created_pids+=("$pid")
-          fi
-        done
+        create_projects_exact 3 "$CURRENT_BILLING" created_pids "选项6-账单$((b_idx + 1))" || true
 
         sleep 5
         local pid
@@ -1658,27 +1918,38 @@ option6_handler() {
         local v_count=0
         for pid in "${created_pids[@]}"; do
           if [ "$v_count" -ge 2 ]; then
-            show_enabled_api_summary "$pid"
+            log "INFO" "[$pid] 本账单 Vertex key 目标已达到 2 个；跳过 Vertex key，稍后只处理 Gemini key。"
             continue
           fi
-          check_api_ready "$pid" "【提Key前】" || true
+          local vertex_ready=0
+          ensure_vertex_key_apis "$pid" "Vertex Key" || vertex_ready=$?
           local v_key
-          v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+          if [ "$vertex_ready" -eq 0 ]; then
+            v_key=$(v27_setup_and_extract_aq_key "$pid" || true)
+          else
+            v_key=""
+          fi
           if [ -n "$v_key" ]; then
             VERTEX_KEYS+=("$v_key")
             v_count=$((v_count + 1))
             log "SUCCESS" "[$pid] Vertex key: $(mask_key "$v_key")"
           fi
-          check_api_ready "$pid" "【提Key后】" || true
-          show_enabled_api_summary "$pid"
+          show_key_api_summary "$pid" vertex
         done
 
         if [ "${#created_pids[@]}" -gt 0 ]; then
           AS_KEYS_FORMATTED+=("新创建项目的key")
           for pid in "${created_pids[@]}"; do
+            local gemini_ready=0
+            ensure_gemini_key_apis "$pid" "Gemini Key" || gemini_ready=$?
             local a_key
-            a_key=$(_extract_single_project "$pid" || true)
+            if [ "$gemini_ready" -eq 0 ]; then
+              a_key=$(_extract_single_project "$pid" || true)
+            else
+              a_key=""
+            fi
             [ -n "$a_key" ] && AS_KEYS_FORMATTED+=("$a_key")
+            show_key_api_summary "$pid" gemini
           done
         fi
       fi
@@ -1784,15 +2055,12 @@ option7_handler() {
     local CURRENT_BNAME="${b_names[$b_idx]}"
     AS_KEYS_FORMATTED+=("【账单: ${CURRENT_BNAME}】")
 
-    local pid
-    pid=$(new_project_id)
-    local pname
-    pname=$(new_project_name)
-    log "INFO" "[$((b_idx + 1))/${#b_ids[@]}] 创建: ${pname} [${pid}]"
+    local created_pids=()
+    create_projects_exact 1 "$CURRENT_BILLING" created_pids "选项7-账单$((b_idx + 1))" || true
 
-    if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-      link_project_to_billing "$pid" "$CURRENT_BILLING" || true
-      sleep 15
+    if [ "${#created_pids[@]}" -gt 0 ]; then
+      local pid="${created_pids[0]}"
+      sleep 10
 
       local a_key
       a_key=$(_extract_single_project "$pid" || true)
@@ -1803,7 +2071,7 @@ option7_handler() {
         log "WARN" "[$pid] Gemini key 提取失败"
       fi
     else
-      log "ERROR" "项目创建失败: $pid"
+      log "ERROR" "[选项7] 该账单未能成功创建目标项目，跳过 Key 提取。"
     fi
   done
 
@@ -1892,16 +2160,119 @@ ${CYAN}${BOLD}====== 选项8: 给现有项目补齐 Agent Studio / Agent Platfor
   log "SUCCESS" "现有项目 API 补齐流程完成"
 }
 
+# ===== Option 10: create exactly two projects, one full API pass, then Vertex-only key path =====
+option10_vertex_two_projects() {
+  prompt_upgrade_billing || return 1
+
+  echo -e "\n${CYAN}${BOLD}====== 选项10: 建2个新项目 -> 全套API首轮 -> Vertex必需API补齐 -> 提Vertex key ======${NC}"
+
+  local billing_id
+  billing_id=$(_select_billing_for_opt6) || {
+    log "ERROR" "选项10：未选择可用于绑定的 Billing Account"
+    return 1
+  }
+  log "INFO" "选项10：使用 Billing Account ${billing_id}"
+
+  local created_pids=()
+  local create_rc=0
+  create_projects_exact 2 "$billing_id" created_pids "选项10-Vertex专项" || create_rc=$?
+
+  if [ "${#created_pids[@]}" -eq 0 ]; then
+    log "ERROR" "选项10：没有成功创建任何项目，流程停止。"
+    return 1
+  fi
+
+  if [ "${#created_pids[@]}" -lt 2 ]; then
+    log "ERROR" "选项10：目标是 2 个新项目，但只成功创建 ${#created_pids[@]} 个。"
+    log "WARN" "已成功创建的项目会保留，但为了避免只返回部分结果，本次不继续全套 API / Vertex key 流程。"
+    return "${create_rc:-1}"
+  fi
+
+  echo -e "\n${GREEN}${BOLD}成功创建 2 个新项目：${NC}"
+  local pid
+  for pid in "${created_pids[@]}"; do
+    echo -e "  ${GREEN}${pid}${NC}"
+  done
+
+  log "INFO" "====== 选项10 第一阶段：两个项目各尝试一轮全套 API ======"
+  submit_projects_api_phase "${created_pids[@]}"
+
+  log "INFO" "====== 选项10 第二阶段：只扫描/补齐 Vertex key 必需 API，然后提取 key ======"
+  local vertex_keys=()
+  local vertex_projects=()
+  local failed_projects=()
+
+  for pid in "${created_pids[@]}"; do
+    echo -e "\n${CYAN}${BOLD}──── Vertex 处理: ${pid} ────${NC}"
+
+    local ready_rc=0
+    ensure_vertex_key_apis "$pid" "Vertex Key 提取前" || ready_rc=$?
+    if [ "$ready_rc" -ne 0 ]; then
+      log "ERROR" "[$pid] Vertex 必需 API 未全部就绪；其他全套 API 状态不影响判断，本项目暂不提 Vertex key。"
+      show_key_api_summary "$pid" vertex
+      failed_projects+=("$pid")
+      continue
+    fi
+
+    local v_key=""
+    v_key=$(v27_setup_and_extract_aq_key "$pid" 1 || true)
+    if [ -n "$v_key" ]; then
+      vertex_keys+=("$v_key")
+      vertex_projects+=("$pid")
+      log "SUCCESS" "[$pid] Vertex Authorization key 提取成功: $(mask_key "$v_key")"
+    else
+      failed_projects+=("$pid")
+      log "ERROR" "[$pid] Vertex Authorization key 提取失败"
+    fi
+
+    show_key_api_summary "$pid" vertex
+  done
+
+  echo -e "\n${YELLOW}${BOLD}====== 选项10 Vertex Authorization key 结果 ======${NC}"
+  if [ "${#vertex_keys[@]}" -gt 0 ]; then
+    local idx
+    for idx in "${!vertex_keys[@]}"; do
+      echo -e "${CYAN}[${vertex_projects[$idx]}]${NC} ${GREEN}${vertex_keys[$idx]}${NC}"
+    done
+  else
+    echo -e "${RED}没有成功提取 Vertex Authorization key。${NC}"
+  fi
+
+  echo -e "\n${CYAN}项目目标: 2 | 已创建: ${#created_pids[@]} | Vertex key 成功: ${#vertex_keys[@]} | 失败: ${#failed_projects[@]}${NC}"
+
+  if [ "${#failed_projects[@]}" -gt 0 ]; then
+    echo -e "${YELLOW}未成功提取 Vertex key 的项目：${failed_projects[*]}${NC}"
+  fi
+
+  if [ "${#vertex_keys[@]}" -eq 2 ]; then
+    log "SUCCESS" "选项10 完成：2 个新项目均完成全套 API 首轮，并成功提取 2 个 Vertex Authorization key。"
+    return 0
+  fi
+
+  log "WARN" "选项10 完成但结果不完整：Vertex key ${#vertex_keys[@]}/2。"
+  return 1
+}
+
 show_api_catalog() {
-  echo -e "\n${CYAN}${BOLD}====== v${VERSION} 默认启用并全量核验的 API (${#FULL_API_SERVICES[@]} 个) ======${NC}"
+  echo -e "
+${CYAN}${BOLD}====== v${VERSION} 首次新项目全套 API (${#FULL_API_SERVICES[@]} 个) ======${NC}"
   local svc
   for svc in "${CORE_API_SERVICES[@]}"; do echo "[CORE]      $svc"; done
   for svc in "${AGENT_PLATFORM_API_SERVICES[@]}"; do echo "[AGENT]     $svc"; done
   for svc in "${APP_LIFECYCLE_DEPENDENCY_SERVICES[@]}"; do echo "[LIFECYCLE] $svc"; done
   for svc in "${RUNTIME_API_SERVICES[@]}"; do echo "[RUNTIME]   $svc"; done
   for svc in "${COMPAT_API_SERVICES[@]}"; do echo "[COMPAT]    $svc"; done
+
+  echo -e "
+${YELLOW}${BOLD}Vertex Authorization key 强制核验 API (${#VERTEX_KEY_REQUIRED_SERVICES[@]} 个)：${NC}"
+  for svc in "${VERTEX_KEY_REQUIRED_SERVICES[@]}"; do echo "[VERTEX-REQ] $svc"; done
+
+  echo -e "
+${GREEN}${BOLD}Gemini 标准 key 强制核验 API (${#GEMINI_KEY_REQUIRED_SERVICES[@]} 个)：${NC}"
+  for svc in "${GEMINI_KEY_REQUIRED_SERVICES[@]}"; do echo "[GEMINI-REQ] $svc"; done
+
   echo
-  echo "v6.3.1 会对以上全部 API 做精确核验；发现缺失会自动再次发送 enable 请求。"
+  echo "规则：新项目首次仍尝试全套 API；提 Key 时只扫描/补发必需集合，其他 Agent/Runtime API 缺失不阻止 Key。"
 }
 
 # ===== Main menu =====
@@ -1909,13 +2280,14 @@ show_menu() {
   echo -e "\n${CYAN}${BOLD}====== 喵酱的 GCP 管理器 v${VERSION} ======${NC}"
   echo "1. [经典] 自动创建项目并提 Gemini key (解绑旧项目)"
   echo "2. [保留] 自动创建项目并提 Gemini key (保留旧结算绑定)"
-  echo "3. 提取现有项目 Vertex Authorization + Gemini key"
+  echo "3. 扫描必需 API -> 缺失补发 -> 提 Vertex Authorization + Gemini key"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3个 Gemini key"
-  echo "6. [完整] 创建项目 -> 智能开全套 API -> 提 Vertex + Gemini key"
+  echo "6. [完整] 新项目先尝试全套 API -> Key 前只补 Vertex/Gemini 必需 API"
   echo "7. [重置] 删光账单关联项目 -> 每账单建1提1 Gemini key"
   echo "8. [补齐] 给现有项目补齐并全量复检 Agent Studio / Agent Platform API"
   echo "9. 查看本版默认启用的 API 清单"
+  echo "10. [Vertex专项] 建2个新项目 -> 全套API首轮 -> 补齐Vertex必需API -> 提Vertex key"
   echo "0. 退出"
 
   local choice
@@ -1959,6 +2331,9 @@ show_menu() {
       ;;
     9)
       show_api_catalog
+      ;;
+    10)
+      check_env && option10_vertex_two_projects
       ;;
     0)
       exit 0
