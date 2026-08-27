@@ -1,9 +1,9 @@
 
 # GCP API Key Manager - Agent Platform + Vertex/Gemini + Agent Studio APIs
-# Version: 6.3.0 (2026-08-27)
+# Version: 6.3.1 (2026-08-27)
 # Changes:
 #   - Remove the previous experimental Billing status diagnostic flow
-#   - Keep only a lightweight billing-account open=true precheck; it never guesses Free/Paid
+#   - Billing discovery no longer filters open=true and never blocks on Free/Paid tier
 #   - Enable IAM Connectors API by default because Agent Studio still displays/checks it
 #   - Add App Lifecycle Manager API (saasservicemgmt.googleapis.com)
 #   - Add current App Lifecycle Manager dependency APIs from Google documentation
@@ -12,6 +12,7 @@
 #   - Automatically re-submit any API that is still missing after the first async submission
 #   - Two-phase multi-project flow: submit project A -> wait 5s -> project B -> ... -> verify/repair -> extract keys
 #   - Exact per-project API summary includes names of any APIs still not enabled
+#   - Fallback Billing discovery from the currently configured project; actual link errors are shown
 
 set -Euo pipefail
 
@@ -24,7 +25,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== Global config =====
-VERSION="6.3.0"
+VERSION="6.3.1"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-4}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -182,39 +183,119 @@ mask_key() {
   fi
 }
 
-# ===== Billing precheck =====
-# v6.3 uses only a lightweight billing-account availability precheck.
-# Google Cloud's public BillingAccount object does not expose a reliable
-# Free-Trial/Paid field, so this script only verifies that at least one billing
-# account visible to the current gcloud identity is open=true. It does not block
-# execution based on a guessed Free/Paid state.
-prompt_upgrade_billing() {
-  log "INFO" "正在检查当前账号是否存在 open=true 的 Cloud Billing Account..."
+# ===== Billing discovery / precheck =====
+# v6.3.1 intentionally does NOT classify Free Trial / Free tier / Paid tier.
+# It also does NOT use `open=true` as a hard gate.
+#
+# Discovery order:
+#   1) `gcloud billing accounts list` WITHOUT an open filter.
+#   2) If that is empty (for example because list permission is limited), read the
+#      Billing Account attached to the currently configured project.
+#   3) If discovery still fails, project creation itself is NOT blocked. Options
+#      that actually need to attach a Billing Account can ask for a Billing ID.
 
-  local billing_raw
-  billing_raw=$(gcloud billing accounts list \
-    --filter='open=true' \
+get_current_project_billing_account() {
+  local project_id
+  project_id=$(gcloud config get-value project 2>/dev/null || true)
+  if [ -z "$project_id" ] || [ "$project_id" = "(unset)" ]; then
+    return 1
+  fi
+
+  local billing_name
+  billing_name=$(gcloud billing projects describe "$project_id" \
+    --format='value(billingAccountName)' 2>/dev/null || true)
+  billing_name=$(echo "$billing_name" | tr -d '\r' | xargs)
+
+  if [ -n "$billing_name" ]; then
+    echo "$billing_name"
+    return 0
+  fi
+  return 1
+}
+
+# Output TSV: resource-name<TAB>display-name<TAB>currency
+billing_accounts_tsv() {
+  local raw
+  raw=$(gcloud billing accounts list \
     --format='value(name,displayName,currencyCode)' \
     2>/dev/null || true)
 
+  if [ -n "$raw" ]; then
+    printf '%s\n' "$raw"
+    return 0
+  fi
+
+  # Some identities can use a project's attached Billing Account but cannot list
+  # all Billing Accounts. Recover that account from the current project.
+  local billing_name
+  billing_name=$(get_current_project_billing_account || true)
+  [ -z "$billing_name" ] && return 1
+
+  local billing_id="${billing_name#billingAccounts/}"
+  local display_name currency_code
+  display_name=$(gcloud billing accounts describe "$billing_id" \
+    --format='value(displayName)' 2>/dev/null || true)
+  currency_code=$(gcloud billing accounts describe "$billing_id" \
+    --format='value(currencyCode)' 2>/dev/null || true)
+
+  [ -z "$display_name" ] && display_name="Current Project Billing"
+  [ -z "$currency_code" ] && currency_code="Unknown"
+
+  printf '%s\t%s\t%s\n' "$billing_name" "$display_name" "$currency_code"
+}
+
+billing_account_names() {
+  local raw
+  raw=$(billing_accounts_tsv || true)
+  [ -z "$raw" ] && return 1
+
+  local billing_name display_name currency_code
+  while IFS=$'\t' read -r billing_name display_name currency_code; do
+    [ -n "$billing_name" ] && printf '%s\n' "$billing_name"
+  done <<< "$raw"
+}
+
+prompt_upgrade_billing() {
+  log "INFO" "Billing 检测：Free/Paid/Open 状态均不作为项目创建限制。"
+
+  local billing_raw
+  billing_raw=$(billing_accounts_tsv || true)
+
   if [ -z "$billing_raw" ]; then
-    echo -e "
-${RED}${BOLD}❌ 未检测到 open=true 的 Cloud Billing Account。${NC}" >&2
-    echo -e "${CYAN}Billing:${NC} https://console.cloud.google.com/billing" >&2
-    echo -e "${CYAN}Welcome / Activate:${NC} https://console.cloud.google.com/welcome" >&2
-    return 1
+    log "WARN" "当前 CLI 暂未解析到 Billing Account；不阻止创建项目。"
+    log "WARN" "若后续需要绑定账单，脚本会要求输入 Billing Account ID，并显示 Google 的真实绑定错误。"
+    return 0
   fi
 
   local count=0
   local billing_name display_name currency_code
-  while IFS=$'	' read -r billing_name display_name currency_code; do
+  while IFS=$'\t' read -r billing_name display_name currency_code; do
     [ -z "$billing_name" ] && continue
     count=$((count + 1))
-    log "SUCCESS" "[${billing_name#billingAccounts/}] Billing open=true | ${display_name:-Unknown} | ${currency_code:-Unknown}"
+    log "SUCCESS" "[${billing_name#billingAccounts/}] 检测到 Billing Account: ${display_name:-Unknown} | ${currency_code:-Unknown}"
   done <<< "$billing_raw"
 
-  log "SUCCESS" "Billing 预检通过：${count} 个 open=true。"
+  log "SUCCESS" "Billing 检测完成：${count} 个账户；不区分 Free/Paid，不检查 open 状态，允许继续。"
   return 0
+}
+
+# Show the real Google error when a Billing Account cannot be attached. This is
+# intentionally evaluated only at the operation that actually requires billing.
+link_project_to_billing() {
+  local project_id="$1"
+  local billing_id="$2"
+  local out
+
+  if out=$(gcloud billing projects link "$project_id" \
+      --billing-account="$billing_id" --quiet 2>&1); then
+    log "SUCCESS" "[$project_id] Billing 绑定成功: $billing_id"
+    return 0
+  fi
+
+  local short_out
+  short_out=$(echo "$out" | tail -n 8 | tr '\n' ' ' | cut -c1-1200)
+  log "WARN" "[$project_id] Billing 绑定失败 ($billing_id): $short_out"
+  return 1
 }
 
 # ===== Project name/id =====
@@ -709,29 +790,40 @@ v27_setup_and_extract_aq_key() {
 # ===== Billing selection =====
 select_billing_accounts() {
   local billing_raw
-  billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || true)
+  billing_raw=$(billing_accounts_tsv || true)
+
   if [ -z "$billing_raw" ]; then
-    log "ERROR" "未找到开放的结算账户"
-    return 1
+    echo -e "\n${YELLOW}自动检测不到 Billing Account，但不会把 Free/Paid 当成限制。${NC}" >&2
+    local manual_billing
+    read -r -p "请输入 Billing Account ID [留空取消绑定]: " manual_billing < /dev/tty
+    manual_billing="${manual_billing#billingAccounts/}"
+    manual_billing=$(echo "$manual_billing" | tr -d ' ')
+    if [ -z "$manual_billing" ]; then
+      log "ERROR" "没有可用于绑定的 Billing Account"
+      return 1
+    fi
+    SELECTED_BILLING_IDS=("$manual_billing")
+    SELECTED_BILLING_NAMES=("Manual Billing Account")
+    return 0
   fi
 
   local ids=()
   local names=()
-  while IFS=',' read -r bid bname; do
+  local bid bname currency_code
+  while IFS=$'\t' read -r bid bname currency_code; do
     [ -z "$bid" ] && continue
-    bid="${bid##*/}"
-    ids+=("$bid")
-    names+=("$bname")
+    ids+=("${bid##*/}")
+    names+=("${bname:-Billing Account}")
   done <<< "$billing_raw"
 
   if [ "${#ids[@]}" -eq 1 ]; then
-    log "INFO" "仅检测到 1 个可用结算账户: ${names[0]} (${ids[0]})"
+    log "INFO" "检测到 1 个 Billing Account: ${names[0]} (${ids[0]})"
     SELECTED_BILLING_IDS=("${ids[0]}")
     SELECTED_BILLING_NAMES=("${names[0]}")
     return 0
   fi
 
-  echo -e "\n${CYAN}${BOLD}可用的结算账户：${NC}" >&2
+  echo -e "\n${CYAN}${BOLD}可用的 Billing Account：${NC}" >&2
   local idx
   for idx in "${!ids[@]}"; do
     echo -e "  ${GREEN}$((idx + 1))${NC}. ${names[$idx]} (${ids[$idx]})" >&2
@@ -744,7 +836,6 @@ select_billing_accounts() {
 
   SELECTED_BILLING_IDS=()
   SELECTED_BILLING_NAMES=()
-
   if [ "$choice" = "0" ]; then
     SELECTED_BILLING_IDS=("${ids[@]}")
     SELECTED_BILLING_NAMES=("${names[@]}")
@@ -762,42 +853,52 @@ select_billing_accounts() {
   fi
 
   if [ "${#SELECTED_BILLING_IDS[@]}" -eq 0 ]; then
-    log "ERROR" "未选择任何结算账户"
+    log "ERROR" "未选择任何 Billing Account"
     return 1
   fi
+  return 0
 }
 
 _select_billing_for_opt6() {
   local billing_raw
-  billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || true)
+  billing_raw=$(billing_accounts_tsv || true)
+
   if [ -z "$billing_raw" ]; then
-    log "ERROR" "未找到开放的结算账户"
+    echo -e "\n${YELLOW}自动检测不到 Billing Account。${NC}" >&2
+    local manual_billing
+    read -r -p "请输入 Billing Account ID: " manual_billing < /dev/tty
+    manual_billing="${manual_billing#billingAccounts/}"
+    manual_billing=$(echo "$manual_billing" | tr -d ' ')
+    if [ -n "$manual_billing" ]; then
+      echo "$manual_billing"
+      return 0
+    fi
     return 1
   fi
 
   local ids=()
   local names=()
-  while IFS=',' read -r bid bname; do
+  local bid bname currency_code
+  while IFS=$'\t' read -r bid bname currency_code; do
     [ -z "$bid" ] && continue
-    bid="${bid##*/}"
-    ids+=("$bid")
-    names+=("$bname")
+    ids+=("${bid##*/}")
+    names+=("${bname:-Billing Account}")
   done <<< "$billing_raw"
 
   if [ "${#ids[@]}" -eq 1 ]; then
-    log "INFO" "仅检测到 1 个可用结算账户: ${names[0]} (${ids[0]})"
+    log "INFO" "检测到 1 个 Billing Account: ${names[0]} (${ids[0]})"
     echo "${ids[0]}"
     return 0
   fi
 
-  echo -e "\n${CYAN}${BOLD}可用的结算账户：${NC}" >&2
+  echo -e "\n${CYAN}${BOLD}可用的 Billing Account：${NC}" >&2
   local idx
   for idx in "${!ids[@]}"; do
     echo -e "  ${GREEN}$((idx + 1))${NC}. ${names[$idx]} (${ids[$idx]})" >&2
   done
 
   local choice
-  read -r -p "请选择 1 个主要结算账户 [默认: 1]: " choice < /dev/tty
+  read -r -p "请选择 1 个主要 Billing Account [默认: 1]: " choice < /dev/tty
   choice=${choice:-1}
 
   if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#ids[@]}" ]; then
@@ -825,17 +926,17 @@ gemini_create_projects() {
   local num_per_billing
   if [ "$auto_mode" = "true" ]; then
     local billing_raw
-    billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || true)
+    billing_raw=$(billing_accounts_tsv || true)
     if [ -z "$billing_raw" ]; then
-      log "ERROR" "未找到开放的结算账户"
+      log "ERROR" "未找到可用于绑定的 Billing Account"
       return 1
     fi
     SELECTED_BILLING_IDS=()
     SELECTED_BILLING_NAMES=()
-    while IFS=',' read -r bid bname; do
+    while IFS=$'\t' read -r bid bname currency_code; do
       [ -z "$bid" ] && continue
       SELECTED_BILLING_IDS+=("${bid##*/}")
-      SELECTED_BILLING_NAMES+=("$bname")
+      SELECTED_BILLING_NAMES+=("${bname:-Billing Account}")
     done <<< "$billing_raw"
     num_per_billing=3
   else
@@ -889,7 +990,7 @@ gemini_create_projects() {
         continue
       fi
 
-      gcloud billing projects link "$project_id" --billing-account="$billing_account" --quiet >/dev/null 2>&1 || true
+      link_project_to_billing "$project_id" "$billing_account" || true
 
       local billing_info
       billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || true)
@@ -1059,13 +1160,11 @@ rebuild_and_transfer_billing() {
   read -r -p "请输入接收结算权限的目标邮箱 [默认: $CURRENT_ACCOUNT]: " TARGET_EMAIL < /dev/tty
   TARGET_EMAIL=${TARGET_EMAIL:-$CURRENT_ACCOUNT}
 
-  local billing_raw
-  billing_raw=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1 || true)
-  if [ -z "$billing_raw" ]; then
-    log "ERROR" "未找到活动结算账户"
+  local TARGET_BILLING_ID
+  TARGET_BILLING_ID=$(_select_billing_for_opt6) || {
+    log "ERROR" "未选择可用于绑定的 Billing Account"
     return 1
-  fi
-  local TARGET_BILLING_ID="${billing_raw#billingAccounts/}"
+  }
 
   log "INFO" "处理结算账户: $TARGET_BILLING_ID"
   local policy_json
@@ -1117,7 +1216,7 @@ except Exception:
   local AS_KEYS=()
 
   log "INFO" "处理原始项目并提取 Gemini key..."
-  gcloud billing projects link "$ORIGINAL_PROJECT" --billing-account="$TARGET_BILLING_ID" --quiet >/dev/null 2>&1 || true
+  link_project_to_billing "$ORIGINAL_PROJECT" "$TARGET_BILLING_ID" || true
   local orig_key
   orig_key=$(_extract_single_project "$ORIGINAL_PROJECT" || true)
   if [ -n "$orig_key" ]; then
@@ -1135,7 +1234,7 @@ except Exception:
     log "INFO" "创建: $pname [$pid]"
     if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
       sleep 3
-      gcloud billing projects link "$pid" --billing-account="$TARGET_BILLING_ID" --quiet >/dev/null 2>&1 || true
+      link_project_to_billing "$pid" "$TARGET_BILLING_ID" || true
       local new_key
       new_key=$(_extract_single_project "$pid" || true)
       if [ -n "$new_key" ]; then
@@ -1194,7 +1293,7 @@ option6_handler() {
       pname=$(new_project_name)
       log "INFO" "[$i/$num_projects] 创建: ${pname} [${pid}]"
       if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-        gcloud billing projects link "$pid" --billing-account="$BILLING_ACCOUNT" --quiet >/dev/null 2>&1 || true
+        link_project_to_billing "$pid" "$BILLING_ACCOUNT" || true
         created_pids+=("$pid")
       fi
     done
@@ -1233,21 +1332,21 @@ option6_handler() {
     fi
 
   elif [ "$sub_choice" = "2" ]; then
-    log "INFO" "====== 执行 6.3 多账单自动模式 ======"
+    log "INFO" "====== 执行 6.3.1 多账单自动模式 ======"
 
     local billing_raw
-    billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || true)
+    billing_raw=$(billing_accounts_tsv || true)
     if [ -z "$billing_raw" ]; then
-      log "ERROR" "未找到开放的结算账户"
+      log "ERROR" "未找到可用于绑定的 Billing Account"
       return 1
     fi
 
     local b_ids=()
     local b_names=()
-    while IFS=',' read -r bid bname; do
+    while IFS=$'\t' read -r bid bname currency_code; do
       [ -z "$bid" ] && continue
       b_ids+=("${bid##*/}")
-      b_names+=("$bname")
+      b_names+=("${bname:-Billing Account}")
     done <<< "$billing_raw"
 
     local b_idx
@@ -1271,7 +1370,7 @@ option6_handler() {
 
         if [ -n "$default_pid" ]; then
           log "INFO" ">> [账单1] 处理默认项目: $default_pid"
-          gcloud billing projects link "$default_pid" --billing-account="$CURRENT_BILLING" --quiet >/dev/null 2>&1 || true
+          link_project_to_billing "$default_pid" "$CURRENT_BILLING" || true
           local check_b
           check_b=$(gcloud billing projects describe "$default_pid" --format='value(billingAccountName)' 2>/dev/null || true)
           if [ -n "$check_b" ]; then
@@ -1292,7 +1391,7 @@ option6_handler() {
           local pname
           pname=$(new_project_name)
           if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-            gcloud billing projects link "$pid" --billing-account="$CURRENT_BILLING" --quiet >/dev/null 2>&1 || true
+            link_project_to_billing "$pid" "$CURRENT_BILLING" || true
             created_pids+=("$pid")
           fi
         done
@@ -1332,7 +1431,7 @@ option6_handler() {
           local pname
           pname=$(new_project_name)
           if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-            gcloud billing projects link "$pid" --billing-account="$CURRENT_BILLING" --quiet >/dev/null 2>&1 || true
+            link_project_to_billing "$pid" "$CURRENT_BILLING" || true
             created_pids+=("$pid")
           fi
         done
@@ -1420,7 +1519,7 @@ option7_handler() {
   prompt_upgrade_billing || return 1
 
   echo -e "\n${CYAN}${BOLD}====== 选项7: 删除所有账单关联项目 -> 每账单新建1个并提 Gemini key ======${NC}"
-  echo -e "${YELLOW}⚠️ 此操作会解绑并删除所有可见活动结算账户下关联的项目。${NC}"
+  echo -e "${YELLOW}⚠️ 此操作会解绑并删除所有可见 Billing Account 下关联的项目。${NC}"
   read -r -p "确认执行吗？[y/N]: " confirm_del < /dev/tty
   if [[ ! "$confirm_del" =~ ^[Yy]$ ]]; then
     log "INFO" "操作已取消"
@@ -1428,21 +1527,21 @@ option7_handler() {
   fi
 
   local billing_raw
-  billing_raw=$(gcloud billing accounts list --filter='open=true' --format='csv[no-heading](name,displayName)' 2>/dev/null || true)
+  billing_raw=$(billing_accounts_tsv || true)
   if [ -z "$billing_raw" ]; then
-    log "ERROR" "未找到开放的结算账户"
+    log "ERROR" "未找到可用于绑定的 Billing Account"
     return 1
   fi
 
   local b_ids=()
   local b_names=()
-  while IFS=',' read -r bid bname; do
+  while IFS=$'\t' read -r bid bname currency_code; do
     [ -z "$bid" ] && continue
     b_ids+=("${bid##*/}")
-    b_names+=("$bname")
+    b_names+=("${bname:-Billing Account}")
   done <<< "$billing_raw"
 
-  log "INFO" "检测到 ${#b_ids[@]} 个活动结算账户"
+  log "INFO" "检测到 ${#b_ids[@]} 个 Billing Account"
 
   local b_idx
   for b_idx in "${!b_ids[@]}"; do
@@ -1477,7 +1576,7 @@ option7_handler() {
     log "INFO" "[$((b_idx + 1))/${#b_ids[@]}] 创建: ${pname} [${pid}]"
 
     if gcloud projects create "$pid" --name="$pname" --quiet >/dev/null 2>&1; then
-      gcloud billing projects link "$pid" --billing-account="$CURRENT_BILLING" --quiet >/dev/null 2>&1 || true
+      link_project_to_billing "$pid" "$CURRENT_BILLING" || true
       sleep 15
 
       local a_key
@@ -1587,7 +1686,7 @@ show_api_catalog() {
   for svc in "${RUNTIME_API_SERVICES[@]}"; do echo "[RUNTIME]   $svc"; done
   for svc in "${COMPAT_API_SERVICES[@]}"; do echo "[COMPAT]    $svc"; done
   echo
-  echo "v6.3 会对以上全部 API 做精确核验；发现缺失会自动再次发送 enable 请求。"
+  echo "v6.3.1 会对以上全部 API 做精确核验；发现缺失会自动再次发送 enable 请求。"
 }
 
 # ===== Main menu =====
