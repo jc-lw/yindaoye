@@ -1,6 +1,6 @@
 
 # GCP API Key Manager - Agent Platform + Vertex/Gemini + Agent Studio APIs
-# Version: 6.4.2 (2026-08-27)
+# Version: 6.4.3 (2026-08-27)
 # Changes:
 #   - Remove the previous experimental Billing status diagnostic flow
 #   - Billing discovery no longer filters open=true and never blocks on Free/Paid tier
@@ -36,7 +36,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== Global config =====
-VERSION="6.4.2"
+VERSION="6.4.3"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-4}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -2232,7 +2232,7 @@ option10_vertex_two_projects() {
   if [ "${#vertex_keys[@]}" -gt 0 ]; then
     local idx
     for idx in "${!vertex_keys[@]}"; do
-      echo -e "${CYAN}[${vertex_projects[$idx]}]${NC} ${GREEN}${vertex_keys[$idx]}${NC}"
+      echo -e "${GREEN}${vertex_keys[$idx]}${NC}"
     done
   else
     echo -e "${RED}没有成功提取 Vertex Authorization key。${NC}"
