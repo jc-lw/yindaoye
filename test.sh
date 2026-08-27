@@ -1,6 +1,6 @@
 
 # GCP API Key Manager - Agent Platform + Vertex/Gemini + Agent Studio APIs
-# Version: 6.3.1 (2026-08-27)
+# Version: 6.3.2 (2026-08-27)
 # Changes:
 #   - Remove the previous experimental Billing status diagnostic flow
 #   - Billing discovery no longer filters open=true and never blocks on Free/Paid tier
@@ -13,6 +13,12 @@
 #   - Two-phase multi-project flow: submit project A -> wait 5s -> project B -> ... -> verify/repair -> extract keys
 #   - Exact per-project API summary includes names of any APIs still not enabled
 #   - Fallback Billing discovery from the currently configured project; actual link errors are shown
+#   - Distinguish "Billing Account linked" from project billingEnabled=true
+#   - Detect UREQ_PROJECT_BILLING_NOT_OPEN as a non-retryable Google precondition
+#   - On BILLING_NOT_OPEN, stop retrying the whole batch and probe each API once
+#   - Track APIs blocked by closed/non-open Cloud Billing and never resend them in repair loops
+#   - Continue enabling free/available APIs and continue key extraction even when some Cloud APIs are billing-blocked
+#   - Final API summary separates ENABLED / BILLING_BLOCKED / ordinary MISSING
 
 set -Euo pipefail
 
@@ -25,7 +31,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== Global config =====
-VERSION="6.3.1"
+VERSION="6.3.2"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-4}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -37,6 +43,12 @@ API_REPAIR_ROUNDS="${API_REPAIR_ROUNDS:-4}"
 API_REPAIR_SLEEP="${API_REPAIR_SLEEP:-5}"
 
 rm -f "$CACHE_FILE" 2>/dev/null || true
+
+# Per-process state used by the smart API engine. A project can be successfully
+# linked to a Billing Account while ProjectBillingInfo.billingEnabled is false.
+# In that case some Google Cloud services return UREQ_PROJECT_BILLING_NOT_OPEN.
+declare -A BILLING_BLOCKED_APIS=()
+
 
 # ===== Current Google Cloud service sets =====
 # Core admin + AI services.
@@ -117,7 +129,7 @@ FULL_API_SERVICES=(
   "${COMPAT_API_SERVICES[@]}"
 )
 
-# v6.3 verifies the entire requested set. This is deliberately not a smaller
+# v6.3.2 verifies the entire requested set. This is deliberately not a smaller
 # "critical" subset: a project only passes after every requested API is visible
 # in `gcloud services list --enabled`.
 VERIFY_API_SERVICES=("${FULL_API_SERVICES[@]}")
@@ -279,8 +291,83 @@ prompt_upgrade_billing() {
   return 0
 }
 
-# Show the real Google error when a Billing Account cannot be attached. This is
-# intentionally evaluated only at the operation that actually requires billing.
+# A successful `gcloud billing projects link` only means the relationship was
+# written. The authoritative project-side flag is ProjectBillingInfo.billingEnabled.
+# If it is false, the project can still exist and some APIs can still be enabled,
+# but paid Cloud services can reject activation with UREQ_PROJECT_BILLING_NOT_OPEN.
+project_billing_info() {
+  local project_id="$1"
+  local info
+  info=$(gcloud billing projects describe "$project_id" \
+    --format='value(billingEnabled,billingAccountName)' 2>/dev/null || true)
+  [ -n "$info" ] && printf '%s
+' "$info"
+}
+
+project_billing_enabled() {
+  local project_id="$1"
+  local info enabled account_name
+  info=$(project_billing_info "$project_id" || true)
+  [ -z "$info" ] && return 1
+  read -r enabled account_name <<< "$info"
+  [ "$enabled" = "True" ] || [ "$enabled" = "true" ]
+}
+
+show_project_billing_state() {
+  local project_id="$1"
+  local info enabled account_name
+  info=$(project_billing_info "$project_id" || true)
+  if [ -z "$info" ]; then
+    log "WARN" "[$project_id] 无法读取 ProjectBillingInfo；后续按 Google 实际 API 返回处理。"
+    return 2
+  fi
+
+  read -r enabled account_name <<< "$info"
+  if [ "$enabled" = "True" ] || [ "$enabled" = "true" ]; then
+    log "SUCCESS" "[$project_id] ProjectBillingInfo: billingEnabled=true | ${account_name:-no-account}"
+    return 0
+  fi
+
+  log "WARN" "[$project_id] ProjectBillingInfo: billingEnabled=false | ${account_name:-no-account}"
+  log "WARN" "[$project_id] 项目可以保留/继续处理，但需要开放 Cloud Billing 的服务可能返回 UREQ_PROJECT_BILLING_NOT_OPEN。"
+  return 1
+}
+
+is_billing_not_open_error() {
+  local text="${1:-}"
+  echo "$text" | grep -qiE \
+    'UREQ_PROJECT_BILLING_NOT_OPEN|PROJECT_BILLING_NOT_OPEN|billing account .* is not open|billing must be enabled for activation|project billing.*not open'
+}
+
+billing_block_key() {
+  printf '%s|%s' "$1" "$2"
+}
+
+mark_billing_blocked_api() {
+  local project_id="$1"
+  local api="$2"
+  BILLING_BLOCKED_APIS["$(billing_block_key "$project_id" "$api")"]=1
+}
+
+is_billing_blocked_api() {
+  local project_id="$1"
+  local api="$2"
+  [ -n "${BILLING_BLOCKED_APIS[$(billing_block_key "$project_id" "$api")]+x}" ]
+}
+
+clear_billing_blocked_for_project() {
+  local project_id="$1"
+  local key
+  for key in "${!BILLING_BLOCKED_APIS[@]}"; do
+    if [[ "$key" == "${project_id}|"* ]]; then
+      unset 'BILLING_BLOCKED_APIS[$key]'
+    fi
+  done
+}
+
+# Show the real Google error when a Billing Account cannot be attached, then
+# immediately check billingEnabled instead of assuming "link succeeded" means
+# the Cloud Billing account is active for paid services.
 link_project_to_billing() {
   local project_id="$1"
   local billing_id="$2"
@@ -288,12 +375,20 @@ link_project_to_billing() {
 
   if out=$(gcloud billing projects link "$project_id" \
       --billing-account="$billing_id" --quiet 2>&1); then
-    log "SUCCESS" "[$project_id] Billing 绑定成功: $billing_id"
+    log "SUCCESS" "[$project_id] Billing Account 已关联: $billing_id"
+    if project_billing_enabled "$project_id"; then
+      log "SUCCESS" "[$project_id] Billing 状态确认: billingEnabled=true"
+      clear_billing_blocked_for_project "$project_id"
+    else
+      log "WARN" "[$project_id] Billing 已关联，但 billingEnabled=false；不会阻止创建项目或提取可用 Key。"
+      log "WARN" "[$project_id] 需要开放 Cloud Billing 的 API 将自动标记 BILLING_BLOCKED，并停止无意义重试。"
+    fi
     return 0
   fi
 
   local short_out
-  short_out=$(echo "$out" | tail -n 8 | tr '\n' ' ' | cut -c1-1200)
+  short_out=$(echo "$out" | tail -n 8 | tr '
+' ' ' | cut -c1-1200)
   log "WARN" "[$project_id] Billing 绑定失败 ($billing_id): $short_out"
   return 1
 }
@@ -371,6 +466,16 @@ enable_api_with_retry() {
       return 0
     fi
 
+    # This is a Google billing precondition, not a transient network/rate error.
+    # Retrying the same batch 5 times can never fix it.
+    if is_billing_not_open_error "$out"; then
+      local short_out
+      short_out=$(echo "$out" | tail -n 5 | tr '
+' ' ' | cut -c1-700)
+      log "WARN" "[$proj] ${batch_name} 命中 BILLING_NOT_OPEN；停止整包重试，立即拆分逐项检测。 ${short_out}"
+      return 20
+    fi
+
     if echo "$out" | grep -qiE '429|RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|quota|Mutate requests|rate.?limit'; then
       local exp=$((1 << (attempt - 1)))
       local delay=$((exp * 6 + RANDOM % 6))
@@ -398,10 +503,22 @@ enable_single_api_with_retry() {
   local max_attempts=4
   local out=""
 
+  # If this exact API was already proven billing-blocked during this run, don't
+  # send it again until the project's billingEnabled state changes.
+  if is_billing_blocked_api "$proj" "$api"; then
+    return 20
+  fi
+
   while [ "$attempt" -le "$max_attempts" ]; do
     if out=$(gcloud services enable "$api" --project="$proj" --async --quiet 2>&1); then
-      log "SUCCESS" "[$proj] 已补发: $api"
+      log "SUCCESS" "[$proj] 已提交: $api"
       return 0
+    fi
+
+    if is_billing_not_open_error "$out"; then
+      mark_billing_blocked_api "$proj" "$api"
+      log "WARN" "[$proj] [BILLING_BLOCKED] $api"
+      return 20
     fi
 
     if echo "$out" | grep -qiE '429|RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|quota|Mutate requests|rate.?limit'; then
@@ -436,13 +553,28 @@ submit_api_list_batched() {
 
   while [ "$start" -lt "$total" ]; do
     local batch=("${requested[@]:start:API_BATCH_SIZE}")
-    if ! enable_api_with_retry "$proj" "${label}-批次${batch_num}" "${batch[@]}"; then
-      log "WARN" "[$proj] ${label}-批次${batch_num} 整包失败，改为逐个补发"
+    local batch_rc=0
+    enable_api_with_retry "$proj" "${label}-批次${batch_num}" "${batch[@]}" || batch_rc=$?
+
+    if [ "$batch_rc" -ne 0 ]; then
+      if [ "$batch_rc" -eq 20 ]; then
+        log "WARN" "[$proj] ${label}-批次${batch_num} 含至少一个 Billing 不可用服务；不再重试整包，逐项探测一次。"
+      else
+        log "WARN" "[$proj] ${label}-批次${batch_num} 整包失败，改为逐个补发"
+      fi
+
       for api in "${batch[@]}"; do
-        enable_single_api_with_retry "$proj" "$api" || log "ERROR" "[$proj] 最终未能提交: $api"
+        local single_rc=0
+        enable_single_api_with_retry "$proj" "$api" || single_rc=$?
+        case "$single_rc" in
+          0) ;;
+          20) ;; # Already logged and recorded as BILLING_BLOCKED.
+          *) log "ERROR" "[$proj] 最终未能提交: $api" ;;
+        esac
         sleep 1
       done
     fi
+
     start=$((start + API_BATCH_SIZE))
     batch_num=$((batch_num + 1))
     if [ "$start" -lt "$total" ]; then
@@ -459,9 +591,18 @@ v60_enable_all_services() {
     [ -n "$api" ] && requested+=("$api")
   done < <(get_requested_api_services)
 
+  # Re-opened billing can make previously blocked APIs available. Clear the
+  # per-process block cache when Google says billingEnabled=true.
+  if project_billing_enabled "$proj"; then
+    clear_billing_blocked_for_project "$proj"
+    log "INFO" "[$proj] Project Billing: billingEnabled=true"
+  else
+    log "WARN" "[$proj] Project Billing: billingEnabled=false/unknown；仍会启用所有可用 API，Billing 限制项只尝试一次。"
+  fi
+
   log "INFO" "[$proj] 准备提交 Agent Studio / Agent Platform 全套 API，共 ${#requested[@]} 个"
   submit_api_list_batched "$proj" "API" "${requested[@]}"
-  log "INFO" "[$proj] ${#requested[@]} 个 API 的首轮启用请求已全部提交"
+  log "INFO" "[$proj] 全套 API 首轮扫描/提交完成"
 }
 
 # Backward-compatible names used by older branches of this script.
@@ -489,6 +630,30 @@ get_missing_requested_apis() {
   done < <(get_requested_api_services)
 }
 
+get_repairable_missing_apis() {
+  local pid="$1"
+  local svc
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    if ! is_billing_blocked_api "$pid" "$svc"; then
+      printf '%s
+' "$svc"
+    fi
+  done < <(get_missing_requested_apis "$pid")
+}
+
+get_billing_blocked_missing_apis() {
+  local pid="$1"
+  local svc
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    if is_billing_blocked_api "$pid" "$svc"; then
+      printf '%s
+' "$svc"
+    fi
+  done < <(get_missing_requested_apis "$pid")
+}
+
 check_api_ready() {
   local pid="$1"
   local stage="$2"
@@ -496,10 +661,16 @@ check_api_ready() {
   local total
   total=$(get_requested_api_services | grep -c . || true)
 
-  log "INFO" "[$pid] ${stage} 开始全量核验 ${total} 个 API；缺失项会自动再次发送启用请求"
+  if project_billing_enabled "$pid"; then
+    clear_billing_blocked_for_project "$pid"
+  fi
+
+  log "INFO" "[$pid] ${stage} 开始全量核验 ${total} 个 API；普通缺失自动补发，Billing 阻止项不会死循环"
 
   while [ "$round" -le "$API_REPAIR_ROUNDS" ]; do
     local missing=()
+    local repairable=()
+    local blocked=()
     mapfile -t missing < <(get_missing_requested_apis "$pid")
 
     if [ "${#missing[@]}" -eq 0 ]; then
@@ -507,29 +678,62 @@ check_api_ready() {
       return 0
     fi
 
-    log "WARN" "[$pid] ${stage} 第 ${round}/${API_REPAIR_ROUNDS} 轮发现 ${#missing[@]} 个未启用 API"
+    mapfile -t repairable < <(get_repairable_missing_apis "$pid")
+    mapfile -t blocked < <(get_billing_blocked_missing_apis "$pid")
+
+    log "WARN" "[$pid] ${stage} 第 ${round}/${API_REPAIR_ROUNDS} 轮：缺失 ${#missing[@]} | 可补发 ${#repairable[@]} | Billing阻止 ${#blocked[@]}"
+
     local svc
-    for svc in "${missing[@]}"; do
-      echo -e "${YELLOW}  - ${svc}${NC}" >&2
+    for svc in "${blocked[@]}"; do
+      echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
+    done
+    for svc in "${repairable[@]}"; do
+      echo -e "${YELLOW}  [REPAIR] ${svc}${NC}" >&2
     done
 
-    submit_api_list_batched "$pid" "补发${round}" "${missing[@]}"
+    # Nothing left to repair: all remaining gaps are a known Billing precondition.
+    if [ "${#repairable[@]}" -eq 0 ]; then
+      log "WARN" "[$pid] ${stage} 剩余 ${#blocked[@]} 个 API 均被 Cloud Billing 状态阻止；停止重复请求，继续后续 Key 流程。"
+      return 2
+    fi
+
+    submit_api_list_batched "$pid" "补发${round}" "${repairable[@]}"
     log "INFO" "[$pid] 补发完成，等待 ${API_REPAIR_SLEEP}s 后重新核验"
     sleep "$API_REPAIR_SLEEP"
+
+    # If billing was activated while the script was running, immediately allow
+    # formerly blocked APIs to enter the next repair round.
+    if project_billing_enabled "$pid"; then
+      clear_billing_blocked_for_project "$pid"
+    fi
+
     round=$((round + 1))
   done
 
   local final_missing=()
+  local final_blocked=()
+  local final_repairable=()
   mapfile -t final_missing < <(get_missing_requested_apis "$pid")
+  mapfile -t final_blocked < <(get_billing_blocked_missing_apis "$pid")
+  mapfile -t final_repairable < <(get_repairable_missing_apis "$pid")
+
   if [ "${#final_missing[@]}" -eq 0 ]; then
     log "SUCCESS" "[$pid] ${stage} 全量核验通过：${total}/${total} 个 API 已启用"
     return 0
   fi
 
-  log "ERROR" "[$pid] ${stage} 完成 ${API_REPAIR_ROUNDS} 轮补发后仍有 ${#final_missing[@]} 个 API 未启用"
+  if [ "${#final_repairable[@]}" -eq 0 ] && [ "${#final_blocked[@]}" -gt 0 ]; then
+    log "WARN" "[$pid] ${stage} 核验结束：${#final_blocked[@]} 个 API 因 Cloud Billing 未开放而未启用；不再重试。"
+    return 2
+  fi
+
+  log "ERROR" "[$pid] ${stage} 完成 ${API_REPAIR_ROUNDS} 轮后仍有 ${#final_missing[@]} 个 API 未启用"
   local svc
-  for svc in "${final_missing[@]}"; do
-    echo -e "${RED}  - ${svc}${NC}" >&2
+  for svc in "${final_blocked[@]}"; do
+    echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
+  done
+  for svc in "${final_repairable[@]}"; do
+    echo -e "${RED}  [MISSING] ${svc}${NC}" >&2
   done
   return 1
 }
@@ -539,15 +743,26 @@ show_enabled_api_summary() {
   local total
   total=$(get_requested_api_services | grep -c . || true)
   local missing=()
+  local blocked=()
+  local repairable=()
   mapfile -t missing < <(get_missing_requested_apis "$pid")
+  mapfile -t blocked < <(get_billing_blocked_missing_apis "$pid")
+  mapfile -t repairable < <(get_repairable_missing_apis "$pid")
   local ok=$((total - ${#missing[@]}))
 
-  log "INFO" "[$pid] API 汇总: 已启用 ${ok}/${total} | 未启用 ${#missing[@]}"
-  if [ "${#missing[@]}" -gt 0 ]; then
-    local svc
-    for svc in "${missing[@]}"; do
-      echo -e "${YELLOW}  [MISSING] ${svc}${NC}" >&2
-    done
+  log "INFO" "[$pid] API 汇总: ENABLED ${ok}/${total} | BILLING_BLOCKED ${#blocked[@]} | MISSING ${#repairable[@]}"
+
+  local svc
+  for svc in "${blocked[@]}"; do
+    echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
+  done
+  for svc in "${repairable[@]}"; do
+    echo -e "${RED}  [MISSING] ${svc}${NC}" >&2
+  done
+
+  if [ "${#blocked[@]}" -gt 0 ]; then
+    echo -e "${YELLOW}  提示：这些 API 不是脚本重试能解决的；Google 返回的前置条件是 Cloud Billing 未开放。${NC}" >&2
+    echo -e "${CYAN}  Activate / Billing: https://console.cloud.google.com/welcome${NC}" >&2
   fi
 }
 
@@ -1332,7 +1547,7 @@ option6_handler() {
     fi
 
   elif [ "$sub_choice" = "2" ]; then
-    log "INFO" "====== 执行 6.3.1 多账单自动模式 ======"
+    log "INFO" "====== 执行 6.3.2 多账单自动模式 ======"
 
     local billing_raw
     billing_raw=$(billing_accounts_tsv || true)
@@ -1697,7 +1912,7 @@ show_menu() {
   echo "3. 提取现有项目 Vertex Authorization + Gemini key"
   echo "4. 批量删除项目"
   echo "5. [护盾] 保护原项目 -> 转移结算 -> 建2个凑齐3个 Gemini key"
-  echo "6. [完整] 创建项目 -> 开全套最新 API -> 提 Vertex + Gemini key"
+  echo "6. [完整] 创建项目 -> 智能开全套 API -> 提 Vertex + Gemini key"
   echo "7. [重置] 删光账单关联项目 -> 每账单建1提1 Gemini key"
   echo "8. [补齐] 给现有项目补齐并全量复检 Agent Studio / Agent Platform API"
   echo "9. 查看本版默认启用的 API 清单"
