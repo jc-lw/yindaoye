@@ -1,6 +1,6 @@
 
 # GCP API Key Manager - Agent Platform + Vertex/Gemini + Agent Studio APIs
-# Version: 6.4.3 (2026-08-27)
+# Version: 6.5.0 (2026-08-29)
 # Changes:
 #   - Remove the previous experimental Billing status diagnostic flow
 #   - Billing discovery no longer filters open=true and never blocks on Free/Paid tier
@@ -24,6 +24,15 @@
 #   - Synchronize exact-count creation engine across options 1/2/5/6/7
 #   - Add option 10: create exactly 2 new projects -> one full API pass -> repair Vertex-required APIs -> extract Vertex keys
 #   - Vertex option reuses exact-count project creation and does not require non-Vertex APIs to pass before key extraction
+#   - v6.5: follow current Google docs: IAM Connectors is legacy and no longer enabled by default
+#   - Legacy iamconnectors.googleapis.com can still be requested with ENABLE_LEGACY_IAM_CONNECTORS=1
+#   - Treat AUTH_PERMISSION_DENIED/PERMISSION_DENIED as non-retryable for API enable requests
+#   - Full API first pass is now truly one-pass: no 5x retry storm; deterministic errors are split once and classified
+#   - Track PERMISSION_BLOCKED separately from BILLING_BLOCKED and never resend either during the same run
+#   - Recognize UREQ_PROJECT_BILLING_NOT_FOUND in addition to BILLING_NOT_OPEN
+#   - If ProjectBillingInfo.billingEnabled=false, skip the noisy full-API pass by default and go straight to Key prerequisites
+#   - FORCE_FULL_API_WITHOUT_BILLING=1 restores the old behavior when explicitly desired
+#   - Billing-link quota errors are condensed to a clear Cloud Billing quota message instead of a long protobuf dump
 
 set -Euo pipefail
 
@@ -36,7 +45,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # ===== Global config =====
-VERSION="6.4.3"
+VERSION="6.5.0"
 PROJECT_PREFIX="${PROJECT_PREFIX:-miaojiang}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-4}"
 CACHE_FILE="$HOME/.miaojiang_keys.cache"
@@ -49,6 +58,9 @@ API_REPAIR_SLEEP="${API_REPAIR_SLEEP:-5}"
 PROJECT_CREATE_GAP="${PROJECT_CREATE_GAP:-3}"
 PROJECT_CREATE_EXTRA_ATTEMPTS="${PROJECT_CREATE_EXTRA_ATTEMPTS:-6}"
 PROJECT_CREATE_RETRY_BASE="${PROJECT_CREATE_RETRY_BASE:-4}"
+ENABLE_LEGACY_IAM_CONNECTORS="${ENABLE_LEGACY_IAM_CONNECTORS:-0}"
+FORCE_FULL_API_WITHOUT_BILLING="${FORCE_FULL_API_WITHOUT_BILLING:-0}"
+FULL_API_SINGLE_GAP="${FULL_API_SINGLE_GAP:-1}"
 
 rm -f "$CACHE_FILE" 2>/dev/null || true
 
@@ -56,6 +68,7 @@ rm -f "$CACHE_FILE" 2>/dev/null || true
 # linked to a Billing Account while ProjectBillingInfo.billingEnabled is false.
 # In that case some Google Cloud services return UREQ_PROJECT_BILLING_NOT_OPEN.
 declare -A BILLING_BLOCKED_APIS=()
+declare -A PERMISSION_BLOCKED_APIS=()
 
 
 # ===== Current Google Cloud service sets =====
@@ -76,8 +89,8 @@ CORE_API_SERVICES=(
 )
 
 # APIs shown/used by the current Agent Studio / Agent Platform experience.
-# IAM Connectors is legacy for new auth integrations, but Agent Studio can still
-# display it in the "Enable APIs" dialog, so v6.3 enables it by default.
+# IAM Connectors is legacy and is intentionally excluded from the default set.
+# Agent Identity is the current replacement for new projects.
 AGENT_PLATFORM_API_SERVICES=(
   "agentregistry.googleapis.com"
   "agentidentity.googleapis.com"
@@ -85,7 +98,6 @@ AGENT_PLATFORM_API_SERVICES=(
   "apphub.googleapis.com"
   "apptopology.googleapis.com"
   "cloudapiregistry.googleapis.com"
-  "iamconnectors.googleapis.com"
   "iap.googleapis.com"
   "modelarmor.googleapis.com"
   "networksecurity.googleapis.com"
@@ -127,6 +139,12 @@ RUNTIME_API_SERVICES=(
 
 COMPAT_API_SERVICES=(
   "dialogflow.googleapis.com"
+)
+
+# IAM Connectors is legacy. Google now recommends Agent Identity for new projects.
+# Keep it opt-in only for old projects that still depend on the V1 connector service.
+LEGACY_API_SERVICES=(
+  "iamconnectors.googleapis.com"
 )
 
 FULL_API_SERVICES=(
@@ -373,32 +391,57 @@ show_project_billing_state() {
 is_billing_not_open_error() {
   local text="${1:-}"
   echo "$text" | grep -qiE \
-    'UREQ_PROJECT_BILLING_NOT_OPEN|PROJECT_BILLING_NOT_OPEN|billing account .* is not open|billing must be enabled for activation|project billing.*not open'
+    'UREQ_PROJECT_BILLING_NOT_OPEN|UREQ_PROJECT_BILLING_NOT_FOUND|PROJECT_BILLING_NOT_OPEN|PROJECT_BILLING_NOT_FOUND|billing account .* is not open|billing must be enabled for activation|project billing.*not open|project billing.*not found'
 }
 
-billing_block_key() {
-  printf '%s|%s' "$1" "$2"
+is_auth_permission_error() {
+  local text="${1:-}"
+  echo "$text" | grep -qiE \
+    'AUTH_PERMISSION_DENIED|PERMISSION_DENIED|permission[[:space:]]+denied|does not have permission|not authorized|servicemanagement\.services\.bind|service .* is not public|service .* is not shared|not shared with'
 }
+
+is_service_usage_rate_error() {
+  local text="${1:-}"
+  echo "$text" | grep -qiE \
+    '429|RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|rate.?limit|too many requests|Mutate requests|quota.*service usage|service usage.*quota'
+}
+
+is_billing_link_quota_error() {
+  local text="${1:-}"
+  echo "$text" | grep -qiE \
+    'Cloud billing quota exceeded|billing_quota_increase|google\.rpc\.QuotaFailure.*billing|quota.*billingAccounts/'
+}
+
+billing_block_key() { printf '%s|%s' "$1" "$2"; }
+permission_block_key() { printf '%s|%s' "$1" "$2"; }
 
 mark_billing_blocked_api() {
-  local project_id="$1"
-  local api="$2"
-  BILLING_BLOCKED_APIS["$(billing_block_key "$project_id" "$api")"]=1
+  BILLING_BLOCKED_APIS["$(billing_block_key "$1" "$2")"]=1
 }
 
 is_billing_blocked_api() {
-  local project_id="$1"
-  local api="$2"
-  [ -n "${BILLING_BLOCKED_APIS[$(billing_block_key "$project_id" "$api")]+x}" ]
+  [ -n "${BILLING_BLOCKED_APIS[$(billing_block_key "$1" "$2")]+x}" ]
+}
+
+mark_permission_blocked_api() {
+  PERMISSION_BLOCKED_APIS["$(permission_block_key "$1" "$2")"]=1
+}
+
+is_permission_blocked_api() {
+  [ -n "${PERMISSION_BLOCKED_APIS[$(permission_block_key "$1" "$2")]+x}" ]
 }
 
 clear_billing_blocked_for_project() {
-  local project_id="$1"
-  local key
+  local project_id="$1" key
   for key in "${!BILLING_BLOCKED_APIS[@]}"; do
-    if [[ "$key" == "${project_id}|"* ]]; then
-      unset 'BILLING_BLOCKED_APIS[$key]'
-    fi
+    [[ "$key" == "${project_id}|"* ]] && unset 'BILLING_BLOCKED_APIS[$key]'
+  done
+}
+
+clear_permission_blocked_for_project() {
+  local project_id="$1" key
+  for key in "${!PERMISSION_BLOCKED_APIS[@]}"; do
+    [[ "$key" == "${project_id}|"* ]] && unset 'PERMISSION_BLOCKED_APIS[$key]'
   done
 }
 
@@ -417,16 +460,20 @@ link_project_to_billing() {
       log "SUCCESS" "[$project_id] Billing 状态确认: billingEnabled=true"
       clear_billing_blocked_for_project "$project_id"
     else
-      log "WARN" "[$project_id] Billing 已关联，但 billingEnabled=false；不会阻止创建项目或提取可用 Key。"
-      log "WARN" "[$project_id] 需要开放 Cloud Billing 的 API 将自动标记 BILLING_BLOCKED，并停止无意义重试。"
+      log "WARN" "[$project_id] Billing 已关联，但 billingEnabled=false；需要付费 Cloud Billing 的服务不会被反复重试。"
     fi
     return 0
   fi
 
+  if is_billing_link_quota_error "$out"; then
+    log "WARN" "[$project_id] Billing 绑定被 Cloud Billing 配额拒绝: $billing_id"
+    log "WARN" "[$project_id] Google 返回 Cloud billing quota exceeded；继续换 API/重复绑定不会立即解决。项目保留，Key 必需 API 仍会单独检测。"
+    return 21
+  fi
+
   local short_out
-  short_out=$(echo "$out" | tail -n 8 | tr '
-' ' ' | cut -c1-1200)
-  log "WARN" "[$project_id] Billing 绑定失败 ($billing_id): $short_out"
+  short_out=$(echo "$out" | tail -n 6 | tr '\n' ' ' | cut -c1-900)
+  log "WARN" "[$project_id] Billing 绑定失败 ($billing_id): ${short_out:-unknown error}"
   return 1
 }
 
@@ -580,142 +627,208 @@ unlink_projects_from_billing_account() {
 
 # ===== API enable + full verification/repair engine =====
 get_requested_api_services() {
-  printf '%s
-' "${FULL_API_SERVICES[@]}"
+  printf '%s\n' "${FULL_API_SERVICES[@]}"
+  if [ "$ENABLE_LEGACY_IAM_CONNECTORS" = "1" ]; then
+    printf '%s\n' "${LEGACY_API_SERVICES[@]}"
+  fi
 }
 
-enable_api_with_retry() {
-  local proj="$1"
-  local batch_name="$2"
+# Return codes used by the API engine:
+#   0  submitted
+#   20 billing precondition
+#   30 permission/service-visibility precondition
+#   40 transient/rate limited (defer to a later repair pass)
+#   1  other error
+enable_api_batch_once() {
+  local proj="$1" label="$2"
   shift 2
   local apis=("$@")
-
   [ "${#apis[@]}" -eq 0 ] && return 0
 
-  local attempt=1
-  local max_attempts=5
+  local out=""
+  if out=$(gcloud services enable "${apis[@]}" --project="$proj" --async --quiet 2>&1); then
+    log "SUCCESS" "[$proj] ${label} 已提交 (${#apis[@]} 个 API)"
+    return 0
+  fi
+
+  local short_out
+  short_out=$(echo "$out" | tail -n 5 | tr '\n' ' ' | cut -c1-700)
+  if is_billing_not_open_error "$out"; then
+    log "WARN" "[$proj] ${label} 命中 Billing 前置条件；不重试整包，拆分一次定位具体服务。 ${short_out}"
+    return 20
+  fi
+  if is_auth_permission_error "$out"; then
+    log "WARN" "[$proj] ${label} 命中权限/服务可见性前置条件；不重复 5 次，拆分一次定位具体服务。 ${short_out}"
+    return 30
+  fi
+  if is_service_usage_rate_error "$out"; then
+    log "WARN" "[$proj] ${label} 本轮遇到 Service Usage 限流/配额；首轮不死循环，留给后续必需 API 或补齐流程。 ${short_out}"
+    return 40
+  fi
+
+  log "WARN" "[$proj] ${label} 首轮提交失败；不重复整包，拆分一次。 ${short_out}"
+  return 1
+}
+
+enable_single_api_once() {
+  local proj="$1" api="$2"
   local out=""
 
+  if is_billing_blocked_api "$proj" "$api"; then return 20; fi
+  if is_permission_blocked_api "$proj" "$api"; then return 30; fi
+
+  if out=$(gcloud services enable "$api" --project="$proj" --async --quiet 2>&1); then
+    log "SUCCESS" "[$proj] 已提交: $api"
+    return 0
+  fi
+
+  if is_billing_not_open_error "$out"; then
+    mark_billing_blocked_api "$proj" "$api"
+    log "WARN" "[$proj] [BILLING_BLOCKED] $api"
+    return 20
+  fi
+  if is_auth_permission_error "$out"; then
+    mark_permission_blocked_api "$proj" "$api"
+    log "WARN" "[$proj] [PERMISSION_BLOCKED] $api"
+    return 30
+  fi
+  if is_service_usage_rate_error "$out"; then
+    log "WARN" "[$proj] [DEFERRED_RATE_LIMIT] $api"
+    return 40
+  fi
+
+  local short_out
+  short_out=$(echo "$out" | tail -n 3 | tr '\n' ' ' | cut -c1-500)
+  log "WARN" "[$proj] [DEFERRED] $api: ${short_out:-unknown error}"
+  return 1
+}
+
+# The first full-API phase is intentionally one-pass. It never retries the same
+# deterministic failure over and over. Failed batches are split only once when
+# that can reveal which service is blocking the batch.
+submit_api_list_first_pass() {
+  local proj="$1" label="$2"
+  shift 2
+  local requested=("$@")
+  [ "${#requested[@]}" -eq 0 ] && return 0
+
+  local start=0 batch_num=1 total=${#requested[@]} api
+  while [ "$start" -lt "$total" ]; do
+    local batch=("${requested[@]:start:API_BATCH_SIZE}")
+    local rc=0
+    enable_api_batch_once "$proj" "${label}-批次${batch_num}" "${batch[@]}" || rc=$?
+
+    case "$rc" in
+      0) ;;
+      20|30|1)
+        log "INFO" "[$proj] ${label}-批次${batch_num} 仅拆分一次，不做重复重试。"
+        for api in "${batch[@]}"; do
+          enable_single_api_once "$proj" "$api" || true
+          sleep "$FULL_API_SINGLE_GAP"
+        done
+        ;;
+      40)
+        # A rate-limited batch is deliberately deferred. The Vertex/Gemini
+        # prerequisite scanner or option 8 can retry only what actually matters.
+        ;;
+    esac
+
+    start=$((start + API_BATCH_SIZE))
+    batch_num=$((batch_num + 1))
+    [ "$start" -lt "$total" ] && sleep "$API_BATCH_GAP"
+  done
+}
+
+# Repair path used by Key prerequisites and option 8. Deterministic Billing or
+# permission failures are still fail-fast; only transient/rate-limit failures retry.
+enable_api_with_retry() {
+  local proj="$1" batch_name="$2"
+  shift 2
+  local apis=("$@")
+  [ "${#apis[@]}" -eq 0 ] && return 0
+
+  local attempt=1 max_attempts=4 out=""
   while [ "$attempt" -le "$max_attempts" ]; do
     if out=$(gcloud services enable "${apis[@]}" --project="$proj" --async --quiet 2>&1); then
       log "SUCCESS" "[$proj] ${batch_name} 已提交 (${#apis[@]} 个 API)"
       return 0
     fi
+    if is_billing_not_open_error "$out"; then return 20; fi
+    if is_auth_permission_error "$out"; then return 30; fi
 
-    # This is a Google billing precondition, not a transient network/rate error.
-    # Retrying the same batch 5 times can never fix it.
-    if is_billing_not_open_error "$out"; then
-      local short_out
-      short_out=$(echo "$out" | tail -n 5 | tr '
-' ' ' | cut -c1-700)
-      log "WARN" "[$proj] ${batch_name} 命中 BILLING_NOT_OPEN；停止整包重试，立即拆分逐项检测。 ${short_out}"
-      return 20
-    fi
-
-    if echo "$out" | grep -qiE '429|RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|quota|Mutate requests|rate.?limit'; then
-      local exp=$((1 << (attempt - 1)))
-      local delay=$((exp * 6 + RANDOM % 6))
-      [ "$delay" -gt 60 ] && delay=60
-      log "WARN" "[$proj] ${batch_name} 遇到 Service Usage 配额限制，等待 ${delay}s 后重试 (${attempt}/${max_attempts})"
+    local short_out
+    short_out=$(echo "$out" | tail -n 4 | tr '\n' ' ' | cut -c1-600)
+    if is_service_usage_rate_error "$out"; then
+      local delay=$((attempt * 8 + RANDOM % 5))
+      [ "$delay" -gt 35 ] && delay=35
+      log "WARN" "[$proj] ${batch_name} 限流，等待 ${delay}s 后重试 (${attempt}/${max_attempts})"
       sleep "$delay"
     else
-      local short_out
-      short_out=$(echo "$out" | tail -n 3 | tr '
-' ' ' | cut -c1-500)
-      log "WARN" "[$proj] ${batch_name} 提交失败 (${attempt}/${max_attempts}): ${short_out}"
-      sleep $((5 + attempt * 2))
+      log "WARN" "[$proj] ${batch_name} 临时失败 (${attempt}/${max_attempts}): $short_out"
+      sleep $((3 + attempt * 2))
     fi
-
     attempt=$((attempt + 1))
   done
-
   return 1
 }
 
 enable_single_api_with_retry() {
-  local proj="$1"
-  local api="$2"
-  local attempt=1
-  local max_attempts=4
-  local out=""
-
-  # If this exact API was already proven billing-blocked during this run, don't
-  # send it again until the project's billingEnabled state changes.
-  if is_billing_blocked_api "$proj" "$api"; then
-    return 20
-  fi
+  local proj="$1" api="$2" attempt=1 max_attempts=4 out=""
+  if is_billing_blocked_api "$proj" "$api"; then return 20; fi
+  if is_permission_blocked_api "$proj" "$api"; then return 30; fi
 
   while [ "$attempt" -le "$max_attempts" ]; do
     if out=$(gcloud services enable "$api" --project="$proj" --async --quiet 2>&1); then
       log "SUCCESS" "[$proj] 已提交: $api"
       return 0
     fi
-
     if is_billing_not_open_error "$out"; then
       mark_billing_blocked_api "$proj" "$api"
       log "WARN" "[$proj] [BILLING_BLOCKED] $api"
       return 20
     fi
+    if is_auth_permission_error "$out"; then
+      mark_permission_blocked_api "$proj" "$api"
+      log "WARN" "[$proj] [PERMISSION_BLOCKED] $api"
+      return 30
+    fi
 
-    if echo "$out" | grep -qiE '429|RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|quota|Mutate requests|rate.?limit'; then
-      local delay=$((attempt * 12 + RANDOM % 8))
-      log "WARN" "[$proj] $api 遇到配额限制，等待 ${delay}s (${attempt}/${max_attempts})"
+    local short_out
+    short_out=$(echo "$out" | tail -n 3 | tr '\n' ' ' | cut -c1-500)
+    if is_service_usage_rate_error "$out"; then
+      local delay=$((attempt * 8 + RANDOM % 5))
+      log "WARN" "[$proj] $api 限流，等待 ${delay}s (${attempt}/${max_attempts})"
       sleep "$delay"
     else
-      local short_out
-      short_out=$(echo "$out" | tail -n 2 | tr '
-' ' ' | cut -c1-400)
-      log "WARN" "[$proj] $api 暂未成功: $short_out"
-      sleep $((4 + attempt * 2))
+      log "WARN" "[$proj] $api 临时失败 (${attempt}/${max_attempts}): $short_out"
+      sleep $((3 + attempt * 2))
     fi
     attempt=$((attempt + 1))
   done
-
   return 1
 }
 
 submit_api_list_batched() {
-  local proj="$1"
-  local label="$2"
+  local proj="$1" label="$2"
   shift 2
   local requested=("$@")
-
   [ "${#requested[@]}" -eq 0 ] && return 0
 
-  local start=0
-  local batch_num=1
-  local total=${#requested[@]}
-  local api
-
+  local start=0 batch_num=1 total=${#requested[@]} api
   while [ "$start" -lt "$total" ]; do
     local batch=("${requested[@]:start:API_BATCH_SIZE}")
-    local batch_rc=0
-    enable_api_with_retry "$proj" "${label}-批次${batch_num}" "${batch[@]}" || batch_rc=$?
-
-    if [ "$batch_rc" -ne 0 ]; then
-      if [ "$batch_rc" -eq 20 ]; then
-        log "WARN" "[$proj] ${label}-批次${batch_num} 含至少一个 Billing 不可用服务；不再重试整包，逐项探测一次。"
-      else
-        log "WARN" "[$proj] ${label}-批次${batch_num} 整包失败，改为逐个补发"
-      fi
-
+    local rc=0
+    enable_api_with_retry "$proj" "${label}-批次${batch_num}" "${batch[@]}" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      log "INFO" "[$proj] ${label}-批次${batch_num} 改为逐项处理一次/重试可恢复错误。"
       for api in "${batch[@]}"; do
-        local single_rc=0
-        enable_single_api_with_retry "$proj" "$api" || single_rc=$?
-        case "$single_rc" in
-          0) ;;
-          20) ;; # Already logged and recorded as BILLING_BLOCKED.
-          *) log "ERROR" "[$proj] 最终未能提交: $api" ;;
-        esac
-        sleep 1
+        enable_single_api_with_retry "$proj" "$api" || true
+        sleep "$FULL_API_SINGLE_GAP"
       done
     fi
-
     start=$((start + API_BATCH_SIZE))
     batch_num=$((batch_num + 1))
-    if [ "$start" -lt "$total" ]; then
-      sleep "$API_BATCH_GAP"
-    fi
+    [ "$start" -lt "$total" ] && sleep "$API_BATCH_GAP"
   done
 }
 
@@ -741,8 +854,7 @@ get_missing_api_subset() {
 }
 
 show_api_subset_scan() {
-  local pid="$1"
-  local label="$2"
+  local pid="$1" label="$2"
   shift 2
   local services=("$@")
   local enabled_list
@@ -750,9 +862,7 @@ show_api_subset_scan() {
 
   declare -A enabled_map=()
   local svc
-  while IFS= read -r svc; do
-    [ -n "$svc" ] && enabled_map["$svc"]=1
-  done <<< "$enabled_list"
+  while IFS= read -r svc; do [ -n "$svc" ] && enabled_map["$svc"]=1; done <<< "$enabled_list"
 
   log "INFO" "[$pid] ${label} 扫描 ${#services[@]} 个必需 API"
   for svc in "${services[@]}"; do
@@ -760,6 +870,8 @@ show_api_subset_scan() {
       echo -e "${GREEN}  [ENABLED] ${svc}${NC}" >&2
     elif is_billing_blocked_api "$pid" "$svc"; then
       echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
+    elif is_permission_blocked_api "$pid" "$svc"; then
+      echo -e "${YELLOW}  [PERMISSION_BLOCKED] ${svc}${NC}" >&2
     else
       echo -e "${RED}  [MISSING] ${svc}${NC}" >&2
     fi
@@ -767,56 +879,44 @@ show_api_subset_scan() {
 }
 
 ensure_api_subset() {
-  local pid="$1"
-  local label="$2"
+  local pid="$1" label="$2"
   shift 2
-  local services=("$@")
-  local round=1
+  local services=("$@") round=1
 
-  if project_billing_enabled "$pid"; then
-    clear_billing_blocked_for_project "$pid"
-  fi
-
-  # Scan first, then submit only the missing required APIs.
+  if project_billing_enabled "$pid"; then clear_billing_blocked_for_project "$pid"; fi
   show_api_subset_scan "$pid" "$label" "${services[@]}"
 
   while [ "$round" -le "$API_REPAIR_ROUNDS" ]; do
-    local missing=()
+    local missing=() repairable=() billing_blocked=() permission_blocked=() svc
     mapfile -t missing < <(get_missing_api_subset "$pid" "${services[@]}")
     if [ "${#missing[@]}" -eq 0 ]; then
       log "SUCCESS" "[$pid] ${label} 必需 API 已全部就绪：${#services[@]}/${#services[@]}"
       return 0
     fi
 
-    local repairable=()
-    local blocked=()
-    local svc
     for svc in "${missing[@]}"; do
       if is_billing_blocked_api "$pid" "$svc"; then
-        blocked+=("$svc")
+        billing_blocked+=("$svc")
+      elif is_permission_blocked_api "$pid" "$svc"; then
+        permission_blocked+=("$svc")
       else
         repairable+=("$svc")
       fi
     done
 
-    log "WARN" "[$pid] ${label} 第 ${round}/${API_REPAIR_ROUNDS} 轮：缺失 ${#missing[@]} | 补发 ${#repairable[@]} | Billing阻止 ${#blocked[@]}"
-    for svc in "${blocked[@]}"; do
-      echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
-    done
-    for svc in "${repairable[@]}"; do
-      echo -e "${CYAN}  [REPAIR] ${svc}${NC}" >&2
-    done
+    log "WARN" "[$pid] ${label} 第 ${round}/${API_REPAIR_ROUNDS} 轮：缺失 ${#missing[@]} | 补发 ${#repairable[@]} | Billing阻止 ${#billing_blocked[@]} | 权限阻止 ${#permission_blocked[@]}"
+    for svc in "${billing_blocked[@]}"; do echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2; done
+    for svc in "${permission_blocked[@]}"; do echo -e "${YELLOW}  [PERMISSION_BLOCKED] ${svc}${NC}" >&2; done
+    for svc in "${repairable[@]}"; do echo -e "${CYAN}  [REPAIR] ${svc}${NC}" >&2; done
 
     if [ "${#repairable[@]}" -eq 0 ]; then
-      log "ERROR" "[$pid] ${label} 存在必需 API 被 Billing 状态阻止，无法继续该 Key 流程。"
+      log "ERROR" "[$pid] ${label} 的剩余必需 API 都是不可重试前置条件；停止死循环。"
       return 2
     fi
 
     submit_api_list_batched "$pid" "${label}-补发${round}" "${repairable[@]}"
     sleep "$API_REPAIR_SLEEP"
-    if project_billing_enabled "$pid"; then
-      clear_billing_blocked_for_project "$pid"
-    fi
+    if project_billing_enabled "$pid"; then clear_billing_blocked_for_project "$pid"; fi
     round=$((round + 1))
   done
 
@@ -854,24 +954,25 @@ show_key_api_summary() {
 
 v60_enable_all_services() {
   local proj="$1"
-  local requested=()
-  local api
-  while IFS= read -r api; do
-    [ -n "$api" ] && requested+=("$api")
-  done < <(get_requested_api_services)
+  local requested=() api
+  while IFS= read -r api; do [ -n "$api" ] && requested+=("$api"); done < <(get_requested_api_services)
 
-  # Re-opened billing can make previously blocked APIs available. Clear the
-  # per-process block cache when Google says billingEnabled=true.
   if project_billing_enabled "$proj"; then
     clear_billing_blocked_for_project "$proj"
     log "INFO" "[$proj] Project Billing: billingEnabled=true"
   else
-    log "WARN" "[$proj] Project Billing: billingEnabled=false/unknown；仍会启用所有可用 API，Billing 限制项只尝试一次。"
+    log "WARN" "[$proj] Project Billing: billingEnabled=false/unknown"
+    if [ "$FORCE_FULL_API_WITHOUT_BILLING" != "1" ]; then
+      log "WARN" "[$proj] 根据 ProjectBillingInfo，付费 Cloud 服务当前不可用；跳过全套 ${#requested[@]} API 首轮，避免大量 BILLING_NOT_FOUND/BILLING_NOT_OPEN。"
+      log "INFO" "[$proj] Vertex/Gemini 必需 API 会在 Key 前置扫描阶段单独检测和补发。"
+      return 2
+    fi
+    log "WARN" "[$proj] FORCE_FULL_API_WITHOUT_BILLING=1：仍强制尝试全套 API 首轮。"
   fi
 
-  log "INFO" "[$proj] 准备提交 Agent Studio / Agent Platform 全套 API，共 ${#requested[@]} 个"
-  submit_api_list_batched "$proj" "API" "${requested[@]}"
-  log "INFO" "[$proj] 全套 API 首轮扫描/提交完成"
+  log "INFO" "[$proj] 全套 API 首轮：仅尝试一次，共 ${#requested[@]} 个；确定性错误不会重复轰炸。"
+  submit_api_list_first_pass "$proj" "API" "${requested[@]}"
+  log "INFO" "[$proj] 全套 API 首轮完成"
 }
 
 # Backward-compatible names used by older branches of this script.
@@ -900,139 +1001,72 @@ get_missing_requested_apis() {
 }
 
 get_repairable_missing_apis() {
-  local pid="$1"
-  local svc
+  local pid="$1" svc
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
-    if ! is_billing_blocked_api "$pid" "$svc"; then
-      printf '%s
-' "$svc"
-    fi
+    if ! is_billing_blocked_api "$pid" "$svc" && ! is_permission_blocked_api "$pid" "$svc"; then printf '%s\n' "$svc"; fi
   done < <(get_missing_requested_apis "$pid")
 }
 
 get_billing_blocked_missing_apis() {
-  local pid="$1"
-  local svc
+  local pid="$1" svc
   while IFS= read -r svc; do
-    [ -z "$svc" ] && continue
-    if is_billing_blocked_api "$pid" "$svc"; then
-      printf '%s
-' "$svc"
-    fi
+    [ -n "$svc" ] && is_billing_blocked_api "$pid" "$svc" && printf '%s\n' "$svc"
+  done < <(get_missing_requested_apis "$pid")
+}
+
+get_permission_blocked_missing_apis() {
+  local pid="$1" svc
+  while IFS= read -r svc; do
+    [ -n "$svc" ] && is_permission_blocked_api "$pid" "$svc" && printf '%s\n' "$svc"
   done < <(get_missing_requested_apis "$pid")
 }
 
 check_api_ready() {
-  local pid="$1"
-  local stage="$2"
-  local round=1
-  local total
+  local pid="$1" stage="$2" round=1 total
   total=$(get_requested_api_services | grep -c . || true)
+  if project_billing_enabled "$pid"; then clear_billing_blocked_for_project "$pid"; fi
 
-  if project_billing_enabled "$pid"; then
-    clear_billing_blocked_for_project "$pid"
-  fi
-
-  log "INFO" "[$pid] ${stage} 开始全量核验 ${total} 个 API；普通缺失自动补发，Billing 阻止项不会死循环"
-
+  log "INFO" "[$pid] ${stage} 全量核验 ${total} 个 API；Billing/权限确定性失败不重复请求"
   while [ "$round" -le "$API_REPAIR_ROUNDS" ]; do
-    local missing=()
-    local repairable=()
-    local blocked=()
+    local missing=() repairable=() billing_blocked=() permission_blocked=() svc
     mapfile -t missing < <(get_missing_requested_apis "$pid")
-
     if [ "${#missing[@]}" -eq 0 ]; then
-      log "SUCCESS" "[$pid] ${stage} 全量核验通过：${total}/${total} 个 API 已启用"
+      log "SUCCESS" "[$pid] ${stage} 全量核验通过：${total}/${total}"
       return 0
     fi
-
     mapfile -t repairable < <(get_repairable_missing_apis "$pid")
-    mapfile -t blocked < <(get_billing_blocked_missing_apis "$pid")
-
-    log "WARN" "[$pid] ${stage} 第 ${round}/${API_REPAIR_ROUNDS} 轮：缺失 ${#missing[@]} | 可补发 ${#repairable[@]} | Billing阻止 ${#blocked[@]}"
-
-    local svc
-    for svc in "${blocked[@]}"; do
-      echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
-    done
-    for svc in "${repairable[@]}"; do
-      echo -e "${YELLOW}  [REPAIR] ${svc}${NC}" >&2
-    done
-
-    # Nothing left to repair: all remaining gaps are a known Billing precondition.
+    mapfile -t billing_blocked < <(get_billing_blocked_missing_apis "$pid")
+    mapfile -t permission_blocked < <(get_permission_blocked_missing_apis "$pid")
+    log "WARN" "[$pid] ${stage} 第 ${round}/${API_REPAIR_ROUNDS} 轮：缺失 ${#missing[@]} | 可补发 ${#repairable[@]} | Billing阻止 ${#billing_blocked[@]} | 权限阻止 ${#permission_blocked[@]}"
+    for svc in "${billing_blocked[@]}"; do echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2; done
+    for svc in "${permission_blocked[@]}"; do echo -e "${YELLOW}  [PERMISSION_BLOCKED] ${svc}${NC}" >&2; done
+    for svc in "${repairable[@]}"; do echo -e "${CYAN}  [REPAIR] ${svc}${NC}" >&2; done
     if [ "${#repairable[@]}" -eq 0 ]; then
-      log "WARN" "[$pid] ${stage} 剩余 ${#blocked[@]} 个 API 均被 Cloud Billing 状态阻止；停止重复请求，继续后续 Key 流程。"
+      log "WARN" "[$pid] ${stage} 剩余缺失均为不可重试前置条件；停止。"
       return 2
     fi
-
     submit_api_list_batched "$pid" "补发${round}" "${repairable[@]}"
-    log "INFO" "[$pid] 补发完成，等待 ${API_REPAIR_SLEEP}s 后重新核验"
     sleep "$API_REPAIR_SLEEP"
-
-    # If billing was activated while the script was running, immediately allow
-    # formerly blocked APIs to enter the next repair round.
-    if project_billing_enabled "$pid"; then
-      clear_billing_blocked_for_project "$pid"
-    fi
-
+    if project_billing_enabled "$pid"; then clear_billing_blocked_for_project "$pid"; fi
     round=$((round + 1))
-  done
-
-  local final_missing=()
-  local final_blocked=()
-  local final_repairable=()
-  mapfile -t final_missing < <(get_missing_requested_apis "$pid")
-  mapfile -t final_blocked < <(get_billing_blocked_missing_apis "$pid")
-  mapfile -t final_repairable < <(get_repairable_missing_apis "$pid")
-
-  if [ "${#final_missing[@]}" -eq 0 ]; then
-    log "SUCCESS" "[$pid] ${stage} 全量核验通过：${total}/${total} 个 API 已启用"
-    return 0
-  fi
-
-  if [ "${#final_repairable[@]}" -eq 0 ] && [ "${#final_blocked[@]}" -gt 0 ]; then
-    log "WARN" "[$pid] ${stage} 核验结束：${#final_blocked[@]} 个 API 因 Cloud Billing 未开放而未启用；不再重试。"
-    return 2
-  fi
-
-  log "ERROR" "[$pid] ${stage} 完成 ${API_REPAIR_ROUNDS} 轮后仍有 ${#final_missing[@]} 个 API 未启用"
-  local svc
-  for svc in "${final_blocked[@]}"; do
-    echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
-  done
-  for svc in "${final_repairable[@]}"; do
-    echo -e "${RED}  [MISSING] ${svc}${NC}" >&2
   done
   return 1
 }
 
 show_enabled_api_summary() {
-  local pid="$1"
-  local total
+  local pid="$1" total
   total=$(get_requested_api_services | grep -c . || true)
-  local missing=()
-  local blocked=()
-  local repairable=()
+  local missing=() billing_blocked=() permission_blocked=() repairable=() svc
   mapfile -t missing < <(get_missing_requested_apis "$pid")
-  mapfile -t blocked < <(get_billing_blocked_missing_apis "$pid")
+  mapfile -t billing_blocked < <(get_billing_blocked_missing_apis "$pid")
+  mapfile -t permission_blocked < <(get_permission_blocked_missing_apis "$pid")
   mapfile -t repairable < <(get_repairable_missing_apis "$pid")
   local ok=$((total - ${#missing[@]}))
-
-  log "INFO" "[$pid] API 汇总: ENABLED ${ok}/${total} | BILLING_BLOCKED ${#blocked[@]} | MISSING ${#repairable[@]}"
-
-  local svc
-  for svc in "${blocked[@]}"; do
-    echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2
-  done
-  for svc in "${repairable[@]}"; do
-    echo -e "${RED}  [MISSING] ${svc}${NC}" >&2
-  done
-
-  if [ "${#blocked[@]}" -gt 0 ]; then
-    echo -e "${YELLOW}  提示：这些 API 不是脚本重试能解决的；Google 返回的前置条件是 Cloud Billing 未开放。${NC}" >&2
-    echo -e "${CYAN}  Activate / Billing: https://console.cloud.google.com/welcome${NC}" >&2
-  fi
+  log "INFO" "[$pid] API 汇总: ENABLED ${ok}/${total} | BILLING_BLOCKED ${#billing_blocked[@]} | PERMISSION_BLOCKED ${#permission_blocked[@]} | MISSING ${#repairable[@]}"
+  for svc in "${billing_blocked[@]}"; do echo -e "${YELLOW}  [BILLING_BLOCKED] ${svc}${NC}" >&2; done
+  for svc in "${permission_blocked[@]}"; do echo -e "${YELLOW}  [PERMISSION_BLOCKED] ${svc}${NC}" >&2; done
+  for svc in "${repairable[@]}"; do echo -e "${RED}  [MISSING] ${svc}${NC}" >&2; done
 }
 
 submit_projects_api_phase() {
@@ -1053,7 +1087,7 @@ submit_projects_api_phase() {
       sleep "$PROJECT_SUBMIT_GAP"
     fi
   done
-  log "SUCCESS" "API 第一阶段完成：${total} 个项目均已完成首轮提交"
+  log "SUCCESS" "API 第一阶段完成：${total} 个项目均已完成首轮处理；billingEnabled=false 的项目会自动跳过高噪声全套请求。"
 }
 
 # ===== Gemini API / AI Studio standard key =====
@@ -2194,7 +2228,7 @@ option10_vertex_two_projects() {
     echo -e "  ${GREEN}${pid}${NC}"
   done
 
-  log "INFO" "====== 选项10 第一阶段：两个项目各尝试一轮全套 API ======"
+  log "INFO" "====== 选项10 第一阶段：billingEnabled=true 的项目各做一轮全套 API；未启用 Billing 的项目自动跳过噪声 ======"
   submit_projects_api_phase "${created_pids[@]}"
 
   log "INFO" "====== 选项10 第二阶段：只扫描/补齐 Vertex key 必需 API，然后提取 key ======"
@@ -2245,7 +2279,7 @@ option10_vertex_two_projects() {
   fi
 
   if [ "${#vertex_keys[@]}" -eq 2 ]; then
-    log "SUCCESS" "选项10 完成：2 个新项目均完成全套 API 首轮，并成功提取 2 个 Vertex Authorization key。"
+    log "SUCCESS" "选项10 完成：2 个新项目均完成首轮 API 处理，并成功提取 2 个 Vertex Authorization key。"
     return 0
   fi
 
@@ -2254,14 +2288,21 @@ option10_vertex_two_projects() {
 }
 
 show_api_catalog() {
+  local requested_total
+  requested_total=$(get_requested_api_services | grep -c . || true)
   echo -e "
-${CYAN}${BOLD}====== v${VERSION} 首次新项目全套 API (${#FULL_API_SERVICES[@]} 个) ======${NC}"
+${CYAN}${BOLD}====== v${VERSION} 首次新项目全套 API (${requested_total} 个) ======${NC}"
   local svc
   for svc in "${CORE_API_SERVICES[@]}"; do echo "[CORE]      $svc"; done
   for svc in "${AGENT_PLATFORM_API_SERVICES[@]}"; do echo "[AGENT]     $svc"; done
   for svc in "${APP_LIFECYCLE_DEPENDENCY_SERVICES[@]}"; do echo "[LIFECYCLE] $svc"; done
   for svc in "${RUNTIME_API_SERVICES[@]}"; do echo "[RUNTIME]   $svc"; done
   for svc in "${COMPAT_API_SERVICES[@]}"; do echo "[COMPAT]    $svc"; done
+  if [ "$ENABLE_LEGACY_IAM_CONNECTORS" = "1" ]; then
+    for svc in "${LEGACY_API_SERVICES[@]}"; do echo "[LEGACY]    $svc"; done
+  else
+    for svc in "${LEGACY_API_SERVICES[@]}"; do echo "[LEGACY-OFF] $svc"; done
+  fi
 
   echo -e "
 ${YELLOW}${BOLD}Vertex Authorization key 强制核验 API (${#VERTEX_KEY_REQUIRED_SERVICES[@]} 个)：${NC}"
@@ -2272,7 +2313,8 @@ ${GREEN}${BOLD}Gemini 标准 key 强制核验 API (${#GEMINI_KEY_REQUIRED_SERVIC
   for svc in "${GEMINI_KEY_REQUIRED_SERVICES[@]}"; do echo "[GEMINI-REQ] $svc"; done
 
   echo
-  echo "规则：新项目首次仍尝试全套 API；提 Key 时只扫描/补发必需集合，其他 Agent/Runtime API 缺失不阻止 Key。"
+  echo "规则：billingEnabled=true 的新项目首轮只尝试一次全套 API；提 Key 时只扫描/补发必需集合。"
+  echo "IAM Connectors 已按 Google 最新迁移文档改为可选：ENABLE_LEGACY_IAM_CONNECTORS=1 才启用。"
 }
 
 # ===== Main menu =====
