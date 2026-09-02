@@ -575,3 +575,7 @@ main() {
   say "等待 SOCKS5 后台任务结束..."
   local proxy_ready=0
   if wait "$proxy_pid" && [ -s "$PROXY_OUT" ]; then
+    proxy_ready=1
+  fi
+
+  print_final_result "$proxy_ready" "${keys[@]}"
