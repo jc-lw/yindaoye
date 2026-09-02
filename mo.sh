@@ -3012,3 +3012,4 @@ allinone_main() {
 
   echo
   ok "完成：项目=${#target_projects[@]}，Vertex key=${#keys[@]}，代理=$([ "$proxy_ready" -eq 1 ] && echo ready || echo unavailable)"
+  [ -n "$proxy_hostport" ] && echo "Proxy host:port: $proxy_hostport"
