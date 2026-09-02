@@ -62,9 +62,13 @@ require_cmd_local() {
 }
 
 # ------------------------------------------------------------
-# Load test.sh only as a function library.
+# Download/prepare test.sh. IMPORTANT: the actual `source` must happen
+# at TOP LEVEL, not inside a function. test.sh declares associative arrays
+# with `declare -A`; sourcing it inside a function makes those declarations
+# local to that function and later turns keys like "project|api.googleapis.com"
+# into invalid arithmetic array subscripts. kn.sh sources test.sh at top level.
 # ------------------------------------------------------------
-load_testsh_library() {
+prepare_testsh_file() {
   say "下载 test.sh 函数库: $TESTSH_URL"
 
   if ! curl -fsSL "$TESTSH_URL" -o "$TESTSH"; then
@@ -72,29 +76,17 @@ load_testsh_library() {
     exit 1
   fi
 
-  # Catch truncated/broken remote files before sourcing them.
   if ! bash -n "$TESTSH"; then
     err "远程 test.sh 本身存在 Bash 语法错误，已停止。"
     err "请先修复 GitHub 上的 test.sh。"
     exit 1
   fi
 
-  # test.sh ends with a standalone `main`; disable only that invocation.
-  sed -i -E 's/^[[:space:]]*main[[:space:]]*$/: # main disabled by mo_clean.sh/' "$TESTSH"
+  # Disable only the standalone menu entry invocation.
+  sed -i -E 's/^[[:space:]]*main[[:space:]]*$/: # main disabled by mo.sh/' "$TESTSH"
+}
 
-  # shellcheck disable=SC1090
-  source "$TESTSH" >/dev/null 2>&1 || true
-
-  # test.sh may enable strict shell/traps. Keep this controller independent.
-  set +Eeu +o pipefail 2>/dev/null || true
-  trap - ERR 2>/dev/null || true
-
-  # source runs inside this loader function, so plain `declare -A` from test.sh
-  # would otherwise be local to this function and disappear on return.
-  # Re-create the two API state maps as GLOBAL associative arrays.
-  declare -gA BILLING_BLOCKED_APIS=()
-  declare -gA PERMISSION_BLOCKED_APIS=()
-
+validate_testsh_library() {
   local fn
   for fn in \
     check_env \
@@ -110,7 +102,17 @@ load_testsh_library() {
     fi
   done
 
-  ok "test.sh 函数库加载完成"
+  # Hard check for the exact state type that failed in v1.0.0.
+  if ! declare -p BILLING_BLOCKED_APIS 2>/dev/null | grep -q '^declare -A '; then
+    err "test.sh 的 BILLING_BLOCKED_APIS 不是全局关联数组，停止运行。"
+    exit 1
+  fi
+  if ! declare -p PERMISSION_BLOCKED_APIS 2>/dev/null | grep -q '^declare -A '; then
+    err "test.sh 的 PERMISSION_BLOCKED_APIS 不是全局关联数组，停止运行。"
+    exit 1
+  fi
+
+  ok "test.sh 函数库加载完成（关联数组作用域正常）"
 }
 
 # ------------------------------------------------------------
@@ -559,7 +561,6 @@ main() {
   echo -e "${CYAN}${BOLD}====== GCP Vertex + SOCKS5 自动化 v$VERSION ======${NC}"
   echo ""
 
-  load_testsh_library
   check_env
 
   local account
@@ -586,6 +587,26 @@ main() {
 
   print_final_result "$proxy_ready" "${keys[@]}"
 }
+
+# ------------------------------------------------------------
+# Bootstrap test.sh exactly like kn.sh: prepare it, then source it at TOP LEVEL.
+# This preserves test.sh's `declare -A` arrays as global associative arrays.
+# ------------------------------------------------------------
+require_cmd_local gcloud
+require_cmd_local curl
+require_cmd_local openssl
+require_cmd_local timeout
+require_cmd_local shuf
+
+prepare_testsh_file
+# shellcheck disable=SC1090
+source "$TESTSH" >/dev/null 2>&1 || true
+
+# test.sh enables strict mode/ERR trap; keep controller behavior independent.
+set +Eeu +o pipefail 2>/dev/null || true
+trap - ERR 2>/dev/null || true
+
+validate_testsh_library
 
 main "$@"
 
