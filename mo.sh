@@ -579,3 +579,8 @@ main() {
   fi
 
   print_final_result "$proxy_ready" "${keys[@]}"
+}
+
+main "$@"
+
+# MO_EOF_OK_v2
