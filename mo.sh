@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 TESTSH_URL="${TESTSH_URL:-https://raw.githubusercontent.com/jc-lw/yindaoye/refs/heads/main/test.sh}"
 NEED_PROJECTS="${NEED_PROJECTS:-2}"
 REUSE_PROXY="${REUSE_PROXY:-1}"
@@ -88,6 +88,12 @@ load_testsh_library() {
   # test.sh may enable strict shell/traps. Keep this controller independent.
   set +Eeu +o pipefail 2>/dev/null || true
   trap - ERR 2>/dev/null || true
+
+  # source runs inside this loader function, so plain `declare -A` from test.sh
+  # would otherwise be local to this function and disappear on return.
+  # Re-create the two API state maps as GLOBAL associative arrays.
+  declare -gA BILLING_BLOCKED_APIS=()
+  declare -gA PERMISSION_BLOCKED_APIS=()
 
   local fn
   for fn in \
@@ -583,4 +589,4 @@ main() {
 
 main "$@"
 
-# MO_EOF_OK_v2
+# MO_EOF_OK_v3
