@@ -3008,8 +3008,3 @@ allinone_main() {
     upload_results "$account" "$proxy_url" "${keys[@]}" || true
   else
     warn "没有 SOCKS5，因此跳过 Key+Proxy 上传"
-  fi
-
-  echo
-  ok "完成：项目=${#target_projects[@]}，Vertex key=${#keys[@]}，代理=$([ "$proxy_ready" -eq 1 ] && echo ready || echo unavailable)"
-  [ -n "$proxy_hostport" ] && echo "Proxy host:port: $proxy_hostport"
