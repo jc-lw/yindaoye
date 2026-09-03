@@ -1,10 +1,10 @@
 
-# mo_v7.sh
+# mo_v8.sh
 # Minimal controller: reuse/create 2 billed projects -> parallel Vertex AQ keys
 # + account-wide SOCKS5 reuse/create with repair/fallback -> print only.
 set -uo pipefail
 
-VERSION="7.0.0"
+VERSION="8.0.0"
 TESTSH_URL="${TESTSH_URL:-https://raw.githubusercontent.com/jc-lw/yindaoye/refs/heads/main/test.sh}"
 NEED_PROJECTS="${NEED_PROJECTS:-2}"
 REUSE_PROXY="${REUSE_PROXY:-1}"
@@ -12,6 +12,8 @@ REUSE_KEYS="${REUSE_KEYS:-1}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 PROXY_ZONE_TRIES="${PROXY_ZONE_TRIES:-8}"
 PROXY_WAIT_SECONDS="${PROXY_WAIT_SECONDS:-180}"
+PROXY_REUSE_GRACE_SECONDS="${PROXY_REUSE_GRACE_SECONDS:-20}"
+PROXY_ZONES_PER_PROJECT="${PROXY_ZONES_PER_PROJECT:-3}"
 
 # Only shorten waits used by test.sh. Vertex SA propagation waits are untouched.
 export PROJECT_SUBMIT_GAP="${PROJECT_SUBMIT_GAP:-1}"
@@ -76,21 +78,46 @@ mo_wait_proxy() {
   return 1
 }
 
-mo_ensure_compute_api() {
-  local project="$1" i
-  for i in 1 2 3; do
-    if gcloud services list --project="$project" --enabled \
-      --filter='config.name=compute.googleapis.com' \
-      --format='value(config.name)' 2>/dev/null | grep -qx 'compute.googleapis.com'; then
-      return 0
-    fi
-    say "[代理] 启用 Compute Engine API (${i}/3)..."
-    gcloud services enable compute.googleapis.com --project="$project" --quiet >/dev/null 2>&1 || true
-    sleep 5
-  done
+mo_compute_enabled() {
+  local project="$1"
   gcloud services list --project="$project" --enabled \
     --filter='config.name=compute.googleapis.com' \
     --format='value(config.name)' 2>/dev/null | grep -qx 'compute.googleapis.com'
+}
+
+mo_ensure_compute_api() {
+  local project="$1" i j out rc tailmsg
+  mo_compute_enabled "$project" && return 0
+
+  for i in 1 2 3; do
+    say "[代理] [$project] 启用 Compute Engine API (${i}/3)..."
+    out=$(gcloud services enable compute.googleapis.com --project="$project" --quiet 2>&1); rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+      # Service Usage can return before the API is visible to Compute. Poll instead
+      # of blindly submitting the same enable request again.
+      for j in $(seq 1 12); do
+        mo_compute_enabled "$project" && return 0
+        sleep 5
+      done
+      warn "[代理] [$project] Compute API 启用请求成功，但 60 秒内仍未确认生效"
+      return 2
+    fi
+
+    tailmsg=$(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ' | cut -c1-260)
+    if printf '%s' "$out" | grep -qiE 'UREQ_PROJECT_BILLING_NOT_OPEN|UREQ_PROJECT_BILLING_NOT_FOUND|PROJECT_BILLING_NOT_OPEN|PROJECT_BILLING_NOT_FOUND|billing.*(not open|not enabled|disabled)|FAILED_PRECONDITION.*billing'; then
+      warn "[代理] [$project] Compute API 被 Cloud Billing 前置条件阻止，换项目。${tailmsg}"
+      return 20
+    fi
+    if printf '%s' "$out" | grep -qiE 'PERMISSION_DENIED|AUTH_PERMISSION_DENIED|not authorized|does not have permission|organization policy'; then
+      warn "[代理] [$project] Compute API 被权限/组织策略阻止，换项目。${tailmsg}"
+      return 30
+    fi
+
+    warn "[代理] [$project] Compute API 启用失败，准备重试。${tailmsg}"
+    sleep $((i * 5))
+  done
+  return 1
 }
 
 mo_ensure_network() {
@@ -250,7 +277,14 @@ mo_try_reuse_proxy_project() {
       ok "[代理] 复用已验证 SOCKS5: $name / $project / $ip"
       return 0
     fi
-    warn "[代理] 发现旧代理 $name，但真实 SOCKS5 测试失败，不复用"
+    warn "[代理] 发现旧代理 $name，但首次真实 SOCKS5 测试失败；等待 ${PROXY_REUSE_GRACE_SECONDS}s 后复检"
+    sleep "$PROXY_REUSE_GRACE_SECONDS"
+    if mo_proxy_test "$url"; then
+      mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$project" "$name" "$zone"
+      ok "[代理] 旧代理等待后恢复可用，直接复用: $name / $project / $ip"
+      return 0
+    fi
+    warn "[代理] 旧代理 $name 复检仍失败，不复用"
   done <<< "$rows"
   return 1
 }
@@ -263,15 +297,11 @@ mo_show_serial_tail() {
 }
 
 build_proxy() {
-  local primary_project="$1"
-  shift
   local candidates=("$@")
-  local project network startup user pass url ip instance zone vm_out rc attempt
+  local project network startup user pass url ip instance zone vm_out rc
+  local attempt_total=0 project_attempt candidate_index=0
 
-  # 1) Reuse across every candidate project supplied by the controller.
-  #    Key projects and proxy projects are intentionally decoupled: kn/le may
-  #    leave the SOCKS5 VM in a third/non-Key project. A real authenticated
-  #    SOCKS5 request must pass before reuse.
+  # Pass 1: read-only reuse across every accessible project.
   if [ "$REUSE_PROXY" != "0" ]; then
     say "[代理] 扫描当前账号全部候选项目中的现有 socks5-node..."
     for project in "${candidates[@]}"; do
@@ -280,113 +310,125 @@ build_proxy() {
     done
   fi
 
-  # 2) Create new proxy in primary target project.
-  project="$primary_project"
-  [ -z "$project" ] && { err "[代理] 没有可用于创建代理的项目"; return 1; }
-  say "[代理] 未找到可复用代理，使用项目 $project 新建"
+  # Pass 2: create only in a project whose Cloud Billing is actually enabled.
+  # Vertex AQ keys can exist even when billingEnabled=false, but Compute Engine
+  # VM creation cannot be treated the same way. A bad project must not abort the
+  # whole proxy flow: automatically continue to the next accessible project.
+  for project in "${candidates[@]}"; do
+    [ -z "$project" ] && continue
+    candidate_index=$((candidate_index + 1))
 
-  if ! mo_ensure_compute_api "$project"; then
-    err "[代理] Compute Engine API 未能启用/确认"
-    return 1
-  fi
+    if ! project_billing_enabled "$project" 2>/dev/null; then
+      warn "[代理] 跳过项目 $project：billingEnabled!=true，不能作为 Compute VM 新建候选"
+      continue
+    fi
 
-  network=$(mo_ensure_network "$project") || { err "[代理] 无可用 VPC 网络，也无法创建 kn-proxy-net"; return 1; }
-  say "[代理] 使用网络: $network"
+    say "[代理] 尝试项目 $project（候选 ${candidate_index}/${#candidates[@]}）"
+    if ! mo_ensure_compute_api "$project"; then
+      warn "[代理] 项目 $project 的 Compute API 不可用，自动换下一个项目"
+      continue
+    fi
 
-  user="usr$(openssl rand -hex 4)"
-  pass="$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)"
-  startup="/tmp/mo_startup_$$.sh"
-  mo_make_startup_script "$startup" "$PROXY_PORT" "$user" "$pass"
+    network=$(mo_ensure_network "$project") || {
+      warn "[代理] 项目 $project 无可用 VPC 且无法创建 kn-proxy-net，换项目"
+      continue
+    }
+    say "[代理] [$project] 使用网络: $network"
 
-  local zones=(
-    us-central1-a us-central1-b us-central1-c
-    us-east1-b us-east1-c us-east1-d
-    us-west1-a us-west1-b us-west1-c
-    us-east4-a us-east4-b us-east4-c
-    us-east5-a us-east5-b us-east5-c
-    us-west2-a us-west2-b us-west2-c
-    us-west3-a us-west3-b us-west3-c
-    us-west4-a us-west4-b us-west4-c
-    us-south1-a us-south1-b us-south1-c
-  )
-  mapfile -t zones < <(printf '%s\n' "${zones[@]}" | shuf)
+    user="usr$(openssl rand -hex 4)"
+    pass="$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)"
+    startup="/tmp/mo_startup_$$.sh"
+    mo_make_startup_script "$startup" "$PROXY_PORT" "$user" "$pass"
 
-  attempt=0
-  for zone in "${zones[@]}"; do
-    attempt=$((attempt + 1))
-    [ "$attempt" -gt "$PROXY_ZONE_TRIES" ] && break
-    instance="socks5-node-$(date +%s)-${attempt}"
-    say "[代理] 创建 VM: $zone (${attempt}/${PROXY_ZONE_TRIES})"
+    local zones=(
+      us-central1-a us-central1-b us-central1-c
+      us-east1-b us-east1-c us-east1-d
+      us-west1-a us-west1-b us-west1-c
+      us-east4-a us-east4-b us-east4-c
+      us-east5-a us-east5-b us-east5-c
+      us-west2-a us-west2-b us-west2-c
+      us-west3-a us-west3-b us-west3-c
+      us-west4-a us-west4-b us-west4-c
+      us-south1-a us-south1-b us-south1-c
+    )
+    mapfile -t zones < <(printf '%s\n' "${zones[@]}" | shuf)
+    project_attempt=0
 
-    vm_out=$(gcloud compute instances create "$instance" \
-      --project="$project" --zone="$zone" --machine-type=e2-micro \
-      --image-family=debian-12 --image-project=debian-cloud \
-      --network="$network" --tags=socks5-proxy \
-      --metadata=kn-proxy-user="$user",kn-proxy-pass="$pass",kn-proxy-port="$PROXY_PORT" \
-      --metadata-from-file=startup-script="$startup" --quiet 2>&1); rc=$?
+    for zone in "${zones[@]}"; do
+      [ "$attempt_total" -ge "$PROXY_ZONE_TRIES" ] && break 2
+      [ "$project_attempt" -ge "$PROXY_ZONES_PER_PROJECT" ] && break
+      attempt_total=$((attempt_total + 1))
+      project_attempt=$((project_attempt + 1))
+      instance="socks5-node-$(date +%s)-${attempt_total}"
+      say "[代理] [$project] 创建 VM: $zone（总 ${attempt_total}/${PROXY_ZONE_TRIES}，本项目 ${project_attempt}/${PROXY_ZONES_PER_PROJECT}）"
 
-    if [ "$rc" -ne 0 ]; then
-      if echo "$vm_out" | grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources|currently unavailable|resource pool exhausted'; then
-        warn "[代理] $zone 库存不足，自动换区域"
+      vm_out=$(gcloud compute instances create "$instance" \
+        --project="$project" --zone="$zone" --machine-type=e2-micro \
+        --image-family=debian-12 --image-project=debian-cloud \
+        --network="$network" --tags=socks5-proxy \
+        --metadata=kn-proxy-user="$user",kn-proxy-pass="$pass",kn-proxy-port="$PROXY_PORT" \
+        --metadata-from-file=startup-script="$startup" --quiet 2>&1); rc=$?
+
+      if [ "$rc" -ne 0 ]; then
+        if echo "$vm_out" | grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources|currently unavailable|resource pool exhausted'; then
+          warn "[代理] [$project] $zone 库存不足，换区域"
+          continue
+        fi
+        if echo "$vm_out" | grep -qiE 'PERMISSION_DENIED|AUTH_PERMISSION_DENIED|SERVICE_DISABLED|FAILED_PRECONDITION|billing|BILLING|QUOTA_EXCEEDED|quota.*exceeded'; then
+          warn "[代理] [$project] VM 被权限/API/Billing/配额阻止，换项目: $(echo "$vm_out" | tail -n 2 | tr '\n' ' ' | cut -c1-220)"
+          break
+        fi
+        warn "[代理] [$project] $zone 创建失败，继续换区域: $(echo "$vm_out" | tail -n1 | cut -c1-160)"
+        sleep 3
         continue
       fi
-      if echo "$vm_out" | grep -qiE 'PERMISSION_DENIED|QUOTA_EXCEEDED|billing|quota.*exceeded'; then
-        err "[代理] 创建 VM 被权限/配额/Billing 阻止: $(echo "$vm_out" | tail -n1 | cut -c1-180)"
-        rm -f "$startup"
-        return 1
+
+      ok "[代理] VM 已创建: $instance / $project / $zone"
+
+      if ! mo_ensure_firewall "$project" "$network" "$PROXY_PORT"; then
+        warn "[代理] 防火墙首次配置失败，5 秒后修复一次"
+        sleep 5
+        mo_ensure_firewall "$project" "$network" "$PROXY_PORT" || true
       fi
-      warn "[代理] $zone 创建失败，继续换区域: $(echo "$vm_out" | tail -n1 | cut -c1-160)"
-      sleep 3
-      continue
-    fi
 
-    ok "[代理] VM 已创建: $instance / $zone"
+      ip=$(gcloud compute instances describe "$instance" --project="$project" --zone="$zone" \
+        --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null || true)
+      if [ -z "$ip" ]; then
+        warn "[代理] VM 没有公网 IPv4，删除并继续"
+        gcloud compute instances delete "$instance" --project="$project" --zone="$zone" --delete-disks=all --quiet >/dev/null 2>&1 || true
+        continue
+      fi
 
-    # Firewall fallback #1: create OR repair existing rule.
-    if ! mo_ensure_firewall "$project" "$network" "$PROXY_PORT"; then
-      warn "[代理] 防火墙首次配置失败，等待 5 秒再修复一次"
-      sleep 5
+      url="socks5://${user}:${pass}@${ip}:${PROXY_PORT}"
+      say "[代理] 等待 microsocks + 防火墙 + 真实 SOCKS5 请求通过: ${ip}:${PROXY_PORT}"
+      if mo_wait_proxy "$url" "$ip" "$PROXY_PORT"; then
+        mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$project" "$instance" "$zone"
+        ok "[代理] SOCKS5 已验证可用: ${ip}:${PROXY_PORT}"
+        rm -f "$startup"
+        return 0
+      fi
+
+      warn "[代理] 首轮测试失败，执行兜底：防火墙重检 + VM reset + startup 重跑"
       mo_ensure_firewall "$project" "$network" "$PROXY_PORT" || true
-    fi
+      gcloud compute instances reset "$instance" --project="$project" --zone="$zone" --quiet >/dev/null 2>&1 || true
+      sleep 10
 
-    ip=$(gcloud compute instances describe "$instance" --project="$project" --zone="$zone" \
-      --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null || true)
-    if [ -z "$ip" ]; then
-      warn "[代理] VM 没有取得公网 IPv4，删除并换区域"
+      if mo_wait_proxy "$url" "$ip" "$PROXY_PORT"; then
+        mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$project" "$instance" "$zone"
+        ok "[代理] 兜底修复成功: ${ip}:${PROXY_PORT}"
+        rm -f "$startup"
+        return 0
+      fi
+
+      mo_show_serial_tail "$project" "$instance" "$zone"
+      warn "[代理] 当前 VM 修复后仍不可用，删除并继续其他区域/项目"
       gcloud compute instances delete "$instance" --project="$project" --zone="$zone" --delete-disks=all --quiet >/dev/null 2>&1 || true
-      continue
-    fi
+    done
 
-    url="socks5://${user}:${pass}@${ip}:${PROXY_PORT}"
-    say "[代理] 等待 microsocks + 防火墙 + 真实 SOCKS5 请求通过: ${ip}:${PROXY_PORT}"
-    if mo_wait_proxy "$url" "$ip" "$PROXY_PORT"; then
-      mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$project" "$instance" "$zone"
-      ok "[代理] SOCKS5 已验证可用: ${ip}:${PROXY_PORT}"
-      rm -f "$startup"
-      return 0
-    fi
-
-    # Fallback #2: firewall repair + VM reset. Startup script runs again after boot.
-    warn "[代理] 首轮真实 SOCKS5 测试失败，执行兜底修复：防火墙重检 + VM reset + startup重跑"
-    mo_ensure_firewall "$project" "$network" "$PROXY_PORT" || true
-    gcloud compute instances reset "$instance" --project="$project" --zone="$zone" --quiet >/dev/null 2>&1 || true
-    sleep 10
-
-    if mo_wait_proxy "$url" "$ip" "$PROXY_PORT"; then
-      mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$project" "$instance" "$zone"
-      ok "[代理] 兜底修复成功: ${ip}:${PROXY_PORT}"
-      rm -f "$startup"
-      return 0
-    fi
-
-    # Fallback #3: diagnose then delete broken VM and move to another zone.
-    mo_show_serial_tail "$project" "$instance" "$zone"
-    warn "[代理] 当前 VM 修复后仍不可用，删除坏实例并换下一区域"
-    gcloud compute instances delete "$instance" --project="$project" --zone="$zone" --delete-disks=all --quiet >/dev/null 2>&1 || true
+    rm -f "$startup"
   done
 
-  rm -f "$startup"
-  err "[代理] 已尝试 ${PROXY_ZONE_TRIES} 个区域，仍未得到通过真实 SOCKS5 测试的代理"
+  err "[代理] 全账号候选项目均无法得到可用 SOCKS5。若所有项目 billingEnabled=false，GCP Compute VM 无法创建；Vertex AQ Key 仍可能正常。"
   return 1
 }
 
@@ -396,7 +438,7 @@ build_proxy() {
 say "下载 test.sh 函数库: $TESTSH_URL"
 curl -fsSL "$TESTSH_URL" -o "$TESTSH" || { err "下载 test.sh 失败"; exit 1; }
 bash -n "$TESTSH" || { err "远程 test.sh Bash 语法异常"; exit 1; }
-sed -i -E 's/^[[:space:]]*main[[:space:]]*$/: # main disabled by mo_v6.sh/' "$TESTSH"
+sed -i -E 's/^[[:space:]]*main[[:space:]]*$/: # main disabled by mo_v8.sh/' "$TESTSH"
 # shellcheck disable=SC1090
 source "$TESTSH" >/dev/null 2>&1 || true
 set +e +E
@@ -424,30 +466,40 @@ fi
 [ -z "$BILLING_ID" ] && { err "未找到 Billing Account"; exit 1; }
 say "使用 Billing Account: $BILLING_ID"
 
-say "扫描全部无组织/Folder父级项目，收集 billingEnabled=true 项目..."
+say "扫描全部无组织/Folder父级项目，识别 Billing 关联状态..."
 mapfile -t NOORG_PIDS < <(gcloud projects list \
   --format='value(projectId)' \
-  --filter='parent.type!=organization AND parent.type!=folder' 2>/dev/null)
+  --filter='parent.type!=organization AND parent.type!=folder' 2>/dev/null | awk 'NF && !seen[$0]++')
+mapfile -t ALL_PIDS < <(gcloud projects list --format='value(projectId)' 2>/dev/null | awk 'NF && !seen[$0]++')
 
-BILLED_PIDS=()
-for pid in "${NOORG_PIDS[@]:-}"; do
-  [ -z "$pid" ] && continue
-  if project_billing_enabled "$pid" 2>/dev/null; then
+BILLED_PIDS=()             # billingEnabled=true
+LINKED_PIDS=()             # linked to any Billing Account, even if billingEnabled=false
+SELECTED_LINKED_PIDS=()    # linked specifically to BILLING_ID
+
+for pid in "${NOORG_PIDS[@]}"; do
+  # Read the two fields separately. A leading empty billingAccountName would be
+  # lost by Bash `read` because whitespace IFS trims it, which can falsely mark
+  # an unlinked project as linked.
+  acct=$(gcloud billing projects describe "$pid" --format='value(billingAccountName)' 2>/dev/null || true)
+  enabled=$(gcloud billing projects describe "$pid" --format='value(billingEnabled)' 2>/dev/null || true)
+  acct="${acct#billingAccounts/}"
+  enabled=$(printf '%s' "$enabled" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+
+  if [ -n "$acct" ] && [ "$acct" != "None" ]; then
+    LINKED_PIDS+=("$pid")
+    [ "$acct" = "$BILLING_ID" ] && SELECTED_LINKED_PIDS+=("$pid")
+  fi
+  if [ "$enabled" = "true" ]; then
     BILLED_PIDS+=("$pid")
-    say "已绑账单: $pid"
+    say "billingEnabled=true: $pid"
   fi
 done
-say "已绑账单项目总数: ${#BILLED_PIDS[@]}"
 
-# Proxy placement is independent from Vertex-key placement. kn/le can create
-# a socks5-node in an older/default project while the two AQ keys live in two
-# newly billed projects. Therefore proxy discovery MUST scan every project the
-# active gcloud account can see, not only BILLED_PIDS.
-mapfile -t ALL_PIDS < <(gcloud projects list --format='value(projectId)' 2>/dev/null | awk 'NF && !seen[$0]++')
-mapfile -t PROXY_SCAN_PIDS < <(
-  printf '%s\n' "${BILLED_PIDS[@]}" "${ALL_PIDS[@]}" | awk 'NF && !seen[$0]++'
-)
-say "SOCKS5 扫描项目总数: ${#PROXY_SCAN_PIDS[@]}（全账号可访问项目，不要求 billingEnabled=true）"
+say "项目状态: no-org=${#NOORG_PIDS[@]} | Billing已关联=${#LINKED_PIDS[@]} | billingEnabled=true=${#BILLED_PIDS[@]}"
+
+# Proxy discovery is account-wide and independent of Vertex/Billing placement.
+mapfile -t PROXY_SCAN_PIDS < <(printf '%s\n' "${ALL_PIDS[@]}" | awk 'NF && !seen[$0]++')
+say "SOCKS5 扫描项目总数: ${#PROXY_SCAN_PIDS[@]}（全账号可访问项目）"
 
 # ------------------------------------------------------------
 # Reuse pass A: existing SOCKS5 across ALL accessible projects.
@@ -473,9 +525,10 @@ fi
 # ------------------------------------------------------------
 VKEYS=()
 KEY_PIDS=()
-if [ "$REUSE_KEYS" != "0" ] && [ "${#BILLED_PIDS[@]}" -gt 0 ]; then
-  say "优先读取现有 Vertex Authorization key；找到即复用，不重新创建..."
-  for pid in "${BILLED_PIDS[@]}"; do
+KEY_SCAN_PIDS=("${NOORG_PIDS[@]}")
+if [ "$REUSE_KEYS" != "0" ] && [ "${#KEY_SCAN_PIDS[@]}" -gt 0 ]; then
+  say "优先读取所有 no-org 项目中的现有 Vertex Authorization key；billingEnabled=false 也允许复用..."
+  for pid in "${KEY_SCAN_PIDS[@]}"; do
     sa_email="${SERVICE_ACCOUNT_NAME}@${pid}.iam.gserviceaccount.com"
     existing_key=$(find_authorization_key_string "$pid" "$sa_email" 2>/dev/null | grep -oE 'AQ\.[A-Za-z0-9_.\-]{20,}' | head -n1 || true)
     if [ -n "$existing_key" ]; then
@@ -503,10 +556,17 @@ fi
 NEED_KEYS=$((NEED_PROJECTS - ${#VKEYS[@]}))
 WORK_PIDS=()
 
+# Reuse projects already linked to Billing even when billingEnabled=false.
+# The logs prove Vertex Authorization keys can still be created in this state;
+# do not create two more projects on every rerun just because Compute is unavailable.
+mapfile -t KEY_WORK_CANDIDATES < <(
+  printf '%s\n' "${SELECTED_LINKED_PIDS[@]}" "${LINKED_PIDS[@]}" "${BILLED_PIDS[@]}" | awk 'NF && !seen[$0]++'
+)
+
 if [ "$NEED_KEYS" -gt 0 ]; then
-  for pid in "${BILLED_PIDS[@]}"; do
+  for pid in "${KEY_WORK_CANDIDATES[@]}"; do
     already=0
-    for kp in "${KEY_PIDS[@]:-}"; do
+    for kp in "${KEY_PIDS[@]}"; do
       [ "$pid" = "$kp" ] && { already=1; break; }
     done
     [ "$already" = "1" ] && continue
@@ -518,16 +578,18 @@ fi
 MISSING_PROJECTS=$((NEED_KEYS - ${#WORK_PIDS[@]}))
 NEW_PIDS=()
 if [ "$MISSING_PROJECTS" -gt 0 ]; then
-  say "现有项目还缺 $MISSING_PROJECTS 个 Key 槽位，补建项目..."
+  say "已有 Billing 关联项目仍缺 $MISSING_PROJECTS 个 Key 槽位，才补建项目..."
   create_projects_exact "$MISSING_PROJECTS" "$BILLING_ID" NEW_PIDS "mo补建" || true
-  for pid in "${NEW_PIDS[@]:-}"; do
+  for pid in "${NEW_PIDS[@]}"; do
     [ -z "$pid" ] && continue
-    BILLED_PIDS+=("$pid")
+    LINKED_PIDS+=("$pid")
+    SELECTED_LINKED_PIDS+=("$pid")
     WORK_PIDS+=("$pid")
     if project_billing_enabled "$pid" 2>/dev/null; then
+      BILLED_PIDS+=("$pid")
       ok "新项目 Billing 已生效: $pid"
     else
-      warn "新项目 Billing 未确认生效: $pid；仍尝试 Vertex key"
+      warn "新项目已关联 Billing 但 billingEnabled=false: $pid；仍尝试 Vertex key，但不会拿它强行创建 Compute VM"
     fi
   done
 fi
@@ -547,16 +609,23 @@ say "已有 Key=${#VKEYS[@]}，需要新提取=$NEED_KEYS，处理项目=${#WORK
 # ------------------------------------------------------------
 PROXY_PID=""
 if [ "$PROXY_READY" != "1" ]; then
+  # Refresh after project creation. Prioritize projects where Compute is already
+  # enabled, then billingEnabled=true projects, then the rest. build_proxy itself
+  # will skip any project that cannot legally host a Compute VM.
   mapfile -t ALL_PIDS < <(gcloud projects list --format='value(projectId)' 2>/dev/null | awk 'NF && !seen[$0]++')
-  mapfile -t PROXY_SCAN_PIDS < <(
-    printf '%s\n' "${BILLED_PIDS[@]}" "${ALL_PIDS[@]}" | awk 'NF && !seen[$0]++'
+  COMPUTE_READY_PIDS=()
+  for pid in "${ALL_PIDS[@]}"; do
+    mo_compute_enabled "$pid" && COMPUTE_READY_PIDS+=("$pid")
+  done
+  mapfile -t PROXY_CREATE_PIDS < <(
+    printf '%s\n' "${COMPUTE_READY_PIDS[@]}" "${BILLED_PIDS[@]}" "${ALL_PIDS[@]}" | awk 'NF && !seen[$0]++'
   )
-  PRIMARY_PROJECT="${BILLED_PIDS[0]:-${WORK_PIDS[0]:-}}"
-  if [ -z "$PRIMARY_PROJECT" ]; then
-    err "没有已绑账单项目可用于创建新的 SOCKS5"
+
+  if [ "${#PROXY_CREATE_PIDS[@]}" -eq 0 ]; then
+    err "没有可访问项目可用于 SOCKS5 扫描/创建"
   else
-    say "全账号仍未找到可复用 SOCKS5，后台启动创建；Vertex Key 同时处理"
-    build_proxy "$PRIMARY_PROJECT" "${PROXY_SCAN_PIDS[@]}" &
+    say "全账号仍未找到可复用 SOCKS5；按项目逐个尝试 Compute，失败自动换项目"
+    build_proxy "${PROXY_CREATE_PIDS[@]}" &
     PROXY_PID=$!
   fi
 else
@@ -647,4 +716,4 @@ printf '%s\n' "${VKEYS[@]}"
 # Exit status only; no compound Bash block after final output.
 [ "$FINAL_OK" = "1" ]
 
-# MO_V7_EOF_OK
+# MO_V8_EOF_OK
