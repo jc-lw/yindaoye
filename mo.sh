@@ -1,10 +1,10 @@
 
-# mo_v6.sh
+# mo_v7.sh
 # Minimal controller: reuse/create 2 billed projects -> parallel Vertex AQ keys
-# + reuse/create GCP SOCKS5 with repair/fallback -> print only.
+# + account-wide SOCKS5 reuse/create with repair/fallback -> print only.
 set -uo pipefail
 
-VERSION="6.0.0"
+VERSION="7.0.0"
 TESTSH_URL="${TESTSH_URL:-https://raw.githubusercontent.com/jc-lw/yindaoye/refs/heads/main/test.sh}"
 NEED_PROJECTS="${NEED_PROJECTS:-2}"
 REUSE_PROXY="${REUSE_PROXY:-1}"
@@ -268,9 +268,12 @@ build_proxy() {
   local candidates=("$@")
   local project network startup user pass url ip instance zone vm_out rc attempt
 
-  # 1) Reuse: target projects first. Real SOCKS auth test must pass.
+  # 1) Reuse across every candidate project supplied by the controller.
+  #    Key projects and proxy projects are intentionally decoupled: kn/le may
+  #    leave the SOCKS5 VM in a third/non-Key project. A real authenticated
+  #    SOCKS5 request must pass before reuse.
   if [ "$REUSE_PROXY" != "0" ]; then
-    say "[代理] 扫描目标项目中的现有 socks5-node..."
+    say "[代理] 扫描当前账号全部候选项目中的现有 socks5-node..."
     for project in "${candidates[@]}"; do
       [ -z "$project" ] && continue
       if mo_try_reuse_proxy_project "$project"; then return 0; fi
@@ -436,16 +439,26 @@ for pid in "${NOORG_PIDS[@]:-}"; do
 done
 say "已绑账单项目总数: ${#BILLED_PIDS[@]}"
 
+# Proxy placement is independent from Vertex-key placement. kn/le can create
+# a socks5-node in an older/default project while the two AQ keys live in two
+# newly billed projects. Therefore proxy discovery MUST scan every project the
+# active gcloud account can see, not only BILLED_PIDS.
+mapfile -t ALL_PIDS < <(gcloud projects list --format='value(projectId)' 2>/dev/null | awk 'NF && !seen[$0]++')
+mapfile -t PROXY_SCAN_PIDS < <(
+  printf '%s\n' "${BILLED_PIDS[@]}" "${ALL_PIDS[@]}" | awk 'NF && !seen[$0]++'
+)
+say "SOCKS5 扫描项目总数: ${#PROXY_SCAN_PIDS[@]}（全账号可访问项目，不要求 billingEnabled=true）"
+
 # ------------------------------------------------------------
-# Reuse pass A: existing SOCKS5 across ALL billed projects.
+# Reuse pass A: existing SOCKS5 across ALL accessible projects.
 # Both kn/le and mo store credentials in kn-proxy-user/pass metadata,
 # so the resources are mutually readable. A real authenticated request
-# must pass before reuse.
+# must pass before reuse. No API is enabled and no VM is created here.
 # ------------------------------------------------------------
 PROXY_READY=0
-if [ "$REUSE_PROXY" != "0" ] && [ "${#BILLED_PIDS[@]}" -gt 0 ]; then
-  say "优先扫描所有已绑账单项目中的现有 SOCKS5..."
-  for pid in "${BILLED_PIDS[@]}"; do
+if [ "$REUSE_PROXY" != "0" ] && [ "${#PROXY_SCAN_PIDS[@]}" -gt 0 ]; then
+  say "优先扫描当前账号所有可访问项目中的现有 SOCKS5..."
+  for pid in "${PROXY_SCAN_PIDS[@]}"; do
     if mo_try_reuse_proxy_project "$pid"; then
       PROXY_READY=1
       break
@@ -527,17 +540,23 @@ fi
 say "已有 Key=${#VKEYS[@]}，需要新提取=$NEED_KEYS，处理项目=${#WORK_PIDS[@]}"
 
 # ------------------------------------------------------------
-# Proxy creation only if reuse failed. Scan all billed projects again inside
-# build_proxy, then create in a usable primary project only as the final fallback.
+# Proxy creation only if account-wide reuse failed. Refresh the project list
+# once more to close the race where le/kn created a proxy while this script was
+# processing Billing/Keys. build_proxy scans ALL projects again before it creates
+# anything. New VM creation itself still uses a billed project as the primary.
 # ------------------------------------------------------------
 PROXY_PID=""
 if [ "$PROXY_READY" != "1" ]; then
+  mapfile -t ALL_PIDS < <(gcloud projects list --format='value(projectId)' 2>/dev/null | awk 'NF && !seen[$0]++')
+  mapfile -t PROXY_SCAN_PIDS < <(
+    printf '%s\n' "${BILLED_PIDS[@]}" "${ALL_PIDS[@]}" | awk 'NF && !seen[$0]++'
+  )
   PRIMARY_PROJECT="${BILLED_PIDS[0]:-${WORK_PIDS[0]:-}}"
   if [ -z "$PRIMARY_PROJECT" ]; then
-    err "没有项目可用于创建 SOCKS5"
+    err "没有已绑账单项目可用于创建新的 SOCKS5"
   else
-    say "未找到可复用 SOCKS5，后台启动创建；Vertex Key 同时处理"
-    build_proxy "$PRIMARY_PROJECT" "${BILLED_PIDS[@]}" &
+    say "全账号仍未找到可复用 SOCKS5，后台启动创建；Vertex Key 同时处理"
+    build_proxy "$PRIMARY_PROJECT" "${PROXY_SCAN_PIDS[@]}" &
     PROXY_PID=$!
   fi
 else
@@ -578,7 +597,10 @@ for pid in "${WORK_PIDS[@]}"; do
   ) &
   KPIDS+=("$!")
 done
-for p in "${KPIDS[@]:-}"; do wait "$p" || true; done
+# Empty KPIDS is valid when two reusable AQ keys already exist. Do not use
+# ${KPIDS[@]:-} here because that expands to one empty argument and causes
+# `wait: '': not a pid or valid job spec`.
+for p in "${KPIDS[@]}"; do wait "$p" || true; done
 
 for pid in "${WORK_PIDS[@]}"; do
   if [ -s "$KEYDIR/$pid.key" ]; then
@@ -625,3 +647,4 @@ printf '%s\n' "${VKEYS[@]}"
 # Exit status only; no compound Bash block after final output.
 [ "$FINAL_OK" = "1" ]
 
+# MO_V7_EOF_OK
