@@ -742,3 +742,12 @@ FINAL_PROXY="${PROXY_URL:-SOCKS5_FAILED}"
 VKEYS=("${VKEYS[@]:0:$NEED_PROJECTS}")
 FINAL_OK=1
 [ "$PROXY_READY" = "1" ] || FINAL_OK=0
+[ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ] || FINAL_OK=0
+
+printf '\n================ FINAL RESULT ================\n%s\n\n' "$FINAL_PROXY"
+printf '%s\n' "${VKEYS[@]}"
+
+# Exit status only; no compound Bash block after final output.
+[ "$FINAL_OK" = "1" ]
+
+# MO_V9_EOF_OK
