@@ -1,10 +1,10 @@
 
-# mo_v8.sh
+# mo_v10.sh
 # Minimal controller: reuse/create 2 billed projects -> parallel Vertex AQ keys
 # + account-wide SOCKS5 reuse/create with repair/fallback -> print only.
 set -uo pipefail
 
-VERSION="9.0.0"
+VERSION="10.0.0"
 TESTSH_URL="${TESTSH_URL:-https://raw.githubusercontent.com/jc-lw/yindaoye/refs/heads/main/test.sh}"
 NEED_PROJECTS="${NEED_PROJECTS:-2}"
 REUSE_PROXY="${REUSE_PROXY:-1}"
@@ -40,8 +40,54 @@ say "当前账号: $ACCOUNT"
 PROXY_OUT="/tmp/mo_proxy_$$.env"
 TESTSH="/tmp/mo_testsh_$$.sh"
 KEYDIR=""
-cleanup(){ rm -f "$PROXY_OUT" "$TESTSH" 2>/dev/null || true; [ -n "${KEYDIR:-}" ] && rm -rf "$KEYDIR" 2>/dev/null || true; }
-trap cleanup EXIT
+
+# Final-result guard. v9 could finish the background proxy job and then leave
+# the top-level shell before reaching the normal tail on some Cloud Shell runs.
+# Arm this only after the controller has enough state to produce a meaningful
+# result. The EXIT trap then guarantees one final print, without duplicates.
+FINAL_ARMED=0
+FINAL_PRINTED=0
+PROXY_READY=0
+VKEYS=()
+
+cleanup(){
+  rm -f "${PROXY_OUT:-}" "${TESTSH:-}" 2>/dev/null || true
+  [ -n "${KEYDIR:-}" ] && rm -rf "$KEYDIR" 2>/dev/null || true
+}
+
+emit_final(){
+  [ "${FINAL_PRINTED:-0}" = "1" ] && return 0
+  FINAL_PRINTED=1
+
+  # build_proxy/mo_try_reuse_proxy_project only write PROXY_OUT after a real
+  # authenticated SOCKS5 test succeeds. Therefore a result file is safe to
+  # recover even when the main flow exited before its normal final re-check.
+  if [ -s "${PROXY_OUT:-}" ]; then
+    # shellcheck disable=SC1090
+    source "$PROXY_OUT" 2>/dev/null || true
+    [ -n "${PROXY_URL:-}" ] && PROXY_READY=1
+  fi
+
+  local final_proxy="SOCKS5_FAILED"
+  [ "${PROXY_READY:-0}" = "1" ] && [ -n "${PROXY_URL:-}" ] && final_proxy="$PROXY_URL"
+
+  printf '\n================ FINAL RESULT ================\n%s\n\n' "$final_proxy"
+  if declare -p VKEYS >/dev/null 2>&1; then
+    printf '%s\n' "${VKEYS[@]:0:${NEED_PROJECTS:-2}}"
+  fi
+}
+
+on_exit(){
+  local rc=$?
+  trap - EXIT
+  if [ "${FINAL_ARMED:-0}" = "1" ] && [ "${FINAL_PRINTED:-0}" != "1" ]; then
+    warn "主流程提前结束，触发 FINAL RESULT 兜底输出" >&2
+    emit_final
+  fi
+  cleanup
+  exit "$rc"
+}
+trap on_exit EXIT
 
 # ============================================================
 # SOCKS5 helpers
@@ -573,8 +619,8 @@ fi
 if [ "$PROXY_READY" = "1" ] && [ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ]; then
   # shellcheck disable=SC1090
   [ -s "$PROXY_OUT" ] && source "$PROXY_OUT"
-  printf '\n================ FINAL RESULT ================\n%s\n\n' "$PROXY_URL"
-  printf '%s\n' "${VKEYS[@]:0:$NEED_PROJECTS}"
+  FINAL_ARMED=1
+  emit_final
   exit 0
 fi
 
@@ -629,6 +675,11 @@ if [ "${#VKEYS[@]}" -lt "$NEED_PROJECTS" ] && [ "${#WORK_PIDS[@]}" -eq 0 ]; then
 fi
 
 say "已有 Key=${#VKEYS[@]}，需要新提取=$NEED_KEYS，处理项目=${#WORK_PIDS[@]}"
+
+# From this point onward an EXIT must always produce the user's requested
+# proxy + blank line + key list, even if a background wait/child status causes
+# the main flow to terminate before the normal tail.
+FINAL_ARMED=1
 
 # ------------------------------------------------------------
 # Proxy creation only if account-wide reuse failed. Refresh the project list
@@ -735,19 +786,16 @@ fi
 
 # ============================================================
 # EXACT final format: proxy, blank line, AQ keys.
-# Tail-safe: intentionally no open if/for/case blocks below this point.
+# Normal path + EXIT-trap fallback both call the same emitter, so this can
+# never silently end after "等待 SOCKS5 后台任务..." again.
 # ============================================================
-FINAL_PROXY="${PROXY_URL:-SOCKS5_FAILED}"
-[ "$PROXY_READY" = "1" ] || FINAL_PROXY="SOCKS5_FAILED"
 VKEYS=("${VKEYS[@]:0:$NEED_PROJECTS}")
-FINAL_OK=1
-[ "$PROXY_READY" = "1" ] || FINAL_OK=0
-[ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ] || FINAL_OK=0
+FINAL_ARMED=1
+emit_final
 
-printf '\n================ FINAL RESULT ================\n%s\n\n' "$FINAL_PROXY"
-printf '%s\n' "${VKEYS[@]}"
+FINAL_RC=0
+[ "$PROXY_READY" = "1" ] || FINAL_RC=1
+[ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ] || FINAL_RC=1
+exit "$FINAL_RC"
 
-# Exit status only; no compound Bash block after final output.
-[ "$FINAL_OK" = "1" ]
-
-# MO_V9_EOF_OK
+# MO_V10_EOF_OK
