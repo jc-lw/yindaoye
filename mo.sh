@@ -1,13 +1,14 @@
 
-# mo_v4.sh
+# mo_v6.sh
 # Minimal controller: reuse/create 2 billed projects -> parallel Vertex AQ keys
 # + reuse/create GCP SOCKS5 with repair/fallback -> print only.
 set -uo pipefail
 
-VERSION="4.0.0"
+VERSION="6.0.0"
 TESTSH_URL="${TESTSH_URL:-https://raw.githubusercontent.com/jc-lw/yindaoye/refs/heads/main/test.sh}"
 NEED_PROJECTS="${NEED_PROJECTS:-2}"
 REUSE_PROXY="${REUSE_PROXY:-1}"
+REUSE_KEYS="${REUSE_KEYS:-1}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 PROXY_ZONE_TRIES="${PROXY_ZONE_TRIES:-8}"
 PROXY_WAIT_SECONDS="${PROXY_WAIT_SECONDS:-180}"
@@ -392,7 +393,7 @@ build_proxy() {
 say "下载 test.sh 函数库: $TESTSH_URL"
 curl -fsSL "$TESTSH_URL" -o "$TESTSH" || { err "下载 test.sh 失败"; exit 1; }
 bash -n "$TESTSH" || { err "远程 test.sh Bash 语法异常"; exit 1; }
-sed -i -E 's/^[[:space:]]*main[[:space:]]*$/: # main disabled by mo_v4.sh/' "$TESTSH"
+sed -i -E 's/^[[:space:]]*main[[:space:]]*$/: # main disabled by mo_v6.sh/' "$TESTSH"
 # shellcheck disable=SC1090
 source "$TESTSH" >/dev/null 2>&1 || true
 set +e +E
@@ -404,13 +405,13 @@ trap - ERR 2>/dev/null || true
 if ! declare -p BILLING_BLOCKED_APIS 2>/dev/null | grep -q '^declare -A'; then declare -gA BILLING_BLOCKED_APIS=(); fi
 if ! declare -p PERMISSION_BLOCKED_APIS 2>/dev/null | grep -q '^declare -A'; then declare -gA PERMISSION_BLOCKED_APIS=(); fi
 
-for fn in billing_accounts_tsv project_billing_enabled create_projects_exact ensure_vertex_key_apis v27_setup_and_extract_aq_key; do
+for fn in billing_accounts_tsv project_billing_enabled create_projects_exact ensure_vertex_key_apis v27_setup_and_extract_aq_key find_authorization_key_string; do
   declare -F "$fn" >/dev/null 2>&1 || { err "test.sh 缺少函数: $fn"; exit 1; }
 done
 ok "test.sh 函数库加载完成"
 
 # ============================================================
-# Billing + project selection
+# Billing + reuse-first project/key/proxy discovery
 # ============================================================
 BILLING_ID="${BILLING_ID:-}"
 if [ -z "$BILLING_ID" ]; then
@@ -420,7 +421,7 @@ fi
 [ -z "$BILLING_ID" ] && { err "未找到 Billing Account"; exit 1; }
 say "使用 Billing Account: $BILLING_ID"
 
-say "扫描无组织/Folder父级项目，优先复用 billingEnabled=true 的项目..."
+say "扫描全部无组织/Folder父级项目，收集 billingEnabled=true 项目..."
 mapfile -t NOORG_PIDS < <(gcloud projects list \
   --format='value(projectId)' \
   --filter='parent.type!=organization AND parent.type!=folder' 2>/dev/null)
@@ -430,20 +431,86 @@ for pid in "${NOORG_PIDS[@]:-}"; do
   [ -z "$pid" ] && continue
   if project_billing_enabled "$pid" 2>/dev/null; then
     BILLED_PIDS+=("$pid")
-    say "已绑账单可复用: $pid"
-    [ "${#BILLED_PIDS[@]}" -ge "$NEED_PROJECTS" ] && break
+    say "已绑账单: $pid"
   fi
 done
+say "已绑账单项目总数: ${#BILLED_PIDS[@]}"
 
-TARGET_PIDS=("${BILLED_PIDS[@]:0:$NEED_PROJECTS}")
-MISSING=$((NEED_PROJECTS - ${#TARGET_PIDS[@]}))
-if [ "$MISSING" -gt 0 ]; then
-  say "现有可复用项目不足 $NEED_PROJECTS 个，需要补建 $MISSING 个"
-  NEW_PIDS=()
-  create_projects_exact "$MISSING" "$BILLING_ID" NEW_PIDS "mo补建" || true
+# ------------------------------------------------------------
+# Reuse pass A: existing SOCKS5 across ALL billed projects.
+# Both kn/le and mo store credentials in kn-proxy-user/pass metadata,
+# so the resources are mutually readable. A real authenticated request
+# must pass before reuse.
+# ------------------------------------------------------------
+PROXY_READY=0
+if [ "$REUSE_PROXY" != "0" ] && [ "${#BILLED_PIDS[@]}" -gt 0 ]; then
+  say "优先扫描所有已绑账单项目中的现有 SOCKS5..."
+  for pid in "${BILLED_PIDS[@]}"; do
+    if mo_try_reuse_proxy_project "$pid"; then
+      PROXY_READY=1
+      break
+    fi
+  done
+fi
+
+# ------------------------------------------------------------
+# Reuse pass B: read existing Vertex Authorization keys first.
+# This is read-only: do NOT delete old keys, do NOT create a new key,
+# and do NOT touch IAM/API state if a valid existing Vertex key is found.
+# ------------------------------------------------------------
+VKEYS=()
+KEY_PIDS=()
+if [ "$REUSE_KEYS" != "0" ] && [ "${#BILLED_PIDS[@]}" -gt 0 ]; then
+  say "优先读取现有 Vertex Authorization key；找到即复用，不重新创建..."
+  for pid in "${BILLED_PIDS[@]}"; do
+    sa_email="${SERVICE_ACCOUNT_NAME}@${pid}.iam.gserviceaccount.com"
+    existing_key=$(find_authorization_key_string "$pid" "$sa_email" 2>/dev/null | grep -oE 'AQ\.[A-Za-z0-9_.\-]{20,}' | head -n1 || true)
+    if [ -n "$existing_key" ]; then
+      VKEYS+=("$existing_key")
+      KEY_PIDS+=("$pid")
+      ok "复用现有 Vertex key: $pid / ${existing_key:0:12}..."
+      [ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ] && break
+    fi
+  done
+fi
+
+# If le/kn/mo has already left both resources behind, this run is only a reader.
+if [ "$PROXY_READY" = "1" ] && [ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ]; then
+  # shellcheck disable=SC1090
+  [ -s "$PROXY_OUT" ] && source "$PROXY_OUT"
+  printf '\n================ FINAL RESULT ================\n%s\n\n' "$PROXY_URL"
+  printf '%s\n' "${VKEYS[@]:0:$NEED_PROJECTS}"
+  exit 0
+fi
+
+# ------------------------------------------------------------
+# Choose only the projects still needed for missing keys.
+# Existing-key projects are not sent through ensure/create again.
+# ------------------------------------------------------------
+NEED_KEYS=$((NEED_PROJECTS - ${#VKEYS[@]}))
+WORK_PIDS=()
+
+if [ "$NEED_KEYS" -gt 0 ]; then
+  for pid in "${BILLED_PIDS[@]}"; do
+    already=0
+    for kp in "${KEY_PIDS[@]:-}"; do
+      [ "$pid" = "$kp" ] && { already=1; break; }
+    done
+    [ "$already" = "1" ] && continue
+    WORK_PIDS+=("$pid")
+    [ "${#WORK_PIDS[@]}" -ge "$NEED_KEYS" ] && break
+  done
+fi
+
+MISSING_PROJECTS=$((NEED_KEYS - ${#WORK_PIDS[@]}))
+NEW_PIDS=()
+if [ "$MISSING_PROJECTS" -gt 0 ]; then
+  say "现有项目还缺 $MISSING_PROJECTS 个 Key 槽位，补建项目..."
+  create_projects_exact "$MISSING_PROJECTS" "$BILLING_ID" NEW_PIDS "mo补建" || true
   for pid in "${NEW_PIDS[@]:-}"; do
     [ -z "$pid" ] && continue
-    TARGET_PIDS+=("$pid")
+    BILLED_PIDS+=("$pid")
+    WORK_PIDS+=("$pid")
     if project_billing_enabled "$pid" 2>/dev/null; then
       ok "新项目 Billing 已生效: $pid"
     else
@@ -452,22 +519,51 @@ if [ "$MISSING" -gt 0 ]; then
   done
 fi
 
-[ "${#TARGET_PIDS[@]}" -eq 0 ] && { err "没有可用项目"; exit 1; }
-say "目标项目 (${#TARGET_PIDS[@]}): ${TARGET_PIDS[*]}"
+if [ "${#VKEYS[@]}" -lt "$NEED_PROJECTS" ] && [ "${#WORK_PIDS[@]}" -eq 0 ]; then
+  err "没有可用于补齐 Vertex key 的项目"
+  exit 1
+fi
 
-# ============================================================
-# Start proxy and Vertex jobs in parallel.
-# ============================================================
-say "后台启动 SOCKS5 扫描/创建，同时并行处理 ${#TARGET_PIDS[@]} 个 Vertex 项目"
-build_proxy "${TARGET_PIDS[0]}" "${TARGET_PIDS[@]}" &
-PROXY_PID=$!
+say "已有 Key=${#VKEYS[@]}，需要新提取=$NEED_KEYS，处理项目=${#WORK_PIDS[@]}"
 
+# ------------------------------------------------------------
+# Proxy creation only if reuse failed. Scan all billed projects again inside
+# build_proxy, then create in a usable primary project only as the final fallback.
+# ------------------------------------------------------------
+PROXY_PID=""
+if [ "$PROXY_READY" != "1" ]; then
+  PRIMARY_PROJECT="${BILLED_PIDS[0]:-${WORK_PIDS[0]:-}}"
+  if [ -z "$PRIMARY_PROJECT" ]; then
+    err "没有项目可用于创建 SOCKS5"
+  else
+    say "未找到可复用 SOCKS5，后台启动创建；Vertex Key 同时处理"
+    build_proxy "$PRIMARY_PROJECT" "${BILLED_PIDS[@]}" &
+    PROXY_PID=$!
+  fi
+else
+  say "已有 SOCKS5 已通过真实请求验证，不再创建 VM"
+fi
+
+# ------------------------------------------------------------
+# Create only missing Vertex keys, in parallel.
+# ------------------------------------------------------------
 KEYDIR=$(mktemp -d /tmp/mo_keys_XXXXXX)
 KPIDS=()
-for pid in "${TARGET_PIDS[@]}"; do
+for pid in "${WORK_PIDS[@]}"; do
   (
     echo >&2
     echo "========== Vertex: $pid ==========" >&2
+
+    # One last read-only check closes the race where another script created
+    # the key after our initial scan but before this worker started.
+    sa_email="${SERVICE_ACCOUNT_NAME}@${pid}.iam.gserviceaccount.com"
+    existing_key=$(find_authorization_key_string "$pid" "$sa_email" 2>/dev/null | grep -oE 'AQ\.[A-Za-z0-9_.\-]{20,}' | head -n1 || true)
+    if [ -n "$existing_key" ]; then
+      printf '%s\n' "$existing_key" > "$KEYDIR/$pid.key"
+      echo "[$pid] 发现现有 Vertex key，直接复用: ${existing_key:0:12}..." >&2
+      exit 0
+    fi
+
     if ! ensure_vertex_key_apis "$pid" "mo-Vertex提取前" >&2; then
       echo "[$pid] Vertex 必需 API 未就绪，跳过" >&2
       exit 0
@@ -482,42 +578,50 @@ for pid in "${TARGET_PIDS[@]}"; do
   ) &
   KPIDS+=("$!")
 done
-for p in "${KPIDS[@]}"; do wait "$p" || true; done
+for p in "${KPIDS[@]:-}"; do wait "$p" || true; done
 
-VKEYS=()
-for pid in "${TARGET_PIDS[@]}"; do
+for pid in "${WORK_PIDS[@]}"; do
   if [ -s "$KEYDIR/$pid.key" ]; then
     k=$(head -n1 "$KEYDIR/$pid.key")
-    [ -n "$k" ] && VKEYS+=("$k")
+    duplicate=0
+    for old in "${VKEYS[@]:-}"; do [ "$k" = "$old" ] && { duplicate=1; break; }; done
+    [ "$duplicate" = "0" ] && [ -n "$k" ] && VKEYS+=("$k")
   fi
+  [ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ] && break
 done
 say "Vertex key 收集完成: ${#VKEYS[@]} 个"
 
-say "等待 SOCKS5 后台任务..."
-wait "$PROXY_PID" || true
-PROXY_READY=0
+# Wait only when a new proxy job actually exists.
+if [ -n "$PROXY_PID" ]; then
+  say "等待 SOCKS5 后台任务..."
+  wait "$PROXY_PID" || true
+fi
+
 if [ -s "$PROXY_OUT" ]; then
   # shellcheck disable=SC1090
   source "$PROXY_OUT"
-  if mo_proxy_test "$PROXY_URL"; then
+  if mo_proxy_test "${PROXY_URL:-}"; then
     PROXY_READY=1
   else
-    warn "代理结果文件存在，但最终真实 SOCKS5 复检失败"
+    PROXY_READY=0
+    warn "代理结果存在，但最终真实 SOCKS5 复检失败"
   fi
 fi
 
 # ============================================================
-# EXACT final format requested by user: proxy, blank line, keys. No labels/upload.
+# EXACT final format: proxy, blank line, AQ keys.
+# Tail-safe: intentionally no open if/for/case blocks below this point.
 # ============================================================
-echo
-echo "================ FINAL RESULT ================"
-if [ "$PROXY_READY" = "1" ]; then
-  echo "$PROXY_URL"
-else
-  echo "SOCKS5_FAILED"
-fi
-echo
-if [ "${#VKEYS[@]}" -gt 0 ]; then
-  printf '%s\n' "${VKEYS[@]}"
-else
-  echo "VERTEX_KEY_FAILED"
+FINAL_PROXY="${PROXY_URL:-SOCKS5_FAILED}"
+[ "$PROXY_READY" = "1" ] || FINAL_PROXY="SOCKS5_FAILED"
+VKEYS=("${VKEYS[@]:0:$NEED_PROJECTS}")
+FINAL_OK=1
+[ "$PROXY_READY" = "1" ] || FINAL_OK=0
+[ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ] || FINAL_OK=0
+
+printf '\n================ FINAL RESULT ================\n%s\n\n' "$FINAL_PROXY"
+printf '%s\n' "${VKEYS[@]}"
+
+# Exit status only; no compound Bash block after final output.
+[ "$FINAL_OK" = "1" ]
+
