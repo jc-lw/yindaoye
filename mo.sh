@@ -4,7 +4,7 @@
 # + account-wide SOCKS5 reuse/create with repair/fallback -> print only.
 set -uo pipefail
 
-VERSION="8.0.0"
+VERSION="9.0.0"
 TESTSH_URL="${TESTSH_URL:-https://raw.githubusercontent.com/jc-lw/yindaoye/refs/heads/main/test.sh}"
 NEED_PROJECTS="${NEED_PROJECTS:-2}"
 REUSE_PROXY="${REUSE_PROXY:-1}"
@@ -310,22 +310,22 @@ build_proxy() {
     done
   fi
 
-  # Pass 2: create only in a project whose Cloud Billing is actually enabled.
-  # Vertex AQ keys can exist even when billingEnabled=false, but Compute Engine
-  # VM creation cannot be treated the same way. A bad project must not abort the
-  # whole proxy flow: automatically continue to the next accessible project.
+  # Pass 2: mirror kn.sh behavior: DO NOT hard-skip a project only because
+  # ProjectBillingInfo.billingEnabled currently reads false. Newly linked Billing
+  # can lag behind other backends, and kn.sh succeeds by actually attempting the
+  # Compute API/VM flow, waiting for propagation, then retrying. Google remains
+  # the authority: real Billing/permission/precondition errors still move us to
+  # the next project.
   for project in "${candidates[@]}"; do
     [ -z "$project" ] && continue
     candidate_index=$((candidate_index + 1))
 
-    if ! project_billing_enabled "$project" 2>/dev/null; then
-      warn "[代理] 跳过项目 $project：billingEnabled!=true，不能作为 Compute VM 新建候选"
-      continue
-    fi
+    billing_hint="false"
+    project_billing_enabled "$project" 2>/dev/null && billing_hint="true"
+    say "[代理] 尝试项目 $project（候选 ${candidate_index}/${#candidates[@]}，billingEnabled=${billing_hint}）"
 
-    say "[代理] 尝试项目 $project（候选 ${candidate_index}/${#candidates[@]}）"
     if ! mo_ensure_compute_api "$project"; then
-      warn "[代理] 项目 $project 的 Compute API 不可用，自动换下一个项目"
+      warn "[代理] 项目 $project 的 Compute API 真实启用/确认失败，自动换下一个项目"
       continue
     fi
 
@@ -370,17 +370,37 @@ build_proxy() {
         --metadata-from-file=startup-script="$startup" --quiet 2>&1); rc=$?
 
       if [ "$rc" -ne 0 ]; then
-        if echo "$vm_out" | grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources|currently unavailable|resource pool exhausted'; then
+        # kn.sh-compatible propagation fallback: a freshly enabled Compute API
+        # can still return SERVICE_DISABLED for the first VM request. Re-enable,
+        # wait, and retry the SAME zone once before abandoning the project.
+        if echo "$vm_out" | grep -qiE 'SERVICE_DISABLED|has not been used in project .* before or it is disabled'; then
+          warn "[代理] [$project] VM 返回 SERVICE_DISABLED；按 kn.sh 策略重新启用 Compute 并等待 30 秒后重试同一区域"
+          gcloud services enable compute.googleapis.com --project="$project" --quiet >/dev/null 2>&1 || true
+          sleep 30
+          vm_out=$(gcloud compute instances create "$instance" \
+            --project="$project" --zone="$zone" --machine-type=e2-micro \
+            --image-family=debian-12 --image-project=debian-cloud \
+            --network="$network" --tags=socks5-proxy \
+            --metadata=kn-proxy-user="$user",kn-proxy-pass="$pass",kn-proxy-port="$PROXY_PORT" \
+            --metadata-from-file=startup-script="$startup" --quiet 2>&1); rc=$?
+          if [ "$rc" -eq 0 ]; then
+            ok "[代理] [$project] Compute 传播后重试成功"
+          fi
+        fi
+
+        if [ "$rc" -ne 0 ] && echo "$vm_out" | grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources|currently unavailable|resource pool exhausted'; then
           warn "[代理] [$project] $zone 库存不足，换区域"
           continue
         fi
-        if echo "$vm_out" | grep -qiE 'PERMISSION_DENIED|AUTH_PERMISSION_DENIED|SERVICE_DISABLED|FAILED_PRECONDITION|billing|BILLING|QUOTA_EXCEEDED|quota.*exceeded'; then
+        if [ "$rc" -ne 0 ] && echo "$vm_out" | grep -qiE 'PERMISSION_DENIED|AUTH_PERMISSION_DENIED|SERVICE_DISABLED|FAILED_PRECONDITION|billing|BILLING|QUOTA_EXCEEDED|quota.*exceeded'; then
           warn "[代理] [$project] VM 被权限/API/Billing/配额阻止，换项目: $(echo "$vm_out" | tail -n 2 | tr '\n' ' ' | cut -c1-220)"
           break
         fi
-        warn "[代理] [$project] $zone 创建失败，继续换区域: $(echo "$vm_out" | tail -n1 | cut -c1-160)"
-        sleep 3
-        continue
+        if [ "$rc" -ne 0 ]; then
+          warn "[代理] [$project] $zone 创建失败，继续换区域: $(echo "$vm_out" | tail -n1 | cut -c1-160)"
+          sleep 3
+          continue
+        fi
       fi
 
       ok "[代理] VM 已创建: $instance / $project / $zone"
@@ -438,7 +458,7 @@ build_proxy() {
 say "下载 test.sh 函数库: $TESTSH_URL"
 curl -fsSL "$TESTSH_URL" -o "$TESTSH" || { err "下载 test.sh 失败"; exit 1; }
 bash -n "$TESTSH" || { err "远程 test.sh Bash 语法异常"; exit 1; }
-sed -i -E 's/^[[:space:]]*main[[:space:]]*$/: # main disabled by mo_v8.sh/' "$TESTSH"
+sed -i -E 's/^[[:space:]]*main[[:space:]]*$/: # main disabled by mo_v9.sh/' "$TESTSH"
 # shellcheck disable=SC1090
 source "$TESTSH" >/dev/null 2>&1 || true
 set +e +E
@@ -525,16 +545,25 @@ fi
 # ------------------------------------------------------------
 VKEYS=()
 KEY_PIDS=()
-KEY_SCAN_PIDS=("${NOORG_PIDS[@]}")
+# Key reuse must stay inside Billing-linked projects. v8 scanned every no-org
+# project and could therefore return an AQ key from a project with no Billing
+# Account at all. Prefer the selected Billing Account, then any other linked
+# Billing project. billingEnabled may be false; linkage itself is required.
+mapfile -t KEY_SCAN_PIDS < <(
+  printf '%s\n' "${SELECTED_LINKED_PIDS[@]}" "${LINKED_PIDS[@]}" | awk 'NF && !seen[$0]++'
+)
 if [ "$REUSE_KEYS" != "0" ] && [ "${#KEY_SCAN_PIDS[@]}" -gt 0 ]; then
-  say "优先读取所有 no-org 项目中的现有 Vertex Authorization key；billingEnabled=false 也允许复用..."
+  say "优先读取已绑定 Billing Account 项目中的现有 Vertex Authorization key；未绑定账单的项目 Key 不复用..."
   for pid in "${KEY_SCAN_PIDS[@]}"; do
     sa_email="${SERVICE_ACCOUNT_NAME}@${pid}.iam.gserviceaccount.com"
     existing_key=$(find_authorization_key_string "$pid" "$sa_email" 2>/dev/null | grep -oE 'AQ\.[A-Za-z0-9_.\-]{20,}' | head -n1 || true)
     if [ -n "$existing_key" ]; then
+      key_acct=$(gcloud billing projects describe "$pid" --format='value(billingAccountName)' 2>/dev/null || true)
+      key_acct="${key_acct#billingAccounts/}"
+      key_enabled=$(gcloud billing projects describe "$pid" --format='value(billingEnabled)' 2>/dev/null || true)
       VKEYS+=("$existing_key")
       KEY_PIDS+=("$pid")
-      ok "复用现有 Vertex key: $pid / ${existing_key:0:12}..."
+      ok "复用含账单 Vertex key: $pid / Billing=${key_acct:-unknown} / billingEnabled=${key_enabled:-unknown} / ${existing_key:0:12}..."
       [ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ] && break
     fi
   done
@@ -618,7 +647,12 @@ if [ "$PROXY_READY" != "1" ]; then
     mo_compute_enabled "$pid" && COMPUTE_READY_PIDS+=("$pid")
   done
   mapfile -t PROXY_CREATE_PIDS < <(
-    printf '%s\n' "${COMPUTE_READY_PIDS[@]}" "${BILLED_PIDS[@]}" "${ALL_PIDS[@]}" | awk 'NF && !seen[$0]++'
+    printf '%s\n' \
+      "${COMPUTE_READY_PIDS[@]}" \
+      "${BILLED_PIDS[@]}" \
+      "${SELECTED_LINKED_PIDS[@]}" \
+      "${LINKED_PIDS[@]}" \
+      "${ALL_PIDS[@]}" | awk 'NF && !seen[$0]++'
   )
 
   if [ "${#PROXY_CREATE_PIDS[@]}" -eq 0 ]; then
@@ -708,12 +742,3 @@ FINAL_PROXY="${PROXY_URL:-SOCKS5_FAILED}"
 VKEYS=("${VKEYS[@]:0:$NEED_PROJECTS}")
 FINAL_OK=1
 [ "$PROXY_READY" = "1" ] || FINAL_OK=0
-[ "${#VKEYS[@]}" -ge "$NEED_PROJECTS" ] || FINAL_OK=0
-
-printf '\n================ FINAL RESULT ================\n%s\n\n' "$FINAL_PROXY"
-printf '%s\n' "${VKEYS[@]}"
-
-# Exit status only; no compound Bash block after final output.
-[ "$FINAL_OK" = "1" ]
-
-# MO_V8_EOF_OK
