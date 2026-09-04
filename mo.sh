@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-VERSION="13.1.1-fast-billingfix"
+VERSION="13.2.0-fast-repair"
 TESTSH_URL="${TESTSH_URL:-https://raw.githubusercontent.com/jc-lw/yindaoye/refs/heads/main/test.sh}"
 NEED_PROJECTS="${NEED_PROJECTS:-2}"
 
@@ -36,6 +36,8 @@ BILLING_DESCRIBE_RETRIES="${BILLING_DESCRIBE_RETRIES:-3}"
 BILLING_LINK_RETRIES="${BILLING_LINK_RETRIES:-4}"
 BILLING_LINK_POLL_SECONDS="${BILLING_LINK_POLL_SECONDS:-24}"
 NEW_PROJECT_SLOT_TRIES="${NEW_PROJECT_SLOT_TRIES:-6}"
+KEY_SETUP_ATTEMPTS="${KEY_SETUP_ATTEMPTS:-2}"
+KEY_SETUP_RETRY_SLEEP="${KEY_SETUP_RETRY_SLEEP:-8}"
 
 [[ "$NEED_PROJECTS" =~ ^[1-9][0-9]*$ ]] || NEED_PROJECTS=2
 [[ "$PROXY_SCAN_JOBS" =~ ^[1-9][0-9]*$ ]] || PROXY_SCAN_JOBS=6
@@ -48,6 +50,8 @@ NEW_PROJECT_SLOT_TRIES="${NEW_PROJECT_SLOT_TRIES:-6}"
 [[ "$BILLING_LINK_RETRIES" =~ ^[1-9][0-9]*$ ]] || BILLING_LINK_RETRIES=4
 [[ "$BILLING_LINK_POLL_SECONDS" =~ ^[0-9]+$ ]] || BILLING_LINK_POLL_SECONDS=24
 [[ "$NEW_PROJECT_SLOT_TRIES" =~ ^[1-9][0-9]*$ ]] || NEW_PROJECT_SLOT_TRIES=6
+[[ "$KEY_SETUP_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || KEY_SETUP_ATTEMPTS=2
+[[ "$KEY_SETUP_RETRY_SLEEP" =~ ^[0-9]+$ ]] || KEY_SETUP_RETRY_SLEEP=8
 
 # Keep the stable test.sh SA propagation waits untouched.
 export PROJECT_SUBMIT_GAP="${PROJECT_SUBMIT_GAP:-1}"
@@ -1063,18 +1067,52 @@ if [ "$NEED_SLOTS" -gt 0 ]; then
   done
 fi
 
+# IMPORTANT: before creating ANY new project, repair projects that are already
+# linked to the selected Billing Account but currently report billingEnabled != true.
+# This handles transient/lagging Billing state and prevents abandoning an existing
+# project after a previous Vertex attempt failed.
+if [ $(( ${#KEY_PIDS[@]} + ${#WORK_PIDS[@]} )) -lt "$NEED_PROJECTS" ]; then
+  say "existing usable projects are short; repair selected Billing-linked projects before creating anything new"
+  for pid in "${SELECTED_LINKED_PIDS[@]}"; do
+    [ -z "$pid" ] && continue
+    [ -n "${PREKEY_BY_PID[$pid]:-}" ] && continue
+
+    already=0
+    for wp in "${WORK_PIDS[@]}"; do
+      [ "$wp" = "$pid" ] && { already=1; break; }
+    done
+    [ "$already" = "1" ] && continue
+
+    billing_fix_rc=0
+    mo_ensure_project_billing "$pid" "$BILLING_ID" || billing_fix_rc=$?
+    if [ "$billing_fix_rc" -eq 0 ]; then
+      WORK_PIDS+=("$pid")
+      ok "repaired/revalidated existing Billing-linked project for AQ work: $pid"
+    elif [ "$billing_fix_rc" -eq 21 ]; then
+      warn "[$pid] Billing-link quota hit while repairing an EXISTING project; do not create replacement projects"
+      BILLING_HARD_STOP=1
+      break
+    else
+      warn "[$pid] existing Billing-linked project is still unusable after repair; keep it and try other existing projects"
+    fi
+    [ $(( ${#KEY_PIDS[@]} + ${#WORK_PIDS[@]} )) -ge "$NEED_PROJECTS" ] && break
+  done
+fi
+
 # Only create when the actual usable count is still short. Create ONE slot at a
 # time because upstream create_projects_exact counts project creation success,
 # not billing-link success. After each create, repair/poll billing on that SAME
 # project before deciding whether another project is needed.
+BILLING_HARD_STOP="${BILLING_HARD_STOP:-0}"
 create_round=0
-while [ $(( ${#KEY_PIDS[@]} + ${#WORK_PIDS[@]} )) -lt "$NEED_PROJECTS" ] && \
+while [ "$BILLING_HARD_STOP" != "1" ] && \
+      [ $(( ${#KEY_PIDS[@]} + ${#WORK_PIDS[@]} )) -lt "$NEED_PROJECTS" ] && \
       [ "$create_round" -lt "$NEW_PROJECT_SLOT_TRIES" ]; do
   create_round=$((create_round + 1))
   say "usable key projects=$(( ${#KEY_PIDS[@]} + ${#WORK_PIDS[@]} ))/${NEED_PROJECTS}; create/repair one missing slot (${create_round}/${NEW_PROJECT_SLOT_TRIES})"
 
   ONE_NEW=()
-  create_projects_exact 1 "$BILLING_ID" ONE_NEW "mo-v13.1-slot${create_round}" || true
+  create_projects_exact 1 "$BILLING_ID" ONE_NEW "mo-v13.2-slot${create_round}" || true
   if [ "${#ONE_NEW[@]}" -eq 0 ]; then
     warn "no project returned for slot ${create_round}; continue"
     continue
@@ -1161,19 +1199,38 @@ for pid in "${KEY_PROJECTS[@]}"; do
       exit 0
     fi
 
-    if ! ensure_vertex_key_apis "$pid" "mo-v13.1-Vertex" >&2; then
+    if ! ensure_vertex_key_apis "$pid" "mo-v13.2-Vertex" >&2; then
       echo "[$pid] Vertex required APIs not ready" >&2
       exit 0
     fi
 
-    vkey=$(v27_setup_and_extract_aq_key "$pid" 1 2>/dev/null | \
-      grep -oE 'AQ\.[A-Za-z0-9_.\-]{20,}' | head -n1 || true)
+    vkey=""
+    for ((key_try=1; key_try<=KEY_SETUP_ATTEMPTS; key_try++)); do
+      # Do not hide upstream diagnostics. test.sh already has internal quota/
+      # propagation retries; this outer retry protects against a one-off SA/IAM/
+      # API-key visibility race after all required APIs just became ready.
+      raw_key=$(v27_setup_and_extract_aq_key "$pid" 1 2> >(tee -a "$KEYDIR/$pid.vertex.log" >&2) || true)
+      vkey=$(printf '%s\n' "$raw_key" | grep -oE 'AQ\.[A-Za-z0-9_.\-]{20,}' | head -n1 || true)
+
+      if [ -z "$vkey" ]; then
+        sa_email="${SERVICE_ACCOUNT_NAME}@${pid}.iam.gserviceaccount.com"
+        vkey=$(find_authorization_key_string "$pid" "$sa_email" 2>/dev/null | \
+          grep -oE 'AQ\.[A-Za-z0-9_.\-]{20,}' | head -n1 || true)
+      fi
+
+      [ -n "$vkey" ] && break
+      if [ "$key_try" -lt "$KEY_SETUP_ATTEMPTS" ]; then
+        echo "[$pid] Vertex AQ attempt ${key_try}/${KEY_SETUP_ATTEMPTS} failed; wait ${KEY_SETUP_RETRY_SLEEP}s and retry SAME project" >&2
+        sleep "$KEY_SETUP_RETRY_SLEEP"
+      fi
+    done
 
     if [ -n "$vkey" ]; then
       printf '%s\n' "$vkey" > "$KEYDIR/$pid.key"
       echo "[$pid] Vertex AQ ready: ${vkey:0:12}..." >&2
     else
-      echo "[$pid] Vertex AQ failed" >&2
+      echo "[$pid] Vertex AQ failed after ${KEY_SETUP_ATTEMPTS} setup attempt(s); project is retained for the next run" >&2
+      [ -s "$KEYDIR/$pid.vertex.log" ] && tail -n 12 "$KEYDIR/$pid.vertex.log" >&2 || true
     fi
   ) &
   KPIDS+=("$!")
