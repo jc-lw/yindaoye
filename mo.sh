@@ -1,13 +1,11 @@
 #!/bin/bash
-# mo_v13.sh - Optimized
-# Parallel architecture: Background SOCKS5 (Global scan / Build) + Foreground Vertex AQ
+# mo_v13.1.sh - Optimized Parallel Architecture with Precision Proxy Reuse
 set -uo pipefail
 
-VERSION="13.0.0"
+VERSION="13.1.0"
 TESTSH_URL="${TESTSH_URL:-https://raw.githubusercontent.com/jc-lw/yindaoye/refs/heads/main/test.sh}"
 NEED_PROJECTS="${NEED_PROJECTS:-2}"
 REUSE_PROXY="${REUSE_PROXY:-1}"
-REUSE_KEYS="${REUSE_KEYS:-1}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 PROXY_ZONE_TRIES="${PROXY_ZONE_TRIES:-8}"
 PROXY_WAIT_SECONDS="${PROXY_WAIT_SECONDS:-180}"
@@ -98,17 +96,14 @@ mo_proxy_test() {
     -o /dev/null https://api.ipify.org >/dev/null 2>&1
 }
 
-mo_tcp_test() {
-  local host="$1" port="$2"
-  timeout 4 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
-}
-
 mo_wait_proxy() {
   local proxy_url="$1" host="$2" port="$3"
   local elapsed=0 step=5
   while [ "$elapsed" -lt "$PROXY_WAIT_SECONDS" ]; do
-    if mo_tcp_test "$host" "$port" && mo_proxy_test "$proxy_url"; then
-      return 0
+    if timeout 4 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+      if mo_proxy_test "$proxy_url"; then
+        return 0
+      fi
     fi
     sleep "$step"
     elapsed=$((elapsed + step))
@@ -122,18 +117,15 @@ mo_wait_proxy() {
 mo_ensure_network() {
   local project="$1"
   if gcloud compute networks describe default --project="$project" >/dev/null 2>&1; then
-    echo default
-    return 0
+    echo default; return 0
   fi
   if gcloud compute networks describe kn-proxy-net --project="$project" >/dev/null 2>&1; then
-    echo kn-proxy-net
-    return 0
+    echo kn-proxy-net; return 0
   fi
-  bwarn "项目没有 default 网络，创建 kn-proxy-net 自动模式网络..." >&2
+  bwarn "[$project] 没有 default 网络，创建 kn-proxy-net..." >&2
   if gcloud compute networks create kn-proxy-net --project="$project" \
       --subnet-mode=auto --bgp-routing-mode=regional --quiet >/dev/null 2>&1; then
-    echo kn-proxy-net
-    return 0
+    echo kn-proxy-net; return 0
   fi
   return 1
 }
@@ -148,7 +140,7 @@ mo_ensure_firewall() {
       --format='value(network)' 2>/dev/null || true)
     current_network=$(basename "$current_network")
     if [ -n "$current_network" ] && [ "$current_network" != "$network" ]; then
-      bwarn "旧防火墙属于网络 $current_network，不是 $network；重建" >&2
+      bwarn "旧防火墙属于 $current_network，重建" >&2
       gcloud compute firewall-rules delete "$rule" --project="$project" --quiet >/dev/null 2>&1 || true
     else
       if gcloud compute firewall-rules update "$rule" --project="$project" \
@@ -157,7 +149,6 @@ mo_ensure_firewall() {
         bok "防火墙规则已检查/修复: $rule" >&2
         return 0
       fi
-      bwarn "旧防火墙规则无法更新，删除后重建: $rule" >&2
       gcloud compute firewall-rules delete "$rule" --project="$project" --quiet >/dev/null 2>&1 || true
     fi
   fi
@@ -210,7 +201,6 @@ cat > /etc/systemd/system/microsocks.service <<SERVICE_EOF
 [Unit]
 Description=MicroSocks SOCKS5 Proxy
 After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
@@ -241,38 +231,42 @@ mo_save_proxy() {
   } > "$PROXY_OUT"
 }
 
-mo_scan_all_reusable_proxies() {
-  local rows name zone ip url user pass proj selflink
-  # 跨项目聚合列表，极大幅度提升查询速度
-  rows=$(timeout 30 gcloud compute instances list \
+mo_try_reuse_proxy_project() {
+  local project="$1"
+  local rows name zone ip user pass url
+  rows=$(timeout 20 gcloud compute instances list --project="$project" \
     --filter='name~socks5-node AND status=RUNNING' \
-    --format='value(name,zone,networkInterfaces[0].accessConfigs[0].natIP,selfLink)' 2>/dev/null || true)
+    --format='value(name,zone,networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null || true)
   [ -z "$rows" ] && return 1
 
-  while read -r name zone ip selflink; do
+  while read -r name zone ip; do
     [ -z "$name" ] && continue
     zone=$(basename "$zone")
     [ -z "$ip" ] && continue
-    proj=$(echo "$selflink" | grep -oE 'projects/[^/]+' | head -n1 | cut -d/ -f2)
-    [ -z "$proj" ] && continue
 
-    user=$(timeout 15 gcloud compute instances describe "$name" --project="$proj" --zone="$zone" \
+    # 吸收 kn.sh 优点：先用 netcat/bash 探 1080 端口，不通直接跳过，避开慢速 API
+    if ! timeout 4 bash -c "cat < /dev/null > /dev/tcp/${ip}/${PROXY_PORT}" 2>/dev/null; then
+      continue
+    fi
+
+    user=$(timeout 15 gcloud compute instances describe "$name" --project="$project" --zone="$zone" \
       --format='value(metadata.items.filter("key:kn-proxy-user").extract("value").flatten())' 2>/dev/null || true)
-    pass=$(timeout 15 gcloud compute instances describe "$name" --project="$proj" --zone="$zone" \
+    pass=$(timeout 15 gcloud compute instances describe "$name" --project="$project" --zone="$zone" \
       --format='value(metadata.items.filter("key:kn-proxy-pass").extract("value").flatten())' 2>/dev/null || true)
     [ -z "$user" ] || [ -z "$pass" ] && continue
     url="socks5://${user}:${pass}@${ip}:${PROXY_PORT}"
 
+    # 坚持 mo 的强验证：TCP 探通不算，能走原生代理 curl 通才算
     if mo_proxy_test "$url"; then
-      mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$proj" "$name" "$zone"
-      bok "复用已验证 SOCKS5: $name / $proj / $ip"
+      mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$project" "$name" "$zone"
+      bok "♻ 复用已验证 SOCKS5: $name / $project / $ip"
       return 0
     fi
-    bwarn "发现旧代理 $name，但验证失败，等待 ${PROXY_REUSE_GRACE_SECONDS}s 后复检"
+    bwarn "发现旧代理 $name，但真实请求失败；等待 ${PROXY_REUSE_GRACE_SECONDS}s 后复检"
     sleep "$PROXY_REUSE_GRACE_SECONDS"
     if mo_proxy_test "$url"; then
-      mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$proj" "$name" "$zone"
-      bok "旧代理复检恢复可用，直接复用: $name / $proj / $ip"
+      mo_save_proxy "$url" "${ip}:${PROXY_PORT}" "${ip}:${PROXY_PORT}:${user}:${pass}" "$project" "$name" "$zone"
+      bok "♻ 旧代理复检恢复可用，直接复用: $name / $project / $ip"
       return 0
     fi
   done <<< "$rows"
@@ -295,7 +289,7 @@ build_proxy() {
   for project in "${candidates[@]}"; do
     [ -z "$project" ] && continue
     candidate_index=$((candidate_index + 1))
-    bsay "尝试项目 $project（候选 ${candidate_index}/${#candidates[@]}）"
+    bsay "尝试新建项目 $project（候选 ${candidate_index}/${#candidates[@]}）"
 
     user="usr$(openssl rand -hex 4)"
     pass="$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)"
@@ -421,39 +415,48 @@ build_proxy() {
 }
 
 mo_bg_proxy_worker() {
-  if [ "$REUSE_PROXY" != "0" ]; then
-    bsay "全局聚合扫描账户内现有 socks5-node..."
-    if mo_scan_all_reusable_proxies; then return 0; fi
-  fi
-
-  local candidates=()
-  local default_proj
-  default_proj=$(gcloud config get-value project 2>/dev/null || true)
-  [ "$default_proj" != "(unset)" ] && [ -n "$default_proj" ] && candidates+=("$default_proj")
-
-  bsay "等待前台主进程分配候选项目..."
+  local hint_pids=()
+  bsay "等待前台主进程分配优先候选项目..."
   for _ in {1..60}; do
     if [ -s "$PROJECT_HINT" ]; then
       mapfile -t hint_pids < "$PROJECT_HINT"
-      candidates+=("${hint_pids[@]}")
       break
     fi
     sleep 2
   done
 
-  if [ ${#candidates[@]} -eq 0 ]; then
-    bsay "未收到分配，尝试自行抓取兜底项目..."
-    mapfile -t all_pids < <(gcloud projects list --format='value(projectId)' --limit=3 2>/dev/null || true)
-    candidates+=("${all_pids[@]}")
+  # 构建扫描队列：前台确定的 Key 项目 -> 默认项目 -> 账户里所有其他项目
+  local scan_pids=("${hint_pids[@]}")
+  local default_proj
+  default_proj=$(gcloud config get-value project 2>/dev/null || true)
+  [ "$default_proj" != "(unset)" ] && [ -n "$default_proj" ] && scan_pids+=("$default_proj")
+  
+  local all_pids=()
+  mapfile -t all_pids < <(gcloud projects list --format='value(projectId)' 2>/dev/null || true)
+  scan_pids+=("${all_pids[@]}")
+
+  local uniq_scan_pids=()
+  mapfile -t uniq_scan_pids < <(printf '%s\n' "${scan_pids[@]}" | awk 'NF && !seen[$0]++')
+
+  if [ "${REUSE_PROXY:-1}" != "0" ]; then
+    bsay "定向扫描队列中的现存 socks5-node..."
+    for proj in "${uniq_scan_pids[@]}"; do
+      if mo_try_reuse_proxy_project "$proj"; then
+        return 0
+      fi
+    done
   fi
 
-  if [ ${#candidates[@]} -eq 0 ]; then
+  if [ ${#hint_pids[@]} -eq 0 ]; then
+    hint_pids=("${uniq_scan_pids[@]:0:3}")
+  fi
+  if [ ${#hint_pids[@]} -eq 0 ]; then
     berr "无任何可用项目，建代理任务结束"
     return 1
   fi
 
-  mapfile -t uniq_candidates < <(printf '%s\n' "${candidates[@]}" | awk 'NF && !seen[$0]++')
-  build_proxy "${uniq_candidates[@]}"
+  bsay "未发现可复用代理，开始新建流程..."
+  build_proxy "${hint_pids[@]}"
 }
 
 # ============================================================
@@ -554,7 +557,7 @@ if [ "${#KEY_PROJECTS[@]}" -lt "$NEED_PROJECTS" ]; then
 fi
 say "Final Key projects (${#KEY_PROJECTS[@]}): ${KEY_PROJECTS[*]}"
 
-# 发送项目线索给后台任务，解除后台阻塞状态
+# 高优项目锁定！立刻发送线索给后台任务，解除后台复用扫描阻塞状态
 printf '%s\n' "${KEY_PROJECTS[@]}" > "$PROJECT_HINT" 2>/dev/null || true
 
 # ============================================================
